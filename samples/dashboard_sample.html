@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>八性代码质量看板</title>
+<style>
+.viz-root{color-scheme:light;--surface-0:#f4f4f2;--surface-1:#fcfcfb;--border:#e3e2de;--grid:#ecebe7;
+ --text-primary:#0b0b0b;--text-secondary:#52514e;--text-muted:#7a7974;
+ --series-1:#2a78d6;--series-2:#eb6834;--good:#0ca30c;--warning:#fab219;--serious:#ec835a;--critical:#d03b3b;--neutral:#9a9993}
+@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])) .viz-root{color-scheme:dark;--surface-0:#111110;--surface-1:#1a1a19;--border:#2e2e2c;--grid:#262624;
+ --text-primary:#f0efec;--text-secondary:#c3c2b7;--text-muted:#8f8e86;--series-1:#3987e5;--series-2:#d95926}}
+:root[data-theme="dark"] .viz-root{color-scheme:dark;--surface-0:#111110;--surface-1:#1a1a19;--border:#2e2e2c;--grid:#262624;
+ --text-primary:#f0efec;--text-secondary:#c3c2b7;--text-muted:#8f8e86;--series-1:#3987e5;--series-2:#d95926}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+.viz-root{background:var(--surface-0);color:var(--text-primary);min-height:100vh;padding:24px}
+.wrap{max-width:1280px;margin:0 auto}
+header{display:flex;align-items:baseline;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:16px}
+h1{font-size:20px;margin:0}
+.sub{color:var(--text-secondary);font-size:13px}
+.card{background:var(--surface-1);border:1px solid var(--border);border-radius:10px;padding:16px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:12px}
+.tile .label{color:var(--text-secondary);font-size:12px}
+.tile .value{font-size:28px;font-weight:600;font-variant-numeric:tabular-nums;margin-top:2px}
+.tile .note{color:var(--text-muted);font-size:12px}
+.filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:12px 0}
+.filters select,.filters input,button{font:inherit;color:var(--text-primary);background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:6px 10px}
+button{cursor:pointer}
+.grid2{display:grid;grid-template-columns:3fr 2fr;gap:12px;margin-bottom:12px}
+@media (max-width:900px){.grid2{grid-template-columns:1fr}}
+h2{font-size:14px;margin:0 0 8px;font-weight:600}
+.legend{display:flex;gap:16px;font-size:12px;color:var(--text-secondary);margin-bottom:4px}
+.legend i{display:inline-block;width:14px;height:2px;vertical-align:middle;margin-right:6px}
+svg text{fill:var(--text-secondary);font-size:11px}
+.tip{position:fixed;pointer-events:none;background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:12px;
+ box-shadow:0 4px 12px rgba(0,0,0,.12);display:none;z-index:9;color:var(--text-primary)}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{padding:8px 10px;border-bottom:1px solid var(--grid);text-align:left;white-space:nowrap}
+th{color:var(--text-secondary);font-weight:500;font-size:12px;cursor:pointer;user-select:none}
+td.num,th.num{text-align:right}
+tbody tr{cursor:pointer}
+tbody tr:hover{background:var(--surface-0)}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text-primary)}
+.chip::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--c,var(--neutral))}
+.delta-up{color:var(--good)}.delta-down{color:var(--critical)}
+.muted{color:var(--text-muted)}
+.detail{display:none;margin-top:12px}
+.dimbars div{display:grid;grid-template-columns:90px 1fr 48px;gap:8px;align-items:center;margin:4px 0;font-size:12px}
+.bar{height:10px;background:var(--grid);border-radius:4px;overflow:hidden}.bar span{display:block;height:100%;background:var(--series-1);border-radius:0 4px 4px 0}
+.lv{font-weight:600;font-size:12px}
+.tablewrap{overflow-x:auto}
+</style>
+</head>
+<body>
+<div class="viz-root"><div class="wrap">
+<header>
+  <div><h1>八性代码质量看板</h1><div class="sub" id="sub"></div></div>
+  <button id="theme" type="button" aria-label="切换深浅色">切换深浅色</button>
+</header>
+
+<div class="tiles" id="tiles"></div>
+
+<div class="filters">
+  <select id="fDept" aria-label="部门"><option value="">全部部门</option></select>
+  <select id="fGrade" aria-label="档位"><option value="">全部档位</option></select>
+  <input id="fText" placeholder="搜索项目 / 负责人" aria-label="搜索">
+</div>
+
+<div class="grid2">
+  <div class="card"><h2>全公司平均分趋势（0–10）</h2>
+    <div class="legend"><span><i style="background:var(--series-1)"></i>平均总评分</span><span><i style="background:var(--series-2)"></i>平均安全评分</span></div>
+    <svg id="trend" width="100%" height="220" role="img" aria-label="平均总评分与平均安全评分的每日趋势"></svg></div>
+  <div class="card"><h2>八个维度的项目平均分</h2><svg id="dims" width="100%" height="244" role="img" aria-label="八个维度的平均分"></svg></div>
+</div>
+
+<div class="card">
+  <h2>项目评分（点击行查看详情）</h2>
+  <div class="tablewrap"><table id="tbl"><thead><tr>
+    <th data-k="project_name">项目</th><th data-k="department">部门</th><th data-k="owner">负责人</th>
+    <th data-k="total" class="num">总评分</th><th data-k="grade">档位</th><th data-k="delta_total" class="num">较上次</th>
+    <th data-k="security" class="num">安全评分</th><th data-k="security_p0" class="num">安全 P0/P1</th>
+    <th data-k="coverage" class="num">覆盖率</th><th data-k="P0" class="num">P0</th><th data-k="P1" class="num">P1</th>
+    <th data-k="P2" class="num">P2</th><th data-k="P3" class="num">P3</th><th data-k="new_p0p1" class="num">新增 P0/P1</th><th data-k="mode">扫描</th>
+  </tr></thead><tbody></tbody></table></div>
+  <div class="detail" id="detail"></div>
+</div>
+<p class="sub">评分口径：八性 64 项逐项判定，PASS=1 / WARN=0.6 / FAIL=0，含 P0 的检查项计 0 并额外扣分；覆盖率不足 60% 的维度不评分，总评分只基于已评分维度。安全评分＝安全性维度得分。完整报告见 reports/<日期>/<项目ID>.md。</p>
+<div class="tip" id="tip"></div>
+</div></div>
+<script>
+const DATA = {"date": "2026-11-21", "rows": [{"project_id": "app", "project_name": "移动端 App", "department": "终端研发部", "owner": "研发经理C", "date": "2026-11-21", "mode": "incremental", "commit": "appabc2123", "total": 7.7, "grade": "基本合格需改进", "security": 7.6, "coverage": 0.855, "scored_dims": 7, "P0": 0, "P1": 1, "P2": 9, "P3": 16, "security_p0": 0, "security_p1": 0, "cost_usd": 3.2, "d1": null, "d2": 6.3, "d3": 8.7, "d4": 8.3, "d5": 6.6, "d6": 7.6, "d7": 7.3, "d8": 8.3, "delta_total": -0.6, "delta_security": -0.9, "new_p0p1": 1}, {"project_id": "crm", "project_name": "客户管理平台", "department": "业务中台部", "owner": "研发经理B", "date": "2026-11-21", "mode": "incremental", "commit": "crmabc2123", "total": 6.6, "grade": "存在明显风险", "security": 7.2, "coverage": 0.683, "scored_dims": 5, "P0": 1, "P1": 0, "P2": 14, "P3": 9, "security_p0": 1, "security_p1": 0, "cost_usd": 3.2, "d1": null, "d2": 5.7, "d3": 7.3, "d4": null, "d5": 4.9, "d6": 7.2, "d7": null, "d8": 7.0, "delta_total": -1.6, "delta_security": -2.3, "new_p0p1": 1}, {"project_id": "order", "project_name": "订单中心", "department": "交易研发部", "owner": "研发经理A", "date": "2026-11-21", "mode": "incremental", "commit": "orderabc21", "total": 6.8, "grade": "存在明显风险", "security": 6.0, "coverage": 0.712, "scored_dims": 5, "P0": 0, "P1": 3, "P2": 6, "P3": 11, "security_p0": 0, "security_p1": 0, "cost_usd": 3.2, "d1": null, "d2": 6.3, "d3": null, "d4": 7.0, "d5": null, "d6": 6.0, "d7": 6.0, "d8": 9.0, "delta_total": -1.5, "delta_security": -1.2, "new_p0p1": 3}, {"project_id": "legacy", "project_name": "老系统", "department": "交易研发部", "owner": "研发经理A", "date": "2026-11-21", "mode": "失败", "error": "clone 失败: 权限不足（示例）", "total": null, "security": null, "grade": "扫描失败"}], "details": {"app": {"dims": [{"id": "1", "name": "功能适合性", "score": null, "coverage": 0.571}, {"id": "2", "name": "性能效率", "score": 6.3, "coverage": 0.875}, {"id": "3", "name": "可靠性", "score": 8.7, "coverage": 0.857}, {"id": "4", "name": "稳定性", "score": 8.3, "coverage": 1.0}, {"id": "5", "name": "易用性", "score": 6.6, "coverage": 1.0}, {"id": "6", "name": "安全性", "score": 7.6, "coverage": 1.0}, {"id": "7", "name": "兼容性", "score": 7.3, "coverage": 0.75}, {"id": "8", "name": "可维护性", "score": 8.3, "coverage": 0.778}], "issues": [{"level": "P1", "item": "5.6", "title": "[运维] 运维易用性：示例问题", "evidence": "src/app/module2.py:45", "new": true}, {"level": "P2", "item": "1.2", "title": "业务逻辑正确性：示例问题", "evidence": "src/app/module2.py:17", "new": false}, {"level": "P2", "item": "2.3", "title": "缓存策略：示例问题", "evidence": "src/app/module2.py:24", "new": true}, {"level": "P2", "item": "3.4", "title": "可恢复性：示例问题", "evidence": "src/app/module2.py:31", "new": true}, {"level": "P2", "item": "3.7", "title": "异常路径测试：示例问题", "evidence": "src/app/module2.py:31", "new": true}, {"level": "P2", "item": "4.1", "title": "资源泄漏：示例问题", "evidence": "src/app/module2.py:38", "new": true}, {"level": "P2", "item": "4.8", "title": "监控与告警：示例问题", "evidence": "src/app/module2.py:38", "new": true}, {"level": "P2", "item": "6.5", "title": "输入与输出：示例问题", "evidence": "src/app/module2.py:52", "new": false}, {"level": "P2", "item": "8.3", "title": "命名与风格：示例问题", "evidence": "src/app/module2.py:66", "new": true}, {"level": "P2", "item": "8.7", "title": "配置化与扩展性：示例问题", "evidence": "src/app/module2.py:66", "new": false}, {"level": "P3", "item": "1.6", "title": "硬编码业务规则：示例问题", "evidence": "src/app/module2.py:17", "new": false}, {"level": "P3", "item": "2.2", "title": "数据库与存储访问：示例问题", "evidence": "src/app/module2.py:24", "new": true}, {"level": "P3", "item": "2.4", "title": "并发与异步：示例问题", "evidence": "src/app/module2.py:24", "new": true}, {"level": "P3", "item": "2.6", "title": "网络与传输：示例问题", "evidence": "src/app/module2.py:24", "new": true}, {"level": "P3", "item": "2.7", "title": "前端/客户端：示例问题", "evidence": "src/app/module2.py:24", "new": true}, {"level": "P3", "item": "4.3", "title": "并发安全：示例问题", "evidence": "src/app/module2.py:38", "new": true}, {"level": "P3", "item": "5.1", "title": "[用户] 错误与反馈：示例问题", "evidence": "src/app/module2.py:45", "new": false}, {"level": "P3", "item": "5.2", "title": "[用户] 交互与可访问性：示例问题", "evidence": "src/app/module2.py:45", "new": true}, {"level": "P3", "item": "6.1", "title": "注入与反序列化：示例问题", "evidence": "src/app/module2.py:52", "new": false}, {"level": "P3", "item": "6.7", "title": "供应链：示例问题", "evidence": "src/app/module2.py:52", "new": false}, {"level": "P3", "item": "6.9", "title": "隐私与审计：示例问题", "evidence": "src/app/module2.py:52", "new": true}, {"level": "P3", "item": "7.1", "title": "运行时与语言版本：示例问题", "evidence": "src/app/module2.py:59", "new": false}, {"level": "P3", "item": "7.3", "title": "平台差异：示例问题", "evidence": "src/app/module2.py:59", "new": false}, {"level": "P3", "item": "7.7", "title": "共存性：示例问题", "evidence": "src/app/module2.py:59", "new": true}, {"level": "P3", "item": "7.8", "title": "构建可复现：示例问题", "evidence": "src/app/module2.py:59", "new": true}, {"level": "P3", "item": "8.9", "title": "文档与知识沉淀：示例问题", "evidence": "src/app/module2.py:66", "new": true}], "need_info": ["S1 需求文档、S2 接口契约"]}, "crm": {"dims": [{"id": "1", "name": "功能适合性", "score": null, "coverage": 0.167}, {"id": "2", "name": "性能效率", "score": 5.7, "coverage": 0.857}, {"id": "3", "name": "可靠性", "score": 7.3, "coverage": 0.857}, {"id": "4", "name": "稳定性", "score": null, "coverage": 0.5}, {"id": "5", "name": "易用性", "score": 4.9, "coverage": 1.0}, {"id": "6", "name": "安全性", "score": 7.2, "coverage": 1.0}, {"id": "7", "name": "兼容性", "score": null, "coverage": 0.429}, {"id": "8", "name": "可维护性", "score": 7.0, "coverage": 0.6}], "issues": [{"level": "P0", "item": "6.4", "title": "敏感数据：示例问题", "evidence": "src/crm/module1.py:52", "new": true}, {"level": "P2", "item": "2.2", "title": "数据库与存储访问：示例问题", "evidence": "src/crm/module1.py:24", "new": true}, {"level": "P2", "item": "2.3", "title": "缓存策略：示例问题", "evidence": "src/crm/module1.py:24", "new": true}, {"level": "P2", "item": "2.5", "title": "内存与资源使用：示例问题", "evidence": "src/crm/module1.py:24", "new": true}, {"level": "P2", "item": "3.1", "title": "异常处理：示例问题", "evidence": "src/crm/module1.py:31", "new": true}, {"level": "P2", "item": "3.7", "title": "异常路径测试：示例问题", "evidence": "src/crm/module1.py:31", "new": true}, {"level": "P2", "item": "4.2", "title": "长时退化：示例问题", "evidence": "src/crm/module1.py:38", "new": false}, {"level": "P2", "item": "4.6", "title": "依赖漂移：示例问题", "evidence": "src/crm/module1.py:38", "new": true}, {"level": "P2", "item": "5.1", "title": "[用户] 错误与反馈：示例问题", "evidence": "src/crm/module1.py:45", "new": true}, {"level": "P2", "item": "5.2", "title": "[用户] 交互与可访问性：示例问题", "evidence": "src/crm/module1.py:45", "new": true}, {"level": "P2", "item": "5.4", "title": "[开发者] API 与注释：示例问题", "evidence": "src/crm/module1.py:45", "new": false}, {"level": "P2", "item": "5.6", "title": "[运维] 运维易用性：示例问题", "evidence": "src/crm/module1.py:45", "new": false}, {"level": "P2", "item": "5.7", "title": "一致性：示例问题", "evidence": "src/crm/module1.py:45", "new": false}, {"level": "P2", "item": "7.8", "title": "构建可复现：示例问题", "evidence": "src/crm/module1.py:59", "new": true}, {"level": "P2", "item": "8.4", "title": "重复与复用：示例问题", "evidence": "src/crm/module1.py:66", "new": true}, {"level": "P3", "item": "2.4", "title": "并发与异步：示例问题", "evidence": "src/crm/module1.py:24", "new": true}, {"level": "P3", "item": "2.8", "title": "性能可观测性：示例问题", "evidence": "src/crm/module1.py:24", "new": false}, {"level": "P3", "item": "3.2", "title": "失败应对：示例问题", "evidence": "src/crm/module1.py:31", "new": true}, {"level": "P3", "item": "3.4", "title": "可恢复性：示例问题", "evidence": "src/crm/module1.py:31", "new": false}, {"level": "P3", "item": "4.8", "title": "监控与告警：示例问题", "evidence": "src/crm/module1.py:38", "new": true}, {"level": "P3", "item": "5.3", "title": "[开发者] 上手文档：示例问题", "evidence": "src/crm/module1.py:45", "new": true}, {"level": "P3", "item": "6.8", "title": "配置与暴露面：示例问题", "evidence": "src/crm/module1.py:52", "new": true}, {"level": "P3", "item": "8.3", "title": "命名与风格：示例问题", "evidence": "src/crm/module1.py:66", "new": true}, {"level": "P3", "item": "8.10", "title": "技术债盘点：示例问题", "evidence": "src/crm/module1.py:66", "new": false}], "need_info": ["S1 需求文档、S2 接口契约"]}, "order": {"dims": [{"id": "1", "name": "功能适合性", "score": null, "coverage": 0.333}, {"id": "2", "name": "性能效率", "score": 6.3, "coverage": 0.857}, {"id": "3", "name": "可靠性", "score": null, "coverage": 0.429}, {"id": "4", "name": "稳定性", "score": 7.0, "coverage": 1.0}, {"id": "5", "name": "易用性", "score": null, "coverage": 0.571}, {"id": "6", "name": "安全性", "score": 6.0, "coverage": 0.667}, {"id": "7", "name": "兼容性", "score": 6.0, "coverage": 0.875}, {"id": "8", "name": "可维护性", "score": 9.0, "coverage": 0.889}], "issues": [{"level": "P1", "item": "2.7", "title": "前端/客户端：示例问题", "evidence": "src/order/module0.py:24", "new": true}, {"level": "P1", "item": "4.8", "title": "监控与告警：示例问题", "evidence": "src/order/module0.py:38", "new": true}, {"level": "P1", "item": "7.4", "title": "浏览器/设备：示例问题", "evidence": "src/order/module0.py:59", "new": true}, {"level": "P2", "item": "5.1", "title": "[用户] 错误与反馈：示例问题", "evidence": "src/order/module0.py:45", "new": true}, {"level": "P2", "item": "5.2", "title": "[用户] 交互与可访问性：示例问题", "evidence": "src/order/module0.py:45", "new": true}, {"level": "P2", "item": "6.7", "title": "供应链：示例问题", "evidence": "src/order/module0.py:52", "new": false}, {"level": "P2", "item": "7.5", "title": "接口与协议：示例问题", "evidence": "src/order/module0.py:59", "new": true}, {"level": "P2", "item": "7.6", "title": "数据兼容：示例问题", "evidence": "src/order/module0.py:59", "new": true}, {"level": "P2", "item": "8.4", "title": "重复与复用：示例问题", "evidence": "src/order/module0.py:66", "new": true}, {"level": "P3", "item": "1.4", "title": "数据处理正确性：示例问题", "evidence": "src/order/module0.py:17", "new": true}, {"level": "P3", "item": "2.2", "title": "数据库与存储访问：示例问题", "evidence": "src/order/module0.py:24", "new": true}, {"level": "P3", "item": "2.3", "title": "缓存策略：示例问题", "evidence": "src/order/module0.py:24", "new": false}, {"level": "P3", "item": "2.8", "title": "性能可观测性：示例问题", "evidence": "src/order/module0.py:24", "new": true}, {"level": "P3", "item": "3.1", "title": "异常处理：示例问题", "evidence": "src/order/module0.py:31", "new": true}, {"level": "P3", "item": "4.2", "title": "长时退化：示例问题", "evidence": "src/order/module0.py:38", "new": false}, {"level": "P3", "item": "4.5", "title": "后台与定时任务：示例问题", "evidence": "src/order/module0.py:38", "new": true}, {"level": "P3", "item": "6.2", "title": "认证与会话：示例问题", "evidence": "src/order/module0.py:52", "new": false}, {"level": "P3", "item": "6.6", "title": "密码学：示例问题", "evidence": "src/order/module0.py:52", "new": true}, {"level": "P3", "item": "7.1", "title": "运行时与语言版本：示例问题", "evidence": "src/order/module0.py:59", "new": true}, {"level": "P3", "item": "8.5", "title": "耦合与抽象：示例问题", "evidence": "src/order/module0.py:66", "new": true}], "need_info": ["S1 需求文档、S2 接口契约"]}}, "trend": [{"date": "2026-11-19", "total": 8.27, "security": 8.4}, {"date": "2026-11-20", "total": 8.27, "security": 8.4}, {"date": "2026-11-21", "total": 7.03, "security": 6.93}], "dims": [{"id": "1", "name": "功能适合性", "avg": null, "n": 0}, {"id": "2", "name": "性能效率", "avg": 6.1, "n": 3}, {"id": "3", "name": "可靠性", "avg": 8.0, "n": 2}, {"id": "4", "name": "稳定性", "avg": 7.65, "n": 2}, {"id": "5", "name": "易用性", "avg": 5.75, "n": 2}, {"id": "6", "name": "安全性", "avg": 6.93, "n": 3}, {"id": "7", "name": "兼容性", "avg": 6.65, "n": 2}, {"id": "8", "name": "可维护性", "avg": 8.1, "n": 3}], "generated_at": "2026-11-21T03:40:00+08:00"};
+const $ = s => document.querySelector(s);
+const f1 = v => v == null ? "—" : Number(v).toFixed(1);
+const pc = v => v == null ? "—" : Math.round(v * 100) + "%";
+const GRADE_C = {"良好":"var(--good)","基本合格需改进":"var(--warning)","存在明显风险":"var(--serious)","高风险，建议专项整改":"var(--critical)","扫描失败":"var(--critical)"};
+const LV_C = {P0:"var(--critical)",P1:"var(--serious)",P2:"var(--warning)",P3:"var(--neutral)"};
+const tip = $("#tip");
+function showTip(e, html){tip.innerHTML = html; tip.style.display = "block";
+  const x = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8); tip.style.left = x + "px"; tip.style.top = (e.clientY + 14) + "px";}
+function hideTip(){tip.style.display = "none";}
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+$("#theme").onclick = () => { const r = document.documentElement;
+  const dark = r.dataset.theme ? r.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  r.dataset.theme = dark ? "light" : "dark"; draw(); };
+
+$("#sub").textContent = `数据日期 ${DATA.date}` + (DATA.generated_at ? ` · 生成于 ${DATA.generated_at.slice(0,16).replace("T"," ")}` : "");
+[...new Set(DATA.rows.map(r => r.department).filter(Boolean))].forEach(d => $("#fDept").add(new Option(d, d)));
+[...new Set(DATA.rows.map(r => r.grade).filter(Boolean))].forEach(d => $("#fGrade").add(new Option(d, d)));
+
+let sortK = "security", sortAsc = true;
+function filtered(){ const d = $("#fDept").value, g = $("#fGrade").value, t = $("#fText").value.trim().toLowerCase();
+  return DATA.rows.filter(r => (!d || r.department === d) && (!g || r.grade === g) &&
+    (!t || (r.project_name + r.owner + r.project_id).toLowerCase().includes(t))); }
+
+function tiles(rows){
+  const ok = rows.filter(r => r.total != null || r.security != null);
+  const avg = k => { const v = ok.map(r => r[k]).filter(x => x != null); return v.length ? v.reduce((a,b)=>a+b,0)/v.length : null; };
+  const sum = k => rows.reduce((a,r) => a + (r[k] || 0), 0);
+  const fail = rows.filter(r => r.mode === "失败").length;
+  $("#tiles").innerHTML = [
+    ["纳入扫描项目", rows.length, fail ? `其中扫描失败 ${fail} 个` : "全部扫描成功"],
+    ["平均总评分", f1(avg("total")), "0–10，基于已评分维度"],
+    ["平均安全评分", f1(avg("security")), "安全性维度"],
+    ["P0 致命问题", sum("P0"), `其中安全类 ${sum("security_p0")} 个`],
+    ["P1 严重问题", sum("P1"), `较上次新增 P0/P1 ${sum("new_p0p1")} 个`],
+  ].map(([l,v,n]) => `<div class="card tile"><div class="label">${l}</div><div class="value">${v}</div><div class="note">${n}</div></div>`).join("");
+}
+
+function table(rows){
+  rows = [...rows].sort((a,b) => { const x = a[sortK], y = b[sortK];
+    if (x == null && y == null) return 0; if (x == null) return 1; if (y == null) return -1;
+    return (x > y ? 1 : x < y ? -1 : 0) * (sortAsc ? 1 : -1); });
+  const dl = v => v == null ? '<span class="muted">—</span>' : v > 0 ? `<span class="delta-up">▲ ${f1(v)}</span>` : v < 0 ? `<span class="delta-down">▼ ${f1(-v)}</span>` : "0.0";
+  $("#tbl tbody").innerHTML = rows.map(r => `<tr data-id="${esc(r.project_id)}">
+    <td>${esc(r.project_name)}</td><td>${esc(r.department)}</td><td>${esc(r.owner)}</td>
+    <td class="num"><b>${f1(r.total)}</b></td><td><span class="chip" style="--c:${GRADE_C[r.grade]||"var(--neutral)"}">${esc(r.grade||"—")}</span></td>
+    <td class="num">${dl(r.delta_total)}</td><td class="num"><b>${f1(r.security)}</b></td>
+    <td class="num">${r.security_p0 ?? "—"}/${r.security_p1 ?? "—"}</td><td class="num">${pc(r.coverage)}</td>
+    <td class="num">${r.P0 ?? "—"}</td><td class="num">${r.P1 ?? "—"}</td><td class="num">${r.P2 ?? "—"}</td><td class="num">${r.P3 ?? "—"}</td>
+    <td class="num">${r.new_p0p1 ?? "—"}</td><td>${esc(r.mode)}</td></tr>`).join("") ||
+    '<tr><td colspan="15" class="muted">没有符合筛选条件的项目</td></tr>';
+  document.querySelectorAll("#tbl tbody tr[data-id]").forEach(tr => tr.onclick = () => detail(tr.dataset.id));
+}
+
+function detail(id){
+  const r = DATA.rows.find(x => x.project_id === id), d = DATA.details[id], el = $("#detail");
+  el.style.display = "block";
+  if (!d){ el.innerHTML = `<h2>${esc(r.project_name)}</h2><p class="muted">本次扫描失败：${esc(r.error||"")}</p>`; return; }
+  el.innerHTML = `<h2>${esc(r.project_name)} · 提交 ${esc(r.commit)} · ${esc(r.mode)}</h2>
+   <div class="grid2"><div><div class="sub" style="margin-bottom:6px">维度得分（灰底＝证据不足，暂不评分）</div><div class="dimbars">${d.dims.map(x =>
+     `<div><span>${x.id}. ${esc(x.name)}</span><span class="bar" title="覆盖率 ${pc(x.coverage)}"><span style="width:${x.score==null?0:x.score*10}%"></span></span><span class="num">${x.score==null?"暂不评分":f1(x.score)}</span></div>`).join("")}</div>
+     ${d.need_info.length ? `<div class="sub" style="margin-top:10px">待补充信息：${d.need_info.map(esc).join("；")}</div>` : ""}</div>
+   <div><div class="sub" style="margin-bottom:6px">问题（前 30 条）</div><table><tbody>${d.issues.map(i =>
+     `<tr><td><span class="chip lv" style="--c:${LV_C[i.level]}">${i.level}</span></td><td>${i.item}</td><td style="white-space:normal">${esc(i.title)}${i.new?' <b class="delta-down">新</b>':""}<div class="muted">${esc(i.evidence)}</div></td></tr>`).join("") || '<tr><td class="muted">无</td></tr>'}</tbody></table></div></div>`;
+  el.scrollIntoView({behavior:"smooth", block:"nearest"});
+}
+
+function css(v){ return getComputedStyle($(".viz-root")).getPropertyValue(v).trim(); }
+
+function trendChart(){
+  const svg = $("#trend"), W = svg.clientWidth || 600, H = 220, m = {l:32,r:118,t:10,b:24};
+  const pts = DATA.trend; const n = pts.length;
+  if (!n){ svg.innerHTML = '<text x="10" y="20">暂无历史数据</text>'; return; }
+  const x = i => m.l + (n === 1 ? (W-m.l-m.r)/2 : i * (W-m.l-m.r)/(n-1)), y = v => m.t + (10 - v) * (H-m.t-m.b)/10;
+  let g = "", labels = [];
+  for (let v = 0; v <= 10; v += 2) g += `<line x1="${m.l}" x2="${W-m.r}" y1="${y(v)}" y2="${y(v)}" stroke="${css("--grid")}"/><text x="${m.l-6}" y="${y(v)+4}" text-anchor="end">${v}</text>`;
+  const step = Math.max(1, Math.ceil(n / 6));
+  pts.forEach((p,i) => { if (i % step === 0 || i === n-1) g += `<text x="${x(i)}" y="${H-6}" text-anchor="middle">${p.date.slice(5)}</text>`; });
+  [["total","--series-1","总评分"],["security","--series-2","安全评分"]].forEach(([k,c,label]) => {
+    const seg = pts.map((p,i) => p[k]==null ? null : [x(i), y(p[k])]).filter(Boolean);
+    if (!seg.length) return;
+    g += `<polyline fill="none" stroke="${css(c)}" stroke-width="2" stroke-linejoin="round" points="${seg.map(s=>s.join(",")).join(" ")}"/>`;
+    const last = seg[seg.length-1];
+    g += `<circle cx="${last[0]}" cy="${last[1]}" r="4" fill="${css(c)}" stroke="${css("--surface-1")}" stroke-width="2"/>`;
+    labels.push({x:last[0]+10, y:last[1]+4, t:`${label} ${f1(pts[n-1][k])}`});
+  });
+  // 末端直标：两条线收尾接近时上下错开，避免文字重叠
+  if (labels.length === 2 && Math.abs(labels[0].y - labels[1].y) < 14){
+    const mid = (labels[0].y + labels[1].y) / 2, up = labels[0].y <= labels[1].y ? 0 : 1;
+    labels[up].y = mid - 7; labels[1-up].y = mid + 7; }
+  labels.forEach(l => g += `<text x="${l.x}" y="${l.y}" style="fill:${css("--text-primary")}">${l.t}</text>`);
+  g += `<line id="xh" y1="${m.t}" y2="${H-m.b}" stroke="${css("--text-muted")}" stroke-dasharray="3 3" visibility="hidden"/>`;
+  g += `<rect x="${m.l}" y="0" width="${W-m.l-m.r}" height="${H}" fill="transparent" id="hit"/>`;
+  svg.innerHTML = g;
+  const xh = svg.querySelector("#xh");
+  svg.querySelector("#hit").onmousemove = e => { const bx = svg.getBoundingClientRect();
+    const i = Math.max(0, Math.min(n-1, Math.round((e.clientX - bx.left - m.l) / ((W-m.l-m.r)/Math.max(1,n-1)))));
+    xh.setAttribute("x1", x(i)); xh.setAttribute("x2", x(i)); xh.setAttribute("visibility", "visible");
+    showTip(e, `<b>${pts[i].date}</b><br>平均总评分 ${f1(pts[i].total)}<br>平均安全评分 ${f1(pts[i].security)}`); };
+  svg.querySelector("#hit").onmouseleave = () => { xh.setAttribute("visibility","hidden"); hideTip(); };
+}
+
+function dimChart(){
+  const svg = $("#dims"), W = svg.clientWidth || 400, rowH = 28, lw = 80, rw = 64;
+  let g = "";
+  DATA.dims.forEach((d,i) => { const yy = 6 + i*rowH, bw = d.avg==null ? 0 : (W-lw-rw) * d.avg/10;
+    g += `<text x="${lw-8}" y="${yy+13}" text-anchor="end">${d.name}</text>
+      <rect x="${lw}" y="${yy+3}" width="${W-lw-rw}" height="14" rx="4" fill="${css("--grid")}"/>
+      ${bw ? `<rect x="${lw}" y="${yy+3}" width="${bw}" height="14" rx="4" fill="${css("--series-1")}"/>` : ""}
+      <text x="${W-rw+8}" y="${yy+13}" style="fill:${css("--text-primary")}">${d.avg==null?"暂不评分":f1(d.avg)}</text>
+      <rect x="0" y="${yy}" width="${W}" height="${rowH}" fill="transparent" data-i="${i}" class="hit"/>`; });
+  svg.innerHTML = g;
+  svg.querySelectorAll(".hit").forEach(h => { const d = DATA.dims[h.dataset.i];
+    h.onmousemove = e => showTip(e, `<b>${d.name}</b><br>平均 ${f1(d.avg)}（${d.n} 个项目已评分）`); h.onmouseleave = hideTip; });
+}
+
+function draw(){ const rows = filtered(); tiles(rows); table(rows); trendChart(); dimChart(); }
+document.querySelectorAll("#tbl th").forEach(th => th.onclick = () => { const k = th.dataset.k;
+  sortAsc = sortK === k ? !sortAsc : true; sortK = k; table(filtered()); });
+["#fDept","#fGrade","#fText"].forEach(s => $(s).oninput = draw);
+addEventListener("resize", () => { trendChart(); dimChart(); });
+draw();
+</script>
+</body>
+</html>

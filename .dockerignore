@@ -1,0 +1,8 @@
+.git
+.github
+output
+work
+samples
+tests
+*.tar.gz
+**/__pycache__

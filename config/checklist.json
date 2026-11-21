@@ -1,0 +1,400 @@
+{
+  "version": "1.0",
+  "dimensions": [
+    {
+      "id": "1",
+      "code": "FS",
+      "name": "功能适合性",
+      "weight": 15
+    },
+    {
+      "id": "2",
+      "code": "PE",
+      "name": "性能效率",
+      "weight": 12
+    },
+    {
+      "id": "3",
+      "code": "RE",
+      "name": "可靠性",
+      "weight": 14
+    },
+    {
+      "id": "4",
+      "code": "ST",
+      "name": "稳定性",
+      "weight": 12
+    },
+    {
+      "id": "5",
+      "code": "US",
+      "name": "易用性",
+      "weight": 8
+    },
+    {
+      "id": "6",
+      "code": "SE",
+      "name": "安全性",
+      "weight": 18
+    },
+    {
+      "id": "7",
+      "code": "CO",
+      "name": "兼容性",
+      "weight": 9
+    },
+    {
+      "id": "8",
+      "code": "MA",
+      "name": "可维护性",
+      "weight": 12
+    }
+  ],
+  "items": [
+    {
+      "id": "1.1",
+      "dimension": "1",
+      "name": "需求覆盖度"
+    },
+    {
+      "id": "1.2",
+      "dimension": "1",
+      "name": "业务逻辑正确性"
+    },
+    {
+      "id": "1.3",
+      "dimension": "1",
+      "name": "接口契约一致性"
+    },
+    {
+      "id": "1.4",
+      "dimension": "1",
+      "name": "数据处理正确性"
+    },
+    {
+      "id": "1.5",
+      "dimension": "1",
+      "name": "未实现与死代码"
+    },
+    {
+      "id": "1.6",
+      "dimension": "1",
+      "name": "硬编码业务规则"
+    },
+    {
+      "id": "1.7",
+      "dimension": "1",
+      "name": "测试有效性"
+    },
+    {
+      "id": "2.1",
+      "dimension": "2",
+      "name": "算法与复杂度"
+    },
+    {
+      "id": "2.2",
+      "dimension": "2",
+      "name": "数据库与存储访问"
+    },
+    {
+      "id": "2.3",
+      "dimension": "2",
+      "name": "缓存策略"
+    },
+    {
+      "id": "2.4",
+      "dimension": "2",
+      "name": "并发与异步"
+    },
+    {
+      "id": "2.5",
+      "dimension": "2",
+      "name": "内存与资源使用"
+    },
+    {
+      "id": "2.6",
+      "dimension": "2",
+      "name": "网络与传输"
+    },
+    {
+      "id": "2.7",
+      "dimension": "2",
+      "name": "前端/客户端"
+    },
+    {
+      "id": "2.8",
+      "dimension": "2",
+      "name": "性能可观测性"
+    },
+    {
+      "id": "3.1",
+      "dimension": "3",
+      "name": "异常处理"
+    },
+    {
+      "id": "3.2",
+      "dimension": "3",
+      "name": "失败应对"
+    },
+    {
+      "id": "3.3",
+      "dimension": "3",
+      "name": "数据一致性"
+    },
+    {
+      "id": "3.4",
+      "dimension": "3",
+      "name": "可恢复性"
+    },
+    {
+      "id": "3.5",
+      "dimension": "3",
+      "name": "外部依赖故障"
+    },
+    {
+      "id": "3.6",
+      "dimension": "3",
+      "name": "备份与恢复"
+    },
+    {
+      "id": "3.7",
+      "dimension": "3",
+      "name": "异常路径测试"
+    },
+    {
+      "id": "4.1",
+      "dimension": "4",
+      "name": "资源泄漏"
+    },
+    {
+      "id": "4.2",
+      "dimension": "4",
+      "name": "长时退化"
+    },
+    {
+      "id": "4.3",
+      "dimension": "4",
+      "name": "并发安全"
+    },
+    {
+      "id": "4.4",
+      "dimension": "4",
+      "name": "容量限界"
+    },
+    {
+      "id": "4.5",
+      "dimension": "4",
+      "name": "后台与定时任务"
+    },
+    {
+      "id": "4.6",
+      "dimension": "4",
+      "name": "依赖漂移"
+    },
+    {
+      "id": "4.7",
+      "dimension": "4",
+      "name": "启停与变更"
+    },
+    {
+      "id": "4.8",
+      "dimension": "4",
+      "name": "监控与告警"
+    },
+    {
+      "id": "5.1",
+      "dimension": "5",
+      "name": "[用户] 错误与反馈"
+    },
+    {
+      "id": "5.2",
+      "dimension": "5",
+      "name": "[用户] 交互与可访问性"
+    },
+    {
+      "id": "5.3",
+      "dimension": "5",
+      "name": "[开发者] 上手文档"
+    },
+    {
+      "id": "5.4",
+      "dimension": "5",
+      "name": "[开发者] API 与注释"
+    },
+    {
+      "id": "5.5",
+      "dimension": "5",
+      "name": "[开发者] 配置易用性"
+    },
+    {
+      "id": "5.6",
+      "dimension": "5",
+      "name": "[运维] 运维易用性"
+    },
+    {
+      "id": "5.7",
+      "dimension": "5",
+      "name": "一致性"
+    },
+    {
+      "id": "6.1",
+      "dimension": "6",
+      "name": "注入与反序列化"
+    },
+    {
+      "id": "6.2",
+      "dimension": "6",
+      "name": "认证与会话"
+    },
+    {
+      "id": "6.3",
+      "dimension": "6",
+      "name": "授权与越权"
+    },
+    {
+      "id": "6.4",
+      "dimension": "6",
+      "name": "敏感数据"
+    },
+    {
+      "id": "6.5",
+      "dimension": "6",
+      "name": "输入与输出"
+    },
+    {
+      "id": "6.6",
+      "dimension": "6",
+      "name": "密码学"
+    },
+    {
+      "id": "6.7",
+      "dimension": "6",
+      "name": "供应链"
+    },
+    {
+      "id": "6.8",
+      "dimension": "6",
+      "name": "配置与暴露面"
+    },
+    {
+      "id": "6.9",
+      "dimension": "6",
+      "name": "隐私与审计"
+    },
+    {
+      "id": "7.1",
+      "dimension": "7",
+      "name": "运行时与语言版本"
+    },
+    {
+      "id": "7.2",
+      "dimension": "7",
+      "name": "依赖兼容"
+    },
+    {
+      "id": "7.3",
+      "dimension": "7",
+      "name": "平台差异"
+    },
+    {
+      "id": "7.4",
+      "dimension": "7",
+      "name": "浏览器/设备"
+    },
+    {
+      "id": "7.5",
+      "dimension": "7",
+      "name": "接口与协议"
+    },
+    {
+      "id": "7.6",
+      "dimension": "7",
+      "name": "数据兼容"
+    },
+    {
+      "id": "7.7",
+      "dimension": "7",
+      "name": "共存性"
+    },
+    {
+      "id": "7.8",
+      "dimension": "7",
+      "name": "构建可复现"
+    },
+    {
+      "id": "8.1",
+      "dimension": "8",
+      "name": "结构与模块化"
+    },
+    {
+      "id": "8.2",
+      "dimension": "8",
+      "name": "复杂度"
+    },
+    {
+      "id": "8.3",
+      "dimension": "8",
+      "name": "命名与风格"
+    },
+    {
+      "id": "8.4",
+      "dimension": "8",
+      "name": "重复与复用"
+    },
+    {
+      "id": "8.5",
+      "dimension": "8",
+      "name": "耦合与抽象"
+    },
+    {
+      "id": "8.6",
+      "dimension": "8",
+      "name": "可测试性"
+    },
+    {
+      "id": "8.7",
+      "dimension": "8",
+      "name": "配置化与扩展性"
+    },
+    {
+      "id": "8.8",
+      "dimension": "8",
+      "name": "工程化"
+    },
+    {
+      "id": "8.9",
+      "dimension": "8",
+      "name": "文档与知识沉淀"
+    },
+    {
+      "id": "8.10",
+      "dimension": "8",
+      "name": "技术债盘点"
+    }
+  ],
+  "scoring": {
+    "PASS": 1.0,
+    "WARN": 0.6,
+    "FAIL": 0.0,
+    "p0_item_penalty": 1.0,
+    "min_coverage": 0.6,
+    "grades": [
+      [
+        8.5,
+        "良好"
+      ],
+      [
+        7.0,
+        "基本合格需改进"
+      ],
+      [
+        5.0,
+        "存在明显风险"
+      ],
+      [
+        0,
+        "高风险，建议专项整改"
+      ]
+    ]
+  }
+}

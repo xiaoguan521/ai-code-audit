@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 编译检查
+        run: python -m py_compile runner/*.py tools/*.py tests/*.py
+      - name: 一致性检查（SKILL / checklist / schema / 配置）
+        run: python tests/check_consistency.py
+      - name: checklist.json 与 SKILL.md 同步（改了检查项要运行 tools/gen_checklist.py）
+        run: |
+          python tools/gen_checklist.py
+          git diff --exit-code -- config/checklist.json || { echo "::error::config/checklist.json 与 SKILL.md 不一致，请运行 python3 tools/gen_checklist.py 后提交"; exit 1; }
+      - name: 评分与报告渲染（模拟数据）
+        run: python tests/make_samples.py /tmp/out && test -s /tmp/out/dashboard/index.html
+      - name: Shell 脚本语法
+        run: for f in docker/*.sh; do sh -n "$f"; done

@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.DS_Store
+# 运行产物与工作目录（不入库）
+/output/
+/work/
+*.tar.gz
+*.sha256
+# 离线安装包与凭据
+docker/offline/*.tgz
+model.env
+*.env
+!docker/model.env.example

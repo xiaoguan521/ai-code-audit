@@ -1,0 +1,43 @@
+{
+  "workdir": "/data/ai-audit/work",
+  "output_dir": "/data/ai-audit/output",
+  "claude_bin": "claude",
+  "model": "",
+  "max_parallel": 2,
+  "per_project_timeout_sec": 3600,
+  "per_project_budget_usd": 15,
+  "full_scan_weekday": 6,
+  "reuse_if_unchanged_days": 7,
+  "clone_depth": 200,
+  "default_scope_out": [
+    "vendor/",
+    "node_modules/",
+    "dist/",
+    "build/",
+    "target/",
+    ".git/",
+    "third_party/",
+    "*.min.js",
+    "*.lock"
+  ],
+  "prescan_tools": [
+    "cloc",
+    "gitleaks",
+    "semgrep",
+    "lizard"
+  ],
+  "alert": {
+    "score_drop_threshold": 1.0,
+    "new_p0": true
+  },
+  "agent": {
+    "type": "qwen-docker",
+    "image": "ai-code-audit:1.0",
+    "env_file": "/etc/ai-audit/model.env",
+    "network": "",
+    "memory": "6g",
+    "cpus": 2,
+    "max_session_turns": 300,
+    "_说明": "type 可选 qwen-docker（内网千问，推荐）或 claude（Claude Code 直连）"
+  }
+}

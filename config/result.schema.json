@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EightQualityAuditResult",
+  "type": "object",
+  "required": ["inventory", "items", "issues", "need_info_list", "dimension_notes", "summary", "self_check"],
+  "properties": {
+    "inventory": {
+      "type": "object",
+      "required": ["languages", "frameworks", "build_tools", "file_count", "loc_estimate", "modules", "checked_scope", "unchecked"],
+      "properties": {
+        "languages": {"type": "array", "items": {"type": "string"}},
+        "frameworks": {"type": "array", "items": {"type": "string"}},
+        "build_tools": {"type": "array", "items": {"type": "string"}},
+        "file_count": {"type": "integer"},
+        "loc_estimate": {"type": "integer"},
+        "modules": {"type": "array", "items": {
+          "type": "object", "required": ["path", "role"],
+          "properties": {"path": {"type": "string"}, "role": {"type": "string"}, "files": {"type": "integer"}}
+        }},
+        "entrypoints": {"type": "array", "items": {"type": "string"}},
+        "has_tests": {"type": "boolean"},
+        "has_ci": {"type": "boolean"},
+        "lockfiles": {"type": "array", "items": {"type": "string"}},
+        "suspected_cycles": {"type": "array", "items": {"type": "string"}},
+        "checked_scope": {"type": "string"},
+        "unchecked": {"type": "array", "items": {
+          "type": "object", "required": ["path", "reason"],
+          "properties": {"path": {"type": "string"}, "reason": {"type": "string"}}
+        }}
+      }
+    },
+    "items": {
+      "type": "array", "minItems": 64, "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": ["id", "result", "evidence", "risk", "conclusion", "carried_over"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[1-8]\\.(10|[1-9])$"},
+          "result": {"enum": ["PASS", "WARN", "FAIL", "N/A", "NEED_INFO-运行数据", "NEED_INFO-补充材料"]},
+          "evidence": {"type": "array", "items": {"type": "string"}, "description": "相对路径:行号 或 关键片段；无则写 静态未见相关实现"},
+          "risk": {"enum": ["P0", "P1", "P2", "P3", "none"]},
+          "conclusion": {"type": "string"},
+          "audience": {"enum": ["用户", "开发者", "运维", "-"]},
+          "conditional": {"type": "boolean"},
+          "need_info": {"type": "object", "properties": {
+            "missing": {"type": "string"}, "why": {"type": "string"}, "blocked_conclusion": {"type": "string"}
+          }},
+          "materials_cited": {"type": "array", "items": {"type": "string"}},
+          "carried_over": {"type": "boolean"},
+          "change_reason": {"type": "string"}
+        }
+      }
+    },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["item_id", "level", "title", "evidence", "impact", "suggestion", "effort"],
+        "properties": {
+          "item_id": {"type": "string"},
+          "level": {"enum": ["P0", "P1", "P2", "P3"]},
+          "title": {"type": "string"},
+          "evidence": {"type": "array", "items": {"type": "string"}},
+          "impact": {"type": "string"},
+          "suggestion": {"type": "string"},
+          "effort": {"enum": ["S", "M", "L"]},
+          "depends_on": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "need_info_list": {
+      "type": "array", "maxItems": 15,
+      "items": {
+        "type": "object",
+        "required": ["items", "missing", "why", "form", "unlocks", "priority"],
+        "properties": {
+          "items": {"type": "array", "items": {"type": "string"}},
+          "missing": {"type": "string"},
+          "why": {"type": "string"},
+          "form": {"type": "string"},
+          "unlocks": {"type": "string"},
+          "priority": {"enum": ["高", "中", "低"]}
+        }
+      }
+    },
+    "dimension_notes": {
+      "type": "array", "minItems": 8, "maxItems": 8,
+      "items": {
+        "type": "object", "required": ["dimension", "conclusion", "key_analysis"],
+        "properties": {
+          "dimension": {"type": "string", "pattern": "^[1-8]$"},
+          "conclusion": {"type": "string"},
+          "key_analysis": {"type": "string"}
+        }
+      }
+    },
+    "summary": {
+      "type": "object", "required": ["key_findings", "top_risks", "undetermined"],
+      "properties": {
+        "key_findings": {"type": "array", "items": {"type": "string"}},
+        "top_risks": {"type": "array", "items": {"type": "string"}},
+        "undetermined": {"type": "string"}
+      }
+    },
+    "prompt_injection_suspects": {"type": "array", "items": {"type": "string"}},
+    "self_check": {
+      "type": "array",
+      "items": {"type": "object", "required": ["check", "ok"], "properties": {
+        "check": {"type": "string"}, "ok": {"type": "boolean"}, "note": {"type": "string"}
+      }}
+    }
+  }
+}

@@ -1,0 +1,2 @@
+project_id,project_name,department,owner,git_url,branch,status,tech_stack,project_type,core_flows,scope_out,materials_dir,weights,notes
+demo-order,订单中心,交易研发部,研发经理A,git@git.example.com:trade/order-service.git,main,在研,Java 17 / Spring Boot 3 / MySQL 8,Web 服务-电商交易,下单;支付回调;退款,generated/;docs/legacy/,docs/audit-materials,,示例行：上线前删除
