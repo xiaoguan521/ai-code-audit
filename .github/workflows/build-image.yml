@@ -166,6 +166,17 @@ jobs:
             if docker run --rm $plat -v /tmp/ctx:/workspace/context:ro "$img"; then echo "::error::$arch 入口脚本未校验环境变量"; exit 1; fi
           done
 
+      - name: 真实入口测试（两个架构，本地模拟模型）
+        run: |
+          mkdir -p /tmp/qwen-entrypoint-test
+          printf '%s\n' '---' 'AUDIT_ENTRYPOINT_TEST' > /tmp/qwen-entrypoint-test/prompt.md
+          cp tests/qwen_entrypoint_smoke.cjs /tmp/qwen-entrypoint-test/
+          for arch in amd64 arm64; do
+            docker run --rm --network none --platform "linux/$arch" \
+              -e CI=1 -v /tmp/qwen-entrypoint-test:/workspace/context:ro \
+              --entrypoint node "ai-code-audit:ci-$arch" /workspace/context/qwen_entrypoint_smoke.cjs
+          done
+
       - name: 构建调度器 amd64（本地加载用于冒烟测试）
         uses: docker/build-push-action@v6
         with:
