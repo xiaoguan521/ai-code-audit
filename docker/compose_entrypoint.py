@@ -23,7 +23,7 @@ def configure_settings(settings: dict, env: dict) -> dict:
     settings["output_dir"] = str(Path(data_dir) / "output")
     agent = settings.setdefault("agent", {})
     agent.update({
-        "type": "qwen-docker",
+        "type": "pi-docker",
         "image": env.get("AUDIT_SCANNER_IMAGE") or "ghcr.io/xiaoguan521/ai-code-audit:main",
         "env_file": env.get("AUDIT_MODEL_ENV_PATH") or "/run/secrets/model.env",
         "network": network,

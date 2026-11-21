@@ -143,7 +143,8 @@ def prescan(repo: Path, out: Path, tools: list[str], settings: dict) -> list[str
 # ---------- 调用模型 ----------
 
 def build_prompt(p: dict, mode: str, commit: str, settings: dict, prescan_dir: str | None,
-                 prev_file: str | None, changes: list[str] | None, materials_changed: bool) -> str:
+                 prev_file: str | None, changes: list[str] | None, materials_changed: bool,
+                 changes_file: str | None = None) -> str:
     scope_out = [s for s in (p.get("scope_out") or "").replace("；", ";").split(";") if s.strip()]
     scope_out += settings.get("default_scope_out", [])
     lines = [
@@ -177,7 +178,7 @@ def build_prompt(p: dict, mode: str, commit: str, settings: dict, prescan_dir: s
         shown = (changes or [])[:800]
         lines += [f"  - {c}" for c in shown]
         if changes and len(changes) > len(shown):
-            lines.append(f"  - ……另有 {len(changes) - len(shown)} 个文件，用 git diff --name-only 查看")
+            lines.append(f"  - ……另有 {len(changes) - len(shown)} 个文件，完整清单见 {changes_file or '扫描上下文'}")
     return "\n".join(lines)
 
 
@@ -265,18 +266,18 @@ def check_output(result: dict, checklist: dict) -> list[str]:
 
 
 def network_problem(settings: dict) -> str | None:
-    """qwen-docker 后端必须显式指定容器网络。被审查的代码是不可信输入（可能藏提示注入），
+    """容器后端必须显式指定容器网络。被审查的代码是不可信输入（可能藏提示注入），
     留空会落到 Docker 默认网桥、可以访问任意外网地址。确实要用默认网桥，须显式写 "bridge"。"""
     ag = settings.get("agent", {})
-    if ag.get("type") != "qwen-docker" or (ag.get("network") or "").strip():
+    if ag.get("type") not in {"pi-docker", "qwen-docker"} or (ag.get("network") or "").strip():
         return None
     return ("settings.json 的 agent.network 未配置：容器会落到默认网桥、可访问任意地址。"
             "请创建只放行内网千问的专用 Docker 网络并填入（见 README“网络隔离”）；"
             "确需使用默认网桥，请显式填写 \"bridge\"")
 
 
-def call_qwen_docker(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: int) -> dict:
-    """在一次性容器里运行 Qwen Code：代码与上下文只读挂载，容器内没有 Git 凭据。"""
+def call_pi_docker(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: int) -> dict:
+    """在一次性容器里运行 Pi：代码与上下文只读挂载，容器内没有 Git 凭据。"""
     problem = network_problem(settings)
     if problem:
         raise RuntimeError(problem)
@@ -301,13 +302,15 @@ def call_qwen_docker(prompt: str, repo: Path, ctx: Path, settings: dict, timeout
         r = run(cmd, timeout=timeout)
     except subprocess.TimeoutExpired:
         run(["docker", "kill", name], timeout=60)
-        raise RuntimeError(f"Qwen Code 运行超过 {timeout} 秒，已终止容器 {name}")
+        raise RuntimeError(f"Pi 运行超过 {timeout} 秒，已终止容器 {name}")
     if r.returncode in (53, 55):
-        raise AgentOutputError(f"超出轮次或运行预算上限（exit={r.returncode}），请缩小范围或调大 max_session_turns")
+        raise AgentOutputError(f"Pi 超出轮次或模型输出长度上限（exit={r.returncode}）：{r.stderr[-400:]}")
+    if r.returncode != 0:
+        raise RuntimeError(f"Pi 扫描失败（exit={r.returncode}）：{r.stderr[-600:]}")
     try:
         events = json.loads(r.stdout)
     except json.JSONDecodeError:
-        raise RuntimeError(f"Qwen Code 输出不是 JSON（exit={r.returncode}）：{r.stdout[-400:]} {r.stderr[-600:]}")
+        raise RuntimeError(f"Pi 输出不是 JSON（exit={r.returncode}）：{r.stdout[-400:]} {r.stderr[-600:]}")
     last = events[-1] if isinstance(events, list) and events else {}
     result = extract_json(last.get("result", ""))
     return {"result": result, "cost_usd": None, "session_id": last.get("session_id"),
@@ -316,14 +319,14 @@ def call_qwen_docker(prompt: str, repo: Path, ctx: Path, settings: dict, timeout
 
 def call_agent(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: int) -> dict:
     kind = settings.get("agent", {}).get("type", "claude")
-    if kind == "qwen-docker":
-        return call_qwen_docker(prompt, repo, ctx, settings, timeout)
+    if kind in {"pi-docker", "qwen-docker"}:
+        return call_pi_docker(prompt, repo, ctx, settings, timeout)
     return call_claude(prompt, repo, [ctx], settings, timeout)
 
 
 def ctx_view(settings: dict, ctx: Path) -> str:
     """模型看到的上下文目录路径：容器内固定为 /workspace/context。"""
-    return "/workspace/context" if settings.get("agent", {}).get("type") == "qwen-docker" else str(ctx)
+    return "/workspace/context" if settings.get("agent", {}).get("type") in {"pi-docker", "qwen-docker"} else str(ctx)
 
 
 # ---------- 单项目流程 ----------
@@ -380,8 +383,12 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
                 prev_copy = ctx / "previous_result.json"
                 shutil.copyfile(prev_file, prev_copy)
             view = ctx_view(settings, ctx)
+            changes_file = None
+            if mode == "incremental" and changes and len(changes) > 800:
+                (ctx / "changed_files.txt").write_text("\n".join(changes) + "\n", encoding="utf-8")
+                changes_file = f"{view}/changed_files.txt"
             prompt = build_prompt(p, mode, commit, settings, f"{view}/prescan" if tools_done else None,
-                                  f"{view}/previous_result.json" if prev_copy else None, changes, materials_changed)
+                                  f"{view}/previous_result.json" if prev_copy else None, changes, materials_changed, changes_file)
             timeout = int(settings.get("per_project_timeout_sec", 3600))
             best = None  # 最近一次结构合格的输出（可能仍有语义问题）及其问题清单
             for attempt in (1, 2):  # 输出不合格时带着问题清单重试一次
