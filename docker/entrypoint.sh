@@ -10,7 +10,8 @@ export OPENAI_API_KEY="${OPENAI_API_KEY:-none}"
 SKILL=$(cat /opt/audit/skills/eight-quality-code-audit/SKILL.md)
 SCHEMA=$(cat /opt/audit/result.schema.json)
 
-SYSTEM_EXTRA="${SKILL}
+# Qwen 0.26.1 会把以 - 开头的参数值重新识别为选项；前导空格保留原文并避开该问题。
+SYSTEM_EXTRA=" ${SKILL}
 
 ## 输出格式（批量模式强制）
 完成审查后，最终回复只输出一个 JSON 对象，不要输出任何解释文字或 Markdown，不要用代码块包裹。
@@ -18,7 +19,7 @@ JSON 必须符合下面的 JSON Schema（items 必须恰好 64 项，dimension_n
 ${SCHEMA}"
 
 exec qwen \
-  --prompt "$(cat "$PROMPT_FILE")" \
+  --prompt " $(cat "$PROMPT_FILE")" \
   --output-format json \
   --approval-mode default \
   --append-system-prompt "$SYSTEM_EXTRA" \
