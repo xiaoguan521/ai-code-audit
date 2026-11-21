@@ -1,8 +1,17 @@
 // 在只读扫描容器里运行真实 Pi；模型由容器内的 HTTP 服务模拟。
 const http = require('node:http');
+const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 
-const answer = JSON.stringify({ ok: true, data: '中文测试'.repeat(20_000), end: 'AUDIT_MOCK_END' });
+const checklist = JSON.parse(fs.readFileSync('/workspace/context/checklist.json', 'utf8'));
+const answer = JSON.stringify({
+  inventory: { languages: ['Python'], frameworks: [], build_tools: [], file_count: 1, loc_estimate: 10, modules: [], checked_scope: '全部', unchecked: [] },
+  items: checklist.items.map((item) => ({ id: item.id, result: 'PASS', evidence: ['fixture.txt:1'], risk: 'none', conclusion: 'ok', carried_over: false })),
+  issues: [], need_info_list: [],
+  dimension_notes: checklist.dimensions.map((dimension) => ({ dimension: dimension.id, conclusion: 'ok', key_analysis: '-' })),
+  summary: { key_findings: [], top_risks: [], undetermined: '中文测试'.repeat(20_000) + 'AUDIT_MOCK_END' },
+  self_check: [{ check: '64 项齐全', ok: true }],
+});
 let requests = 0;
 let sawPrompt = false;
 let sawAllowedTools = false;
@@ -86,6 +95,7 @@ server.listen(0, '127.0.0.1', () => {
       process.exitCode = 1;
       return;
     }
+    fs.writeFileSync(`/workspace/test-results/${process.env.AUDIT_TEST_ARCH}.json`, stdout);
     console.log(`Pi 真实入口测试通过：只读范围、.env 排除、模型认证、前导短横线和 ${Buffer.byteLength(stdout)} 字节输出均正常`);
   });
 });

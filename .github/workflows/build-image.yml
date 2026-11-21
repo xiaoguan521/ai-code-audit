@@ -168,18 +168,33 @@ jobs:
 
       - name: 真实入口测试（两个架构，本地模拟模型）
         run: |
-          mkdir -p /tmp/pi-entrypoint-test/context /tmp/pi-entrypoint-test/repo
+          mkdir -p /tmp/pi-entrypoint-test/context /tmp/pi-entrypoint-test/repo /tmp/pi-entrypoint-test/results
+          chmod 0777 /tmp/pi-entrypoint-test/results
           printf '%s\n' '---' 'AUDIT_ENTRYPOINT_TEST' > /tmp/pi-entrypoint-test/context/prompt.md
           printf '%s\n' 'AUDIT_MOCK_READ_CONTENT' > /tmp/pi-entrypoint-test/repo/fixture.txt
           printf '%s\n' 'PRIVATE_TOKEN=DONT_SEND_THIS_VALUE' > /tmp/pi-entrypoint-test/repo/.env
           cp tests/pi_entrypoint_smoke.cjs /tmp/pi-entrypoint-test/context/
+          cp config/checklist.json /tmp/pi-entrypoint-test/context/
           for arch in amd64 arm64; do
             docker run --rm --network none --platform "linux/$arch" \
               --read-only --tmpfs /tmp:rw,size=512m --tmpfs /home/node:rw,size=256m,uid=1000,gid=1000 \
-              -e CI=1 -v /tmp/pi-entrypoint-test/context:/workspace/context:ro \
+              -e CI=1 -e AUDIT_TEST_ARCH="$arch" -v /tmp/pi-entrypoint-test/context:/workspace/context:ro \
               -v /tmp/pi-entrypoint-test/repo:/workspace/repo:ro \
+              -v /tmp/pi-entrypoint-test/results:/workspace/test-results \
               --entrypoint node "ai-code-audit:ci-$arch" /workspace/context/pi_entrypoint_smoke.cjs
           done
+          python3 - <<'PY'
+          import json, sys
+          from pathlib import Path
+          sys.path.insert(0, 'runner')
+          import run_daily, scoring
+          for arch in ('amd64', 'arm64'):
+              events = json.loads(Path(f'/tmp/pi-entrypoint-test/results/{arch}.json').read_text())
+              result = run_daily.extract_json(events[-1]['result'])
+              problems = run_daily.check_output(result, scoring.load_checklist())
+              assert not problems, problems
+              print(f'{arch}: 完整 64 项结果通过调度器结构和语义校验')
+          PY
 
       - name: 构建调度器 amd64（本地加载用于冒烟测试）
         uses: docker/build-push-action@v6
