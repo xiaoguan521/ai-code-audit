@@ -83,9 +83,16 @@ def sync_repo(p: dict, repo: Path, depth: int) -> str:
         r = run(["git", "fetch", "--no-tags", "--depth", str(depth), "origin", branch], cwd=repo, timeout=1800, env=env)
         if r.returncode:
             raise RuntimeError(f"fetch 失败: {r.stderr.strip()[-500:]}")
-        run(["git", "reset", "-q", "--hard", "FETCH_HEAD"], cwd=repo, env=env)
-        run(["git", "clean", "-qffdx"], cwd=repo, env=env)
-    return run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+        # 任何一步失败都必须报错：否则 HEAD 还停在旧提交，会被误判为“无变更 → 沿用”，静默地扫旧代码
+        for cmd in (["git", "reset", "-q", "--hard", "FETCH_HEAD"], ["git", "clean", "-qffdx"]):
+            r = run(cmd, cwd=repo, env=env)
+            if r.returncode:
+                raise RuntimeError(f"{' '.join(cmd[:2])} 失败: {r.stderr.strip()[-500:]}")
+    r = run(["git", "rev-parse", "HEAD"], cwd=repo)
+    commit = r.stdout.strip()
+    if r.returncode or not commit:
+        raise RuntimeError(f"git rev-parse HEAD 失败: {r.stderr.strip()[-500:]}")
+    return commit
 
 
 def changed_files(repo: Path, old: str, new: str) -> list[str] | None:
@@ -205,35 +212,74 @@ def call_claude(prompt: str, repo: Path, extra_dirs: list[Path], settings: dict,
 
 
 class AgentOutputError(RuntimeError):
-    """模型输出无法解析为合格 JSON；可带问题清单重试。"""
+    """模型输出无法解析为合格 JSON 或结构不符合 Schema；可带问题清单重试。"""
+
+    def __init__(self, msg: str, problems: list[str] | None = None):
+        super().__init__(msg)
+        self.problems = problems or [msg]
 
 
 REQUIRED_KEYS = ["inventory", "items", "issues", "need_info_list", "dimension_notes", "summary", "self_check"]
+MAX_PROBLEMS_IN_PROMPT = 30
 
 
 def extract_json(text: str) -> dict:
-    """从模型最终回复中取出 JSON 对象（容忍 ```json 代码块和前后多余文字）。"""
-    t = (text or "").strip()
-    if "```" in t:
-        blocks = [b for b in t.split("```") if b.strip().startswith(("json", "{"))]
-        if blocks:
-            t = blocks[-1].strip()
-            t = t[4:].strip() if t.startswith("json") else t
-    start, end = t.find("{"), t.rfind("}")
-    if start < 0 or end <= start:
-        raise AgentOutputError("最终回复中没有 JSON 对象")
-    try:
-        obj = json.loads(t[start:end + 1])
-    except json.JSONDecodeError as e:
-        raise AgentOutputError(f"JSON 解析失败：{e}")
-    missing = [k for k in REQUIRED_KEYS if k not in obj]
-    if missing:
-        raise AgentOutputError(f"JSON 缺少顶层字段：{missing}")
-    return obj
+    """从模型最终回复中取出 JSON 对象（容忍 ```json 代码块和前后多余文字）。
+
+    不按 ``` 切分文本：证据里引用的代码片段本身可能带 ```，切分会把 JSON 切断。
+    做法是从每个 "{" 尝试解码一个完整 JSON 对象，取最后一个带齐顶层字段的。"""
+    t = text or ""
+    dec = json.JSONDecoder()
+    found: list[dict] = []
+    first_err = None
+    i = t.find("{")
+    while i >= 0:
+        try:
+            obj, end = dec.raw_decode(t, i)
+        except json.JSONDecodeError as e:
+            first_err = first_err or e
+            i = t.find("{", i + 1)
+            continue
+        if isinstance(obj, dict):
+            found.append(obj)
+        i = t.find("{", end)
+    complete = [o for o in found if all(k in o for k in REQUIRED_KEYS)]
+    if complete:
+        return complete[-1]
+    best = max(found, key=lambda o: sum(k in o for k in REQUIRED_KEYS), default=None)
+    # 一个顶层字段都没有、同时又有解析失败：多半是输出被截断，只解出了内部的子对象，按解析失败报
+    if best is not None and (any(k in best for k in REQUIRED_KEYS) or not first_err):
+        raise AgentOutputError(f"JSON 缺少顶层字段：{[k for k in REQUIRED_KEYS if k not in best]}")
+    if first_err:
+        raise AgentOutputError(f"JSON 解析失败：{first_err}")
+    raise AgentOutputError("最终回复中没有 JSON 对象")
+
+
+def check_output(result: dict, checklist: dict) -> list[str]:
+    """先按 JSON Schema 校验结构，不合格抛 AgentOutputError（走重试，绝不进入评分）；
+    结构合格后再做语义校验（证据、问题清单是否一致），返回语义问题列表。"""
+    structural = scoring.schema_errors(result)
+    if structural:
+        raise AgentOutputError(f"输出不符合 JSON Schema（{len(structural)} 处）：{structural[:3]}", structural)
+    return scoring.validate(result, checklist)
+
+
+def network_problem(settings: dict) -> str | None:
+    """qwen-docker 后端必须显式指定容器网络。被审查的代码是不可信输入（可能藏提示注入），
+    留空会落到 Docker 默认网桥、可以访问任意外网地址。确实要用默认网桥，须显式写 "bridge"。"""
+    ag = settings.get("agent", {})
+    if ag.get("type") != "qwen-docker" or (ag.get("network") or "").strip():
+        return None
+    return ("settings.json 的 agent.network 未配置：容器会落到默认网桥、可访问任意地址。"
+            "请创建只放行内网千问的专用 Docker 网络并填入（见 README“网络隔离”）；"
+            "确需使用默认网桥，请显式填写 \"bridge\"")
 
 
 def call_qwen_docker(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: int) -> dict:
     """在一次性容器里运行 Qwen Code：代码与上下文只读挂载，容器内没有 Git 凭据。"""
+    problem = network_problem(settings)
+    if problem:
+        raise RuntimeError(problem)
     ag = settings["agent"]
     (ctx / "prompt.md").write_text(prompt, encoding="utf-8")
     # 容器带唯一名字：超时时 subprocess 只能杀掉 docker 客户端，容器本身要单独 kill，否则会一直跑下去
@@ -247,8 +293,7 @@ def call_qwen_docker(prompt: str, repo: Path, ctx: Path, settings: dict, timeout
         "-w", "/workspace/repo",
         "-e", f"MAX_SESSION_TURNS={ag.get('max_session_turns', 300)}",
     ]
-    if ag.get("network"):
-        cmd += ["--network", ag["network"]]
+    cmd += ["--network", ag["network"].strip()]
     if ag.get("env_file"):
         cmd += ["--env-file", ag["env_file"]]      # OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL
     cmd += [ag.get("image", "ai-code-audit:latest")]
@@ -338,19 +383,26 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
             prompt = build_prompt(p, mode, commit, settings, f"{view}/prescan" if tools_done else None,
                                   f"{view}/previous_result.json" if prev_copy else None, changes, materials_changed)
             timeout = int(settings.get("per_project_timeout_sec", 3600))
-            out, problems = None, []
+            best = None  # 最近一次结构合格的输出（可能仍有语义问题）及其问题清单
             for attempt in (1, 2):  # 输出不合格时带着问题清单重试一次
                 try:
                     out = call_agent(prompt, repo, ctx, settings, timeout)
-                    problems = scoring.validate(out["result"], checklist)
+                    problems = check_output(out["result"], checklist)
+                    best = (out, problems)
                 except AgentOutputError as e:
-                    problems = [str(e)]
-                    if attempt == 2:
+                    # 结构不合格的输出不能拿去评分；两次都没有结构合格的输出，本项目记为失败
+                    if attempt == 2 and best is None:
                         raise
+                    problems = e.problems
                 if not problems:
                     break
                 log(f"{pid}: 第 {attempt} 次输出校验未通过: {problems[:3]}")
-                prompt += "\n\n## 上次输出校验未通过，请修正后重新输出完整 JSON\n" + "\n".join(f"- {x}" for x in problems)
+                if attempt == 1:
+                    shown = problems[:MAX_PROBLEMS_IN_PROMPT]
+                    more = len(problems) - len(shown)
+                    prompt += ("\n\n## 上次输出校验未通过，请修正后重新输出完整 JSON\n" + "\n".join(f"- {x}" for x in shown)
+                               + (f"\n- ……另有 {more} 处同类问题" if more > 0 else ""))
+            out, problems = best
             data = out["result"]
             data["meta"] = {"date": run_date, "mode": mode, "commit": commit, "cost_usd": out["cost_usd"],
                             "session_id": out["session_id"], "prescan_tools": tools_done, "agent": settings.get("agent", {}).get("type", "claude"),
@@ -391,6 +443,12 @@ def main() -> int:
     args = ap.parse_args()
 
     settings = json.loads(Path(args.settings).read_text(encoding="utf-8"))
+    problem = network_problem(settings)
+    if problem:
+        if not args.dry_run:
+            log(f"拒绝启动：{problem}")
+            return 2
+        log(f"警告：{problem}")
     statuses = set(settings.get("scan_statuses", ["在研"]))
     projects = load_projects(Path(args.projects), statuses)
     if args.only:

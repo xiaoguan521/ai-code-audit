@@ -4,8 +4,10 @@
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
+import re
 from pathlib import Path
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
@@ -14,6 +16,53 @@ NEED_INFO = ("NEED_INFO-运行数据", "NEED_INFO-补充材料")
 
 def load_checklist() -> dict:
     return json.loads((CONFIG_DIR / "checklist.json").read_text(encoding="utf-8"))
+
+
+@functools.lru_cache(maxsize=1)
+def load_schema() -> dict:
+    return json.loads((CONFIG_DIR / "result.schema.json").read_text(encoding="utf-8"))
+
+
+_TYPES = {
+    "object": lambda v: isinstance(v, dict),
+    "array": lambda v: isinstance(v, list),
+    "string": lambda v: isinstance(v, str),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "boolean": lambda v: isinstance(v, bool),
+}
+
+
+def schema_errors(value, schema: dict | None = None, path: str = "$") -> list[str]:
+    """按 result.schema.json 校验结构（支持其中用到的 type / required / properties / items /
+    enum / pattern / minItems / maxItems）。Qwen Code 没有 --json-schema 强约束，评分前必须先过这一关，
+    否则字段缺失或枚举值写错会在评分时直接崩溃。返回问题列表（空表示通过）。"""
+    if schema is None:
+        schema = load_schema()
+    errs: list[str] = []
+    t = schema.get("type")
+    if t and not _TYPES[t](value):
+        return [f"{path} 类型应为 {t}，实际为 {type(value).__name__}"]
+    if "enum" in schema and value not in schema["enum"]:
+        errs.append(f"{path} 取值 {json.dumps(value, ensure_ascii=False)} 不在允许范围 {schema['enum']}")
+    if "pattern" in schema and isinstance(value, str) and not re.search(schema["pattern"], value):
+        errs.append(f"{path} 取值 {value!r} 不符合格式 {schema['pattern']}")
+    if isinstance(value, dict):
+        for k in schema.get("required", []):
+            if k not in value:
+                errs.append(f"{path} 缺少必填字段 {k}")
+        for k, sub in schema.get("properties", {}).items():
+            if k in value:
+                errs += schema_errors(value[k], sub, f"{path}.{k}")
+    if isinstance(value, list):
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            errs.append(f"{path} 至少需要 {schema['minItems']} 项，实际 {len(value)} 项")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            errs.append(f"{path} 最多 {schema['maxItems']} 项，实际 {len(value)} 项")
+        if "items" in schema:
+            for i, v in enumerate(value):
+                errs += schema_errors(v, schema["items"], f"{path}[{i}]")
+    return errs
 
 
 def parse_weights(raw: str | None, checklist: dict) -> dict[str, float]:

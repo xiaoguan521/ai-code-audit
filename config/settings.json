@@ -38,6 +38,6 @@
     "memory": "6g",
     "cpus": 2,
     "max_session_turns": 300,
-    "_说明": "type 可选 qwen-docker（内网千问，推荐）或 claude（Claude Code 直连）"
+    "_说明": "type 可选 qwen-docker（内网千问，推荐）或 claude（Claude Code 直连）；qwen-docker 必须填 network（只放行千问的专用 Docker 网络），留空拒绝启动，确需默认网桥显式填 bridge"
   }
 }

@@ -11,13 +11,13 @@
 | 修改检查规则 | 改 `skill/eight-quality-audit/SKILL.md`；增删检查项后运行 `python3 tools/gen_checklist.py` | CI 校验 64 项与 checklist / schema 一致；合并后重新构建镜像 |
 | 调整权重、评分档位 | 改 `config/checklist.json` | CI 校验权重合计 100 |
 | 升级 Qwen Code | 改 `docker/QWEN_CODE_VERSION` | 构建镜像并冒烟测试（版本号、Skill、配置、非 root、入口校验） |
-| 发布给内网 | 打 tag：`git tag v1.0.0 && git push origin v1.0.0` | 镜像推送到 `ghcr.io/<owner>/<repo>:1.0.0`，并在 GitHub Release 附带离线镜像包 `ai-code-audit_v1.0.0_amd64.tar.gz` 和 sha256 |
+| 发布给内网 | 打 tag：`git tag v1.0.0 && git push origin v1.0.0` | 镜像推送到 `ghcr.io/<owner>/<repo>:1.0.0`，镜像为多架构（amd64 + arm64）；GitHub Release 附带两个离线镜像包 `ai-code-audit_v1.0.0_amd64.tar.gz`、`ai-code-audit_v1.0.0_arm64.tar.gz` 及各自 sha256 |
 
 工作流文件：`.github/workflows/ci.yml`（每次 PR / push 跑测试）、`.github/workflows/build-image.yml`（构建、测试、推送镜像，tag 时出离线包）。Dependabot 每月提醒升级 Actions 与基础镜像。
 
 内网取镜像的三种方式（按安全规范选）：
-1. 从 Release 下载离线包，校验 sha256 后 `docker load`（纯内网推荐）；
-2. 由能出网的同步机把 `ghcr.io/<owner>/<repo>:<版本>` 同步到公司 Harbor，运行机从 Harbor 拉；
+1. 从 Release 下载与运行机架构对应的离线包（`uname -m` 为 x86_64 选 `_amd64`，aarch64 选 `_arm64`），校验 sha256 后 `docker load`（纯内网推荐）；
+2. 由能出网的同步机把 `ghcr.io/<owner>/<repo>:<版本>` 同步到公司 Harbor（用 `skopeo copy --all` 或 `crane copy` 保留两个架构），运行机从 Harbor 拉；
 3. 运行机经代理直接 `docker pull`（需要 GHCR 的读权限 token）。
 
 运行机部署时，把仓库 clone（或拷贝）到运行机，`runner/` 与 `config/` 在宿主机运行，镜像只负责模型审查；`config/projects.csv` 中的真实 Git 地址属于内部资产，可以只保存在运行机上，仓库里保留示例行。
@@ -37,6 +37,7 @@ runner/render.py                     报告、CSV、看板渲染
 runner/dashboard_template.html       看板模板（单文件，无外部依赖）
 tests/make_samples.py                用模拟数据验证评分与渲染：python3 tests/make_samples.py /tmp/out
 tests/check_consistency.py           SKILL / checklist / schema / 配置一致性检查（CI 必跑）
+tests/test_runner.py                 单元测试：输出 Schema 校验、JSON 提取、重试、网络、git 同步（python3 -m unittest discover -s tests）
 tools/gen_checklist.py               从 SKILL.md 重新生成 checklist.json
 .github/workflows/                   CI 与镜像构建流水线
 docker/QWEN_CODE_VERSION             镜像内 Qwen Code 版本（单一来源）
@@ -65,14 +66,14 @@ run_daily.py ──git fetch（只读凭据，只在宿主机）     Qwen Code +
 
 安全要点：容器里没有 Git 凭据；代码以 `:ro` 挂载，即使模型尝试写文件也会失败；容器以非 root 运行，`--read-only`、`--cap-drop ALL`、`no-new-privileges`、限制 CPU/内存/进程数；Qwen Code 的遥测、使用统计、自动更新在系统级配置中关闭，写文件、联网抓取等工具被禁用。
 
-1. **构建镜像（在能上网的构建机）**：`QWEN_CODE_VERSION=<稳定版本号> sh docker/build.sh 1.0`，得到 `ai-code-audit_1.0.tar.gz`。如需从内网镜像仓库拉基础镜像，加 `BASE_IMAGE=harbor.xxx/library/node:22-bookworm-slim`。完全离线构建：先 `npm pack @qwen-code/qwen-code@<版本>`，把 tgz 放进 `docker/offline/`。
-2. **导入内网**：`docker load < ai-code-audit_1.0.tar.gz`。
+1. **构建镜像（在能上网的构建机）**：`QWEN_CODE_VERSION=<稳定版本号> sh docker/build.sh 1.0`，得到本机架构的 `ai-code-audit_1.0_<amd64|arm64>.tar.gz` 及 sha256。给 ARM 服务器（鲲鹏、飞腾等）构建加 `PLATFORM=linux/arm64`（x86 构建机需先装 QEMU：`docker run --privileged --rm tonistiigi/binfmt --install arm64`），反之加 `PLATFORM=linux/amd64`。如需从内网镜像仓库拉基础镜像，加 `BASE_IMAGE=harbor.xxx/library/node:22-bookworm-slim`（该镜像须包含目标架构）。完全离线构建：先 `npm pack @qwen-code/qwen-code@<版本>`，把 tgz 放进 `docker/offline/`。
+2. **导入内网**：`sha256sum -c ai-code-audit_1.0_amd64.tar.gz.sha256 && docker load < ai-code-audit_1.0_amd64.tar.gz`（ARM 运行机换成 `_arm64`）。
 3. **配置模型地址**：`cp docker/model.env.example /etc/ai-audit/model.env && chmod 600 /etc/ai-audit/model.env`，填内网千问的 `OPENAI_BASE_URL`（OpenAI 兼容接口，一般以 /v1 结尾）、`OPENAI_MODEL`、`OPENAI_API_KEY`。
-4. **网络隔离（建议）**：建一个专用 Docker 网络，在宿主机防火墙上只放行该网络到千问服务的地址和端口，填到 settings.json 的 `agent.network`。
+4. **网络隔离（必填）**：建一个专用 Docker 网络（如 `docker network create --subnet 172.30.0.0/24 ai-audit-net`），在宿主机防火墙上只放行该网段到千问服务的地址和端口，填到 settings.json 的 `agent.network`。被审查的代码是不可信输入，`agent.network` 留空时 runner 拒绝启动（`--dry-run` 只告警）；确需使用 Docker 默认网桥（可访问任意外网），须显式填写 `"bridge"`。
 5. **冒烟测试**：`sh docker/smoke_test.sh ai-code-audit:1.0 /etc/ai-audit/model.env`，确认能连上千问、列出文件，并且创建 x.txt 失败。
 6. **试扫一个项目**：`python3 runner/run_daily.py --only <项目ID> --force-full`，人工核对报告证据；再按下面第 8 步配置定时任务。
 
-千问模型说明：Qwen Code 没有 Claude Code 的 `--json-schema` 强约束，镜像入口会把 Schema 附在系统提示里要求只输出 JSON；runner 负责解析（容忍代码块包裹）、校验 64 项是否齐全、证据与问题清单是否一致，不合格带着问题清单重试一次。仓库很大时如出现退出码 53（轮次超限），调大 `agent.max_session_turns` 或在 projects.csv 中用 scope_out 排除无关目录。
+千问模型说明：Qwen Code 没有 Claude Code 的 `--json-schema` 强约束，镜像入口会把 Schema 附在系统提示里要求只输出 JSON；runner 负责解析（容忍代码块包裹和前后文字）、按 `config/result.schema.json` 逐字段校验结构（字段缺失、枚举值写错、类型不对都会带着问题清单重试，结构不合格的输出绝不进入评分）、校验 64 项是否齐全、证据与问题清单是否一致，不合格带着问题清单重试一次。仓库很大时如出现退出码 53（轮次超限），调大 `agent.max_session_turns` 或在 projects.csv 中用 scope_out 排除无关目录。
 
 ## 部署步骤（Claude Code 后端，兴华 + 晓晨）
 
