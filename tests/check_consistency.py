@@ -22,7 +22,6 @@ skill_items = re.findall(r"^\| (\d+\.\d+) \| ([^|]+)\|", skill, re.M)
 ck = load("config/checklist.json")
 schema = load("config/result.schema.json")
 load("config/settings.json")
-load("docker/qwen-settings.json")
 
 if len(skill_items) != 64:
     errors.append(f"SKILL.md 检查项应为 64 个，实际 {len(skill_items)}")

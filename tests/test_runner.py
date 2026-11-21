@@ -187,17 +187,18 @@ class RetryTest(unittest.TestCase):
 
 
 class NetworkTest(unittest.TestCase):
-    def test_qwen_requires_network(self):
-        self.assertIsNotNone(run_daily.network_problem({"agent": {"type": "qwen-docker", "network": ""}}))
-        self.assertIsNotNone(run_daily.network_problem({"agent": {"type": "qwen-docker"}}))
-        self.assertIsNone(run_daily.network_problem({"agent": {"type": "qwen-docker", "network": "audit-net"}}))
-        self.assertIsNone(run_daily.network_problem({"agent": {"type": "qwen-docker", "network": "bridge"}}))
+    def test_container_backends_require_network(self):
+        for kind in ("pi-docker", "qwen-docker"):
+            self.assertIsNotNone(run_daily.network_problem({"agent": {"type": kind, "network": ""}}))
+            self.assertIsNotNone(run_daily.network_problem({"agent": {"type": kind}}))
+            self.assertIsNone(run_daily.network_problem({"agent": {"type": kind, "network": "audit-net"}}))
+            self.assertIsNone(run_daily.network_problem({"agent": {"type": kind, "network": "bridge"}}))
         self.assertIsNone(run_daily.network_problem({"agent": {"type": "claude"}}))
 
     def test_main_refuses_to_start(self):
         with tempfile.TemporaryDirectory() as t:
             s = Path(t) / "settings.json"
-            s.write_text(json.dumps({"workdir": f"{t}/w", "output_dir": f"{t}/o", "agent": {"type": "qwen-docker", "network": ""}}))
+            s.write_text(json.dumps({"workdir": f"{t}/w", "output_dir": f"{t}/o", "agent": {"type": "pi-docker", "network": ""}}))
             with mock.patch.object(sys, "argv", ["run_daily.py", "--settings", str(s)]), \
                     mock.patch.object(run_daily, "scan_project") as scan:
                 self.assertEqual(run_daily.main(), 2)
@@ -207,15 +208,33 @@ class NetworkTest(unittest.TestCase):
     def test_call_refuses_without_network(self):
         with mock.patch.object(run_daily, "run") as run, tempfile.TemporaryDirectory() as t:
             with self.assertRaisesRegex(RuntimeError, "agent.network"):
-                run_daily.call_qwen_docker("p", Path(t), Path(t), {"agent": {"type": "qwen-docker"}}, 10)
+                run_daily.call_pi_docker("p", Path(t), Path(t), {"agent": {"type": "pi-docker"}}, 10)
             run.assert_not_called()
 
     def test_network_passed_to_docker(self):
         done = subprocess.CompletedProcess([], 0, stdout=json.dumps([{"result": json.dumps(valid_result())}]), stderr="")
         with mock.patch.object(run_daily, "run", return_value=done) as run, tempfile.TemporaryDirectory() as t:
-            run_daily.call_qwen_docker("p", Path(t), Path(t), {"agent": {"type": "qwen-docker", "network": "audit-net"}}, 10)
+            run_daily.call_pi_docker("p", Path(t), Path(t), {"agent": {"type": "pi-docker", "network": "audit-net"}}, 10)
         cmd = run.call_args.args[0]
         self.assertEqual(cmd[cmd.index("--network") + 1], "audit-net")
+
+    def test_nonzero_exit_is_reported(self):
+        done = subprocess.CompletedProcess([], 1, stdout="", stderr="模型服务不可用")
+        with mock.patch.object(run_daily, "run", return_value=done), tempfile.TemporaryDirectory() as t:
+            with self.assertRaisesRegex(RuntimeError, "模型服务不可用"):
+                run_daily.call_pi_docker("p", Path(t), Path(t), {"agent": {"type": "pi-docker", "network": "audit-net"}}, 10)
+
+
+class PromptTest(unittest.TestCase):
+    def test_large_change_list_points_to_complete_manifest(self):
+        project = {"project_id": "p", "project_name": "测试项目"}
+        changes = [f"file-{i}.py" for i in range(801)]
+        prompt = run_daily.build_prompt(project, "incremental", "c" * 40, {}, None,
+                                        "/workspace/context/previous_result.json", changes, False,
+                                        "/workspace/context/changed_files.txt")
+        self.assertIn("/workspace/context/changed_files.txt", prompt)
+        self.assertIn("file-799.py", prompt)
+        self.assertNotIn("file-800.py", prompt)
 
 
 class SyncRepoTest(unittest.TestCase):

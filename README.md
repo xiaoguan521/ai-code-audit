@@ -1,6 +1,6 @@
 # 八性 AI 代码检查 · 部署包
 
-支持两种模型后端（config/settings.json 的 agent.type）：**qwen-docker**（推荐，内网千问 + Qwen Code，在一次性 Docker 容器中运行）和 **claude**（Claude Code 直连）。基于智能体无界面模式，对全公司在研项目每天做一次只读静态审查，按“八性”64 项检查项出逐项结论，由程序按固定规则出分，生成单项目报告、每日汇总、评分表和静态看板。
+支持两种模型后端（config/settings.json 的 agent.type）：**pi-docker**（推荐，Pi + 内网 OpenAI 兼容模型，在一次性 Docker 容器中运行）和 **claude**（Claude Code 直连）。基于智能体无界面模式，对全公司在研项目每天做一次只读静态审查，按“八性”64 项检查项出逐项结论，由程序按固定规则出分，生成单项目报告、每日汇总、评分表和静态看板。
 
 ## 仓库维护（GitHub）
 
@@ -10,7 +10,7 @@
 |---|---|---|
 | 修改检查规则 | 改 `skill/eight-quality-audit/SKILL.md`；增删检查项后运行 `python3 tools/gen_checklist.py` | CI 校验 64 项与 checklist / schema 一致；合并后重新构建镜像 |
 | 调整权重、评分档位 | 改 `config/checklist.json` | CI 校验权重合计 100 |
-| 升级 Qwen Code | 改 `docker/QWEN_CODE_VERSION` | 构建镜像并冒烟测试（版本号、Skill、配置、非 root、入口校验） |
+| 升级 Pi | 改 `docker/PI_VERSION` | 构建镜像并冒烟测试（版本号、Skill、非 root、真实入口及大输出） |
 | 发布给内网 | 打 tag：`git tag v1.0.0 && git push origin v1.0.0` | 扫描镜像 `ghcr.io/<owner>/<repo>:1.0.0` 和调度镜像 `ghcr.io/<owner>/<repo>-runner:1.0.0` 均为 amd64 + arm64；GitHub Release 为两种镜像的每个架构分别附离线包及 sha256 |
 
 工作流文件：`.github/workflows/ci.yml`（每次 PR / push 跑测试）、`.github/workflows/build-image.yml`（构建、测试、推送镜像，tag 时出离线包）。Dependabot 每月提醒升级 Actions 与基础镜像。
@@ -30,7 +30,7 @@ config/checklist.json                64 项检查项与权重、评分参数（�
 config/result.schema.json            模型输出的 JSON Schema（约束结构，保证可自动出分）
 config/projects.csv                  项目 Git 地址清单（张玲维护，示例行上线前删除）
 config/settings.json                 运行参数（目录、并发、预算、全量扫描日、模型后端 agent 等）
-docker/                              Qwen Code 扫描镜像：Dockerfile、入口脚本、系统级配置、构建与冒烟测试脚本
+docker/                              Pi 扫描镜像：Dockerfile、入口脚本、构建与冒烟测试脚本
 runner/run_daily.py                  每日扫描入口
 runner/scoring.py                    校验与评分（确定性计算）
 runner/render.py                     报告、CSV、看板渲染
@@ -40,7 +40,7 @@ tests/check_consistency.py           SKILL / checklist / schema / 配置一致�
 tests/test_runner.py                 单元测试：输出 Schema 校验、JSON 提取、重试、网络、git 同步（python3 -m unittest discover -s tests）
 tools/gen_checklist.py               从 SKILL.md 重新生成 checklist.json
 .github/workflows/                   CI 与镜像构建流水线
-docker/QWEN_CODE_VERSION             镜像内 Qwen Code 版本（单一来源）
+docker/PI_VERSION                    镜像内 Pi 版本（单一来源）
 ```
 
 ## 运行机制
@@ -53,33 +53,33 @@ docker/QWEN_CODE_VERSION             镜像内 Qwen Code 版本（单一来源�
 
 评分不由模型给出：模型只输出每项 PASS/WARN/FAIL/N/A/NEED_INFO 和证据，`scoring.py` 按 SKILL.md 第 6 节固定规则计算，同样的结论永远得同样的分。
 
-## 纯内网部署：Qwen Code + Docker（推荐）
+## 纯内网部署：Pi + Docker（推荐）
 
 ```
 运行机（宿主机）                                   一次性容器 ai-code-audit（每个项目一个）
-run_daily.py ──git fetch（只读凭据，只在宿主机）     Qwen Code + 八性 Skill + 只读权限配置
+run_daily.py ──git fetch（只读凭据，只在宿主机）     Pi + 八性 Skill + 只读工具
      │  写入 work/<项目>/context/prompt.md            │  /workspace/repo     ← 代码，只读挂载
      └─ docker run ─────────────────────────────────▶ │  /workspace/context  ← 提示词/预扫描/上次结果，只读挂载
                                                       └─ 仅能访问内网千问 OPENAI_BASE_URL，输出 JSON 到 stdout
      ◀── 解析 JSON → 校验（不合格重试一次）→ 程序评分 → 报告 / 看板
 ```
 
-安全要点：容器里没有 Git 凭据；代码以 `:ro` 挂载，即使模型尝试写文件也会失败；容器以非 root 运行，`--read-only`、`--cap-drop ALL`、`no-new-privileges`、限制 CPU/内存/进程数；Qwen Code 的遥测、使用统计、自动更新在系统级配置中关闭，写文件、联网抓取等工具被禁用。
+安全要点：容器里没有 Git 凭据；代码以 `:ro` 挂载；容器以非 root 运行，`--read-only`、`--cap-drop ALL`、`no-new-privileges` 并限制资源。Pi 只启用 read、grep、find、ls；工具路径限制在仓库和扫描上下文，直接读取和搜索时排除 `.env`、`.env.*`；不加载仓库里的扩展和指令，也不自动联网更新。其他文件仍可能含敏感信息，模型服务的网络范围仍需通过防火墙限制。
 
-1. **构建镜像（在能上网的构建机）**：`QWEN_CODE_VERSION=<稳定版本号> sh docker/build.sh 1.0`，得到本机架构的 `ai-code-audit_1.0_<amd64|arm64>.tar.gz` 及 sha256。给 ARM 服务器（鲲鹏、飞腾等）构建加 `PLATFORM=linux/arm64`（x86 构建机需先装 QEMU：`docker run --privileged --rm tonistiigi/binfmt --install arm64`），反之加 `PLATFORM=linux/amd64`。如需从内网镜像仓库拉基础镜像，加 `BASE_IMAGE=harbor.xxx/library/node:22-bookworm-slim`（该镜像须包含目标架构）。完全离线构建：先 `npm pack @qwen-code/qwen-code@<版本>`，把 tgz 放进 `docker/offline/`。
+1. **构建镜像（在能上网的构建机）**：`sh docker/build.sh 1.0`，得到本机架构的 `ai-code-audit_1.0_<amd64|arm64>.tar.gz` 及 sha256；覆盖版本可设置 `PI_VERSION`。给 ARM 服务器构建加 `PLATFORM=linux/arm64`，反之加 `PLATFORM=linux/amd64`。如需从内网镜像仓库拉基础镜像，加 `BASE_IMAGE=harbor.xxx/library/node:22-bookworm-slim`（Node.js 须不低于 22.19，镜像须包含目标架构）。纯内网优先导入 GitHub Release 的离线镜像包。
 2. **导入内网**：`sha256sum -c ai-code-audit_1.0_amd64.tar.gz.sha256 && docker load < ai-code-audit_1.0_amd64.tar.gz`（ARM 运行机换成 `_arm64`）。
 3. **配置模型地址**：`cp docker/model.env.example /etc/ai-audit/model.env && chmod 600 /etc/ai-audit/model.env`，填内网千问的 `OPENAI_BASE_URL`（OpenAI 兼容接口，一般以 /v1 结尾）、`OPENAI_MODEL`、`OPENAI_API_KEY`。
 4. **网络隔离（必填）**：建一个专用 Docker 网络（如 `docker network create --subnet 172.30.0.0/24 ai-audit-net`），在宿主机防火墙上只放行该网段到千问服务的地址和端口，填到 settings.json 的 `agent.network`。被审查的代码是不可信输入，`agent.network` 留空时 runner 拒绝启动（`--dry-run` 只告警）；确需使用 Docker 默认网桥（可访问任意外网），须显式填写 `"bridge"`。
-5. **冒烟测试**：`sh docker/smoke_test.sh ai-code-audit:1.0 /etc/ai-audit/model.env`，确认能连上千问、列出文件，并且创建 x.txt 失败。
+5. **冒烟测试**：`AUDIT_MODEL_NETWORK=ai-audit-net sh docker/smoke_test.sh ai-code-audit:1.0 /etc/ai-audit/model.env`，确认 Pi 能连接模型并返回完整结果。
 6. **试扫一个项目**：`python3 runner/run_daily.py --only <项目ID> --force-full`，人工核对报告证据；再按下面第 8 步配置定时任务。
 
-千问模型说明：Qwen Code 没有 Claude Code 的 `--json-schema` 强约束，镜像入口会把 Schema 附在系统提示里要求只输出 JSON；runner 负责解析（容忍代码块包裹和前后文字）、按 `config/result.schema.json` 逐字段校验结构（字段缺失、枚举值写错、类型不对都会带着问题清单重试，结构不合格的输出绝不进入评分）、校验 64 项是否齐全、证据与问题清单是否一致，不合格带着问题清单重试一次。仓库很大时如出现退出码 53（轮次超限），调大 `agent.max_session_turns` 或在 projects.csv 中用 scope_out 排除无关目录。
+模型说明：Pi 使用 OpenAI 兼容的 Chat Completions 接口，模型需支持流式输出和工具调用；可继续使用内网千问模型。镜像入口将 Schema 附在系统提示中，runner 解析、逐字段校验并在结果不合格时重试。Pi 默认按 128000 token 上下文、16384 token 最大输出配置模型，可在 `model.env` 中用 `PI_CONTEXT_WINDOW` 和 `PI_MAX_OUTPUT_TOKENS` 按实际模型调整。超出轮次时可调整 `agent.max_session_turns`。旧配置中的 `qwen-docker` 名称暂时保留兼容，应使用新的 Pi 扫描镜像。
 
 ## Docker Compose 批量扫描
 
 内网部署、离线镜像导入与运维排障详见[内网部署运维手册](docs/内网部署运维手册.md)。
 
-Compose 中 `scanner-image` 指向 GitHub 发布的 Qwen 扫描镜像；`audit` 使用同一工作流发布的调度镜像，负责拉取仓库、管理扫描状态和生成报告。调度器通过本机 Docker 为每个项目启动一个 `scanner-image` 对应镜像的独立容器。扫描完成后调度容器退出；再次运行会使用保存的状态，按原有规则选择全量、增量或复用。两个镜像的发布需要相应代码进入 `main` 且 `Build image` 工作流成功；PR 测试阶段只构建和测试，不推送镜像。
+Compose 中 `scanner-image` 指向 GitHub 发布的 Pi 扫描镜像；`audit` 使用同一工作流发布的调度镜像，负责拉取仓库、管理扫描状态和生成报告。调度器通过本机 Docker 为每个项目启动一个 `scanner-image` 对应镜像的独立容器。扫描完成后调度容器退出；再次运行会使用保存的状态，按原有规则选择全量、增量或复用。两个镜像的发布需要相应代码进入 `main` 且 `Build image` 工作流成功；PR 测试阶段只构建和测试，不推送镜像。
 
 1. 在有 Docker Engine 和 Compose 的运行机上，从项目目录准备配置：
    ```sh

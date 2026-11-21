@@ -1,4 +1,4 @@
-# 调度容器只负责拉取仓库、启动扫描容器和生成报告；Qwen 镜像单独发布。
+# 调度容器只负责拉取仓库、启动扫描容器和生成报告；Pi 镜像单独发布。
 FROM docker:27-cli
 
 RUN apk add --no-cache python3 git openssh-client ca-certificates tzdata \

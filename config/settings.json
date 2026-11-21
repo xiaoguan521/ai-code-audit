@@ -31,13 +31,13 @@
     "new_p0": true
   },
   "agent": {
-    "type": "qwen-docker",
+    "type": "pi-docker",
     "image": "ai-code-audit:1.0",
     "env_file": "/etc/ai-audit/model.env",
     "network": "",
     "memory": "6g",
     "cpus": 2,
     "max_session_turns": 300,
-    "_说明": "type 可选 qwen-docker（内网千问，推荐）或 claude（Claude Code 直连）；qwen-docker 必须填 network（只放行千问的专用 Docker 网络），留空拒绝启动，确需默认网桥显式填 bridge"
+    "_说明": "type 可选 pi-docker（内网 OpenAI 兼容模型）或 claude；pi-docker 必须填 network，留空拒绝启动，确需默认网桥显式填 bridge。旧的 qwen-docker 名称保留兼容，应使用 Pi 扫描镜像"
   }
 }

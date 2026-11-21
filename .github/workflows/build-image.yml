@@ -27,8 +27,8 @@ on:
       - ".github/workflows/build-image.yml"
   workflow_dispatch:
     inputs:
-      qwen_code_version:
-        description: "覆盖 Qwen Code 版本（留空用 docker/QWEN_CODE_VERSION）"
+      pi_version:
+        description: "覆盖 Pi 版本（留空用 docker/PI_VERSION）"
         required: false
 
 permissions:
@@ -47,6 +47,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m unittest discover -s tests
+      - run: node --test tests/test_pi_events.cjs
       - run: python tests/check_consistency.py
       - run: python tools/gen_checklist.py && git diff --exit-code -- config/checklist.json
       - run: python tests/make_samples.py /tmp/out
@@ -64,14 +65,14 @@ jobs:
       - name: 准备变量
         id: vars
         env:
-          INPUT_VERSION: ${{ inputs.qwen_code_version }}
+          INPUT_VERSION: ${{ inputs.pi_version }}
         run: |
           v="$INPUT_VERSION"
           if [ -n "$v" ] && ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::Qwen Code 版本号格式不对：$v"; exit 1
+            echo "::error::Pi 版本号格式不对：$v"; exit 1
           fi
-          [ -z "$v" ] && v="$(tr -d '[:space:]' < docker/QWEN_CODE_VERSION)"
-          echo "qwen_code_version=$v" >> "$GITHUB_OUTPUT"
+          [ -z "$v" ] && v="$(tr -d '[:space:]' < docker/PI_VERSION)"
+          echo "pi_version=$v" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
           echo "runner_image=ghcr.io/${GITHUB_REPOSITORY,,}-runner" >> "$GITHUB_OUTPUT"
 
@@ -102,8 +103,8 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=ai-code-audit
-            org.opencontainers.image.description=八性 AI 代码检查（Qwen Code + Skill）
-            io.qwen-code.version=${{ steps.vars.outputs.qwen_code_version }}
+            org.opencontainers.image.description=八性 AI 代码检查（Pi + Skill）
+            io.pi.version=${{ steps.vars.outputs.pi_version }}
 
       - name: 生成调度镜像标签
         id: runner_meta
@@ -131,7 +132,7 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: ai-code-audit:ci-amd64
-          build-args: QWEN_CODE_VERSION=${{ steps.vars.outputs.qwen_code_version }}
+          build-args: PI_VERSION=${{ steps.vars.outputs.pi_version }}
           cache-from: type=gha,scope=amd64
           cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=amd64,mode=max,ignore-error=true' || '' }}
 
@@ -143,7 +144,7 @@ jobs:
           platforms: linux/arm64
           load: true
           tags: ai-code-audit:ci-arm64
-          build-args: QWEN_CODE_VERSION=${{ steps.vars.outputs.qwen_code_version }}
+          build-args: PI_VERSION=${{ steps.vars.outputs.pi_version }}
           cache-from: type=gha,scope=arm64
           cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=arm64,mode=max,ignore-error=true' || '' }}
 
@@ -154,13 +155,12 @@ jobs:
             img="ai-code-audit:ci-$arch"; plat="--platform linux/$arch"
             echo "== $arch =="
             [ "$(docker image inspect -f '{{.Architecture}}' "$img")" = "$arch" ] || { echo "::error::$img 架构不是 $arch"; exit 1; }
-            docker run --rm $plat --entrypoint qwen "$img" --version
+            docker run --rm $plat --entrypoint pi "$img" --version
             docker run --rm $plat --entrypoint sh "$img" -c '
               test -f /opt/audit/skills/eight-quality-code-audit/SKILL.md &&
               test -f /opt/audit/result.schema.json &&
-              test -f /etc/qwen-code/settings.json &&
-              grep -q "\"usageStatisticsEnabled\": false" /etc/qwen-code/settings.json &&
-              rg --version >/dev/null && git --version >/dev/null &&
+              test -f /opt/audit/pi_entrypoint.cjs &&
+              rg --version >/dev/null && fdfind --version >/dev/null && git --version >/dev/null &&
               [ "$(id -u)" != "0" ] && echo "镜像内容检查通过：$(uname -m)"'
             # 未配置模型地址时入口脚本应拒绝启动
             if docker run --rm $plat -v /tmp/ctx:/workspace/context:ro "$img"; then echo "::error::$arch 入口脚本未校验环境变量"; exit 1; fi
@@ -168,13 +168,17 @@ jobs:
 
       - name: 真实入口测试（两个架构，本地模拟模型）
         run: |
-          mkdir -p /tmp/qwen-entrypoint-test
-          printf '%s\n' '---' 'AUDIT_ENTRYPOINT_TEST' > /tmp/qwen-entrypoint-test/prompt.md
-          cp tests/qwen_entrypoint_smoke.cjs /tmp/qwen-entrypoint-test/
+          mkdir -p /tmp/pi-entrypoint-test/context /tmp/pi-entrypoint-test/repo
+          printf '%s\n' '---' 'AUDIT_ENTRYPOINT_TEST' > /tmp/pi-entrypoint-test/context/prompt.md
+          printf '%s\n' 'AUDIT_MOCK_READ_CONTENT' > /tmp/pi-entrypoint-test/repo/fixture.txt
+          printf '%s\n' 'PRIVATE_TOKEN=DONT_SEND_THIS_VALUE' > /tmp/pi-entrypoint-test/repo/.env
+          cp tests/pi_entrypoint_smoke.cjs /tmp/pi-entrypoint-test/context/
           for arch in amd64 arm64; do
             docker run --rm --network none --platform "linux/$arch" \
-              -e CI=1 -v /tmp/qwen-entrypoint-test:/workspace/context:ro \
-              --entrypoint node "ai-code-audit:ci-$arch" /workspace/context/qwen_entrypoint_smoke.cjs
+              --read-only --tmpfs /tmp:rw,size=512m --tmpfs /home/node:rw,size=256m,uid=1000,gid=1000 \
+              -e CI=1 -v /tmp/pi-entrypoint-test/context:/workspace/context:ro \
+              -v /tmp/pi-entrypoint-test/repo:/workspace/repo:ro \
+              --entrypoint node "ai-code-audit:ci-$arch" /workspace/context/pi_entrypoint_smoke.cjs
           done
 
       - name: 构建调度器 amd64（本地加载用于冒烟测试）
@@ -226,7 +230,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: QWEN_CODE_VERSION=${{ steps.vars.outputs.qwen_code_version }}
+          build-args: PI_VERSION=${{ steps.vars.outputs.pi_version }}
           cache-from: |
             type=gha,scope=amd64
             type=gha,scope=arm64
