@@ -1,0 +1,4 @@
+project_id,project_name,department,owner,git_url,branch,status,tech_stack,project_type,core_flows,scope_out,materials_dir,weights,notes
+order-main,订单中心主分支,交易研发部,负责人A,https://git.example.com/trade/order-service.git,main,在研,Java / Spring Boot,Web 服务,下单;支付回调,generated/;docs/legacy/,docs/audit-materials,,示例：替换为实际仓库
+order-develop,订单中心开发分支,交易研发部,负责人A,https://git.example.com/trade/order-service.git,develop,在研,Java / Spring Boot,Web 服务,下单;支付回调,generated/;docs/legacy/,docs/audit-materials,,示例：同一仓库的另一个分支
+inventory-main,库存服务,供应链研发部,负责人B,https://git.example.com/supply/inventory-service.git,main,在研,Go / PostgreSQL,Web 服务,库存查询;库存更新,generated/,,,示例：替换为实际仓库

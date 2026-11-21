@@ -1,0 +1,58 @@
+x-scanner-image: &scanner-image ${AUDIT_SCANNER_IMAGE:-ghcr.io/xiaoguan521/ai-code-audit:main}
+
+services:
+  # 仅用于显式拉取镜像。实际审查由 audit 为每个仓库启动此镜像的独立容器。
+  scanner-image:
+    image: *scanner-image
+    profiles:
+      - images
+
+  audit:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.runner
+    image: ${AUDIT_RUNNER_IMAGE:-ghcr.io/xiaoguan521/ai-code-audit-runner:main}
+    init: true
+    environment:
+      AUDIT_DATA_DIR: ${AUDIT_DATA_DIR:?请先从 .env.example 创建 .env 并设置绝对路径}
+      AUDIT_MODEL_NETWORK: ${AUDIT_MODEL_NETWORK:-ai-audit-model-net}
+      AUDIT_SCANNER_IMAGE: *scanner-image
+      AUDIT_MODEL_ENV_PATH: /run/secrets/model.env
+      TZ: Asia/Shanghai
+    volumes:
+      # Docker CLI 通过宿主机的 daemon 启动只读的扫描容器。
+      - type: bind
+        source: ${AUDIT_DOCKER_SOCKET:-/var/run/docker.sock}
+        target: /var/run/docker.sock
+      # 调度容器和宿主机必须看到同一个绝对路径，daemon 才能挂载项目副本。
+      - type: bind
+        source: ${AUDIT_DATA_DIR:?请先从 .env.example 创建 .env 并设置绝对路径}
+        target: ${AUDIT_DATA_DIR:?请先从 .env.example 创建 .env 并设置绝对路径}
+      - type: bind
+        source: ./config/projects.local.csv
+        target: /opt/ai-code-audit/config/projects.csv
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./model.env
+        target: /run/secrets/model.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/git-credentials
+        target: /run/secrets/git-credentials
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/ssh
+        target: /root/.ssh
+        read_only: true
+    networks:
+      - model
+
+networks:
+  model:
+    name: ${AUDIT_MODEL_NETWORK:-ai-audit-model-net}

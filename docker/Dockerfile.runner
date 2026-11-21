@@ -1,0 +1,17 @@
+# 调度容器只负责拉取仓库、启动扫描容器和生成报告；Qwen 镜像单独发布。
+FROM docker:27-cli
+
+RUN apk add --no-cache python3 git openssh-client ca-certificates tzdata \
+ && git config --system credential.useHttpPath true \
+ && git config --system credential.helper /opt/ai-code-audit/docker/git-credential-readonly.sh
+
+WORKDIR /opt/ai-code-audit
+COPY runner/ runner/
+COPY config/checklist.json config/result.schema.json config/settings.json config/
+COPY skill/eight-quality-audit/SKILL.md skill/eight-quality-audit/SKILL.md
+COPY docker/compose_entrypoint.py docker/compose_entrypoint.py
+COPY docker/git-credential-readonly.sh docker/git-credential-readonly.sh
+RUN chmod 0555 docker/git-credential-readonly.sh
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ENTRYPOINT ["python3", "/opt/ai-code-audit/docker/compose_entrypoint.py"]

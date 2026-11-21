@@ -11,7 +11,7 @@
 | 修改检查规则 | 改 `skill/eight-quality-audit/SKILL.md`；增删检查项后运行 `python3 tools/gen_checklist.py` | CI 校验 64 项与 checklist / schema 一致；合并后重新构建镜像 |
 | 调整权重、评分档位 | 改 `config/checklist.json` | CI 校验权重合计 100 |
 | 升级 Qwen Code | 改 `docker/QWEN_CODE_VERSION` | 构建镜像并冒烟测试（版本号、Skill、配置、非 root、入口校验） |
-| 发布给内网 | 打 tag：`git tag v1.0.0 && git push origin v1.0.0` | 镜像推送到 `ghcr.io/<owner>/<repo>:1.0.0`，镜像为多架构（amd64 + arm64）；GitHub Release 附带两个离线镜像包 `ai-code-audit_v1.0.0_amd64.tar.gz`、`ai-code-audit_v1.0.0_arm64.tar.gz` 及各自 sha256 |
+| 发布给内网 | 打 tag：`git tag v1.0.0 && git push origin v1.0.0` | 扫描镜像 `ghcr.io/<owner>/<repo>:1.0.0` 和调度镜像 `ghcr.io/<owner>/<repo>-runner:1.0.0` 均为 amd64 + arm64；GitHub Release 为两种镜像的每个架构分别附离线包及 sha256 |
 
 工作流文件：`.github/workflows/ci.yml`（每次 PR / push 跑测试）、`.github/workflows/build-image.yml`（构建、测试、推送镜像，tag 时出离线包）。Dependabot 每月提醒升级 Actions 与基础镜像。
 
@@ -74,6 +74,49 @@ run_daily.py ──git fetch（只读凭据，只在宿主机）     Qwen Code +
 6. **试扫一个项目**：`python3 runner/run_daily.py --only <项目ID> --force-full`，人工核对报告证据；再按下面第 8 步配置定时任务。
 
 千问模型说明：Qwen Code 没有 Claude Code 的 `--json-schema` 强约束，镜像入口会把 Schema 附在系统提示里要求只输出 JSON；runner 负责解析（容忍代码块包裹和前后文字）、按 `config/result.schema.json` 逐字段校验结构（字段缺失、枚举值写错、类型不对都会带着问题清单重试，结构不合格的输出绝不进入评分）、校验 64 项是否齐全、证据与问题清单是否一致，不合格带着问题清单重试一次。仓库很大时如出现退出码 53（轮次超限），调大 `agent.max_session_turns` 或在 projects.csv 中用 scope_out 排除无关目录。
+
+## Docker Compose 批量扫描
+
+内网部署、离线镜像导入与运维排障详见[内网部署运维手册](docs/内网部署运维手册.md)。
+
+Compose 中 `scanner-image` 指向 GitHub 发布的 Qwen 扫描镜像；`audit` 使用同一工作流发布的调度镜像，负责拉取仓库、管理扫描状态和生成报告。调度器通过本机 Docker 为每个项目启动一个 `scanner-image` 对应镜像的独立容器。扫描完成后调度容器退出；再次运行会使用保存的状态，按原有规则选择全量、增量或复用。两个镜像的发布需要相应代码进入 `main` 且 `Build image` 工作流成功；PR 测试阶段只构建和测试，不推送镜像。
+
+1. 在有 Docker Engine 和 Compose 的运行机上，从项目目录准备配置：
+   ```sh
+   cp .env.example .env
+   cp config/projects.compose.example.csv config/projects.local.csv
+   cp docker/model.env.example model.env
+   mkdir -p secrets/ssh audit-data
+   cp docker/git-credentials.example secrets/git-credentials
+   chmod 700 secrets/ssh
+   chmod 600 model.env secrets/git-credentials
+   ```
+2. 编辑 `config/projects.local.csv`：每行填写一个 `git_url` 和 `branch`。示例包含两个仓库，其中一个扫描 `main` 和 `develop` 两个分支；每一行的 `project_id` 必须唯一，`status` 为 `在研` 才会被扫描。不要把令牌或密码写进仓库 URL，因为 URL 会进入扫描结果。更换项目的仓库地址时请使用新的 `project_id`，以免复用旧仓库的本地副本。
+3. 编辑 `model.env`，填入能从扫描容器访问到的 OpenAI 兼容服务地址、模型名和 API Key：
+   ```text
+   OPENAI_BASE_URL=http://model.internal.example.com:8000/v1
+   OPENAI_MODEL=qwen3-coder
+   OPENAI_API_KEY=替换为实际密钥
+   ```
+   此文件按 Docker `--env-file` 格式填写，值直接写在等号后，不要额外加引号。容器中的 `127.0.0.1` 指向容器自身；模型部署在其他机器或宿主机时应填写容器能够访问的实际地址。
+4. 配置私有 Git 仓库的只读凭据，任选一种方式：
+   - **HTTPS 用户名与密码 / 访问令牌**：编辑 `secrets/git-credentials`，每个仓库一行，如 `https://用户名:令牌@git.example.com/trade/order-service.git`。地址路径须与项目清单里的 HTTPS 仓库地址一致；同一仓库的不同分支共用一行。用户名或令牌中的 `@`、`:`、`/`、`%` 等特殊字符须先做 URL 编码。Git 服务要求访问令牌时填写只读令牌。
+   - **SSH deploy key**：将私钥及经过验证的 `known_hosts` 放到 `secrets/ssh/`，私钥权限设为 `600`，并将对应项目的 `git_url` 改为 SSH 地址。多个 Git 服务器可在该目录放 `config`，为各主机指定不同的 `IdentityFile`。
+
+   Git 凭据只挂载给调度容器；不使用 HTTPS 凭据时可以把 `secrets/git-credentials` 清空并保留文件。该文件和 `model.env` 都是明文，应保留 `600` 权限并使用只读凭据。`.env`、`model.env`、本地项目清单及 `secrets/` 都被 Git 忽略，也不会发给 Docker 构建器。
+5. 检查 `.env`。`AUDIT_DATA_DIR` 必须是运行机上的绝对路径，调度容器和宿主机使用同一路径，以便 Docker 挂载项目副本；默认是当前项目目录下的 `audit-data/`，更换路径时先创建该目录。`AUDIT_SCANNER_IMAGE` 和 `AUDIT_RUNNER_IMAGE` 分别配置扫描和调度镜像，可改为内网镜像。Docker socket 不在 `/var/run/docker.sock` 时，修改 `AUDIT_DOCKER_SOCKET`。
+6. 拉取两个 GitHub 镜像并试跑：
+   ```sh
+   docker compose --profile images pull scanner-image audit
+   docker compose run --rm audit --dry-run
+   docker compose run --rm audit --only order-main --force-full
+   docker compose run --rm audit
+   ```
+   `scanner-image` 服务只用来显式拉取镜像，不单独启动；实际扫描时由 `audit` 启动它。如需修改调度器，可执行 `docker compose build audit` 在本机构建；构建需要 `docker:27-cli` 基础镜像和 Alpine 软件包。`--dry-run` 仍会连接 Git 并克隆或更新扫描专用副本，但不调用模型；全部项目正常后再正式运行。报告和看板位于 `AUDIT_DATA_DIR/output/`，项目副本位于 `AUDIT_DATA_DIR/work/`。
+
+Compose 会创建 `AUDIT_MODEL_NETWORK` 指定的 Docker 网络。该网络本身不会限制出站访问，需要按现有网络隔离要求在宿主机防火墙上限制扫描容器只能访问模型服务。调度容器挂载 Docker socket 以启动扫描容器，拥有宿主机 Docker 的控制权限，应只在可信运行机上使用。扫描容器本身不挂载该 socket，也不接收 Git 凭据。
+
+如需每天运行，可在运行机的 crontab 中进入项目目录后执行 `docker compose run --rm audit`；Compose 本身不会自动定时。
 
 ## 部署步骤（Claude Code 后端，兴华 + 晓晨）
 
