@@ -6,3 +6,9 @@ samples
 tests
 *.tar.gz
 **/__pycache__
+# 不把本地模型凭据、Git 凭据或真实仓库清单发送给构建器
+.env
+*.env
+secrets
+config/projects.local.csv
+audit-data

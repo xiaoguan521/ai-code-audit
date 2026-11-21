@@ -11,3 +11,7 @@ docker/offline/*.tgz
 model.env
 *.env
 !docker/model.env.example
+# Compose 的本地仓库清单、Git 凭据和运行数据
+/config/projects.local.csv
+/secrets/
+/audit-data/

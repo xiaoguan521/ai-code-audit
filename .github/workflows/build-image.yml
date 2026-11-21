@@ -8,12 +8,22 @@ on:
       - "docker/**"
       - "skill/**"
       - "config/**"
+      - "runner/**"
+      - "tests/**"
+      - "tools/**"
+      - "compose.yaml"
+      - ".env.example"
       - ".github/workflows/build-image.yml"
   pull_request:
     paths:
       - "docker/**"
       - "skill/**"
       - "config/**"
+      - "runner/**"
+      - "tests/**"
+      - "tools/**"
+      - "compose.yaml"
+      - ".env.example"
       - ".github/workflows/build-image.yml"
   workflow_dispatch:
     inputs:
@@ -63,6 +73,7 @@ jobs:
           [ -z "$v" ] && v="$(tr -d '[:space:]' < docker/QWEN_CODE_VERSION)"
           echo "qwen_code_version=$v" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "runner_image=ghcr.io/${GITHUB_REPOSITORY,,}-runner" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -91,6 +102,23 @@ jobs:
             org.opencontainers.image.title=ai-code-audit
             org.opencontainers.image.description=八性 AI 代码检查（Qwen Code + Skill）
             io.qwen-code.version=${{ steps.vars.outputs.qwen_code_version }}
+
+      - name: 生成调度镜像标签
+        id: runner_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.vars.outputs.runner_image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=ai-code-audit-runner
+            org.opencontainers.image.description=八性 AI 代码检查批量调度器
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
       # 每个架构各构建一份并本地加载，分别做冒烟测试；arm64 在 x86 runner 上经 QEMU 模拟运行（较慢，靠缓存加速）
       - name: 构建 amd64（本地加载用于冒烟测试）
@@ -136,7 +164,46 @@ jobs:
             if docker run --rm $plat -v /tmp/ctx:/workspace/context:ro "$img"; then echo "::error::$arch 入口脚本未校验环境变量"; exit 1; fi
           done
 
-      - name: 推送镜像
+      - name: 构建调度器 amd64（本地加载用于冒烟测试）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.runner
+          platforms: linux/amd64
+          load: true
+          tags: ai-code-audit-runner:ci-amd64
+          cache-from: type=gha,scope=runner-amd64
+          cache-to: type=gha,scope=runner-amd64,mode=max
+
+      - name: 构建调度器 arm64（本地加载用于冒烟测试）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.runner
+          platforms: linux/arm64
+          load: true
+          tags: ai-code-audit-runner:ci-arm64
+          cache-from: type=gha,scope=runner-arm64
+          cache-to: type=gha,scope=runner-arm64,mode=max
+
+      - name: 调度器冒烟测试（两个架构，不连接 Git 或模型）
+        run: |
+          for arch in amd64 arm64; do
+            img="ai-code-audit-runner:ci-$arch"
+            [ "$(docker image inspect -f '{{.Architecture}}' "$img")" = "$arch" ] || { echo "::error::$img 架构不是 $arch"; exit 1; }
+            docker run --rm --network none --platform "linux/$arch" --entrypoint sh "$img" -c '
+              python3 --version && git --version && docker --version && ssh -V 2>&1 &&
+              test -x /opt/ai-code-audit/docker/git-credential-readonly.sh &&
+              test "$(git config --system --get credential.useHttpPath)" = true &&
+              test "$(git config --system --get credential.helper)" = /opt/ai-code-audit/docker/git-credential-readonly.sh &&
+              test -f /opt/ai-code-audit/runner/run_daily.py &&
+              test -f /opt/ai-code-audit/config/checklist.json'
+            docker run --rm --network none --platform "linux/$arch" \
+              -e AUDIT_DATA_DIR=/tmp/audit -e AUDIT_MODEL_NETWORK=ci-model \
+              "$img" --help | grep -q -- '--dry-run'
+          done
+
+      - name: 推送扫描镜像
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
@@ -151,17 +218,27 @@ jobs:
             type=gha,scope=amd64
             type=gha,scope=arm64
 
-      - name: 导出离线镜像包（仅版本 tag，每个架构一个）
+      - name: 推送调度镜像
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.runner
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.runner_meta.outputs.tags }}
+          labels: ${{ steps.runner_meta.outputs.labels }}
+          cache-from: |
+            type=gha,scope=runner-amd64
+            type=gha,scope=runner-arm64
+
+      - name: 导出离线镜像包（仅版本 tag，每种镜像和架构各一个）
         if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          mkdir -p offline
-          for arch in amd64 arm64; do
-            name="offline/ai-code-audit_${GITHUB_REF_NAME}_${arch}.tar.gz"
-            docker tag "ai-code-audit:ci-$arch" "ai-code-audit:${GITHUB_REF_NAME#v}"
-            docker save "ai-code-audit:${GITHUB_REF_NAME#v}" | gzip > "$name"
-            (cd offline && sha256sum "$(basename "$name")" > "$(basename "$name").sha256")
-          done
-          ls -l offline
+        env:
+          SCANNER_IMAGE: ${{ steps.vars.outputs.image }}
+          RUNNER_IMAGE: ${{ steps.vars.outputs.runner_image }}
+        shell: bash
+        run: bash docker/export_release_images.sh
 
       - name: 上传为 Release 附件
         if: startsWith(github.ref, 'refs/tags/v')
