@@ -18,6 +18,8 @@ jobs:
           python-version: "3.12"
       - name: 编译检查
         run: python -m py_compile runner/*.py tools/*.py tests/*.py
+      - name: 单元测试（输出校验、JSON 提取、重试、网络、git 同步）
+        run: python -m unittest discover -s tests -v
       - name: 一致性检查（SKILL / checklist / schema / 配置）
         run: python tests/check_consistency.py
       - name: checklist.json 与 SKILL.md 同步（改了检查项要运行 tools/gen_checklist.py）

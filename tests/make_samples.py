@@ -31,6 +31,7 @@ for k, day in enumerate(["2026-11-19", "2026-11-20", "2026-11-21"]):
                 "dimension_notes": [{"dimension": d["id"], "conclusion": f"{d['name']}示例结论", "key_analysis": "示例分析"} for d in ck["dimensions"]],
                 "summary": {"key_findings": ["示例结论一"], "top_risks": ["示例风险"], "undetermined": "功能覆盖度需 S1"},
                 "self_check": [{"check": "64 项齐全", "ok": True}]}
+        assert not scoring.schema_errors(data), scoring.schema_errors(data)[:5]
         data["meta"] = {"date": day, "mode": "full" if k == 0 else "incremental", "commit": f"{pid}abc{k}1234567", "cost_usd": 3.2,
                         "project": {"project_id": pid, "project_name": name, "department": dept, "owner": owner, "branch": "main"}}
         assert not scoring.validate(data, ck), scoring.validate(data, ck)

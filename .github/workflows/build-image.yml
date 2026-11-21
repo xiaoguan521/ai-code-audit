@@ -25,8 +25,8 @@ permissions:
   contents: read
 
 env:
-  # 内网服务器一般是 x86_64；需要 ARM 时改成 linux/amd64,linux/arm64
-  PLATFORMS: linux/amd64
+  # 同时支持 x86_64 和 ARM64（鲲鹏、飞腾等 ARM 服务器）；推到 GHCR 的是多架构镜像，docker pull 自动选架构
+  PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
   test:
@@ -36,6 +36,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - run: python -m unittest discover -s tests
       - run: python tests/check_consistency.py
       - run: python tools/gen_checklist.py && git diff --exit-code -- config/checklist.json
       - run: python tests/make_samples.py /tmp/out
@@ -91,30 +92,49 @@ jobs:
             org.opencontainers.image.description=八性 AI 代码检查（Qwen Code + Skill）
             io.qwen-code.version=${{ steps.vars.outputs.qwen_code_version }}
 
-      - name: 构建（单架构先本地加载用于冒烟测试）
+      # 每个架构各构建一份并本地加载，分别做冒烟测试；arm64 在 x86 runner 上经 QEMU 模拟运行（较慢，靠缓存加速）
+      - name: 构建 amd64（本地加载用于冒烟测试）
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
           platforms: linux/amd64
           load: true
-          tags: ai-code-audit:ci
+          tags: ai-code-audit:ci-amd64
           build-args: QWEN_CODE_VERSION=${{ steps.vars.outputs.qwen_code_version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,scope=amd64,mode=max
 
-      - name: 冒烟测试（不连模型）
+      - name: 构建 arm64（本地加载用于冒烟测试）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/arm64
+          load: true
+          tags: ai-code-audit:ci-arm64
+          build-args: QWEN_CODE_VERSION=${{ steps.vars.outputs.qwen_code_version }}
+          cache-from: type=gha,scope=arm64
+          cache-to: type=gha,scope=arm64,mode=max
+
+      - name: 冒烟测试（两个架构，不连模型）
         run: |
-          docker run --rm --entrypoint qwen ai-code-audit:ci --version
-          docker run --rm --entrypoint sh ai-code-audit:ci -c '
-            test -f /opt/audit/skills/eight-quality-code-audit/SKILL.md &&
-            test -f /opt/audit/result.schema.json &&
-            test -f /etc/qwen-code/settings.json &&
-            grep -q "\"usageStatisticsEnabled\": false" /etc/qwen-code/settings.json &&
-            [ "$(id -u)" != "0" ] && echo "镜像内容检查通过"'
-          # 未配置模型地址时入口脚本应拒绝启动
           mkdir -p /tmp/ctx && echo test > /tmp/ctx/prompt.md
-          if docker run --rm -v /tmp/ctx:/workspace/context:ro ai-code-audit:ci; then echo "入口脚本未校验环境变量" && exit 1; fi
+          for arch in amd64 arm64; do
+            img="ai-code-audit:ci-$arch"; plat="--platform linux/$arch"
+            echo "== $arch =="
+            [ "$(docker image inspect -f '{{.Architecture}}' "$img")" = "$arch" ] || { echo "::error::$img 架构不是 $arch"; exit 1; }
+            docker run --rm $plat --entrypoint qwen "$img" --version
+            docker run --rm $plat --entrypoint sh "$img" -c '
+              test -f /opt/audit/skills/eight-quality-code-audit/SKILL.md &&
+              test -f /opt/audit/result.schema.json &&
+              test -f /etc/qwen-code/settings.json &&
+              grep -q "\"usageStatisticsEnabled\": false" /etc/qwen-code/settings.json &&
+              rg --version >/dev/null && git --version >/dev/null &&
+              [ "$(id -u)" != "0" ] && echo "镜像内容检查通过：$(uname -m)"'
+            # 未配置模型地址时入口脚本应拒绝启动
+            if docker run --rm $plat -v /tmp/ctx:/workspace/context:ro "$img"; then echo "::error::$arch 入口脚本未校验环境变量"; exit 1; fi
+          done
 
       - name: 推送镜像
         if: github.event_name != 'pull_request'
@@ -127,22 +147,25 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: QWEN_CODE_VERSION=${{ steps.vars.outputs.qwen_code_version }}
-          cache-from: type=gha
+          cache-from: |
+            type=gha,scope=amd64
+            type=gha,scope=arm64
 
-      - name: 导出离线镜像包（仅版本 tag）
+      - name: 导出离线镜像包（仅版本 tag，每个架构一个）
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          name="ai-code-audit_${GITHUB_REF_NAME}_amd64.tar.gz"
-          docker tag ai-code-audit:ci "ai-code-audit:${GITHUB_REF_NAME#v}"
-          docker save "ai-code-audit:${GITHUB_REF_NAME#v}" | gzip > "$name"
-          sha256sum "$name" > "$name.sha256"
-          echo "OFFLINE=$name" >> "$GITHUB_ENV"
+          mkdir -p offline
+          for arch in amd64 arm64; do
+            name="offline/ai-code-audit_${GITHUB_REF_NAME}_${arch}.tar.gz"
+            docker tag "ai-code-audit:ci-$arch" "ai-code-audit:${GITHUB_REF_NAME#v}"
+            docker save "ai-code-audit:${GITHUB_REF_NAME#v}" | gzip > "$name"
+            (cd offline && sha256sum "$(basename "$name")" > "$(basename "$name").sha256")
+          done
+          ls -l offline
 
       - name: 上传为 Release 附件
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ${{ env.OFFLINE }}
-            ${{ env.OFFLINE }}.sha256
+          files: offline/*
           generate_release_notes: true
