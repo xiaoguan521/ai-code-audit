@@ -5,11 +5,11 @@ FROM node:24.22.3-bookworm-slim
 # DeepSeek Harness 官方 CLI。版本必须和 Node.js 主版本要求匹配。
 ARG DSH_VERSION=0.2.3-alpha.2
 RUN apt-get update \
- && apt-get install -y --no-install-recommends bash git ca-certificates ripgrep fd-find tini \
+ && apt-get install -y --no-install-recommends bash git ca-certificates ripgrep fd-find tini build-essential python3 \
  && rm -rf /var/lib/apt/lists/* \
  && git config --system safe.directory '*' \
  && git config --system core.fsmonitor false \
- && npm install -g --omit=dev --ignore-scripts "@deepseek-ai/dsh@${DSH_VERSION}" \
+ && npm install -g --omit=dev "@deepseek-ai/dsh@${DSH_VERSION}" \
  && npm cache clean --force \
  && dsh --version
 
