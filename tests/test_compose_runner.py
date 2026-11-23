@@ -74,6 +74,7 @@ class ComposeRunnerTest(unittest.TestCase):
 
         settings = json.loads((ROOT / "config/settings.json").read_text(encoding="utf-8"))
         settings.update({"prescan_tools": [], "max_parallel": 1})
+        settings["agent"]["strategy"] = "single"  # 本测试专注于现有单会话的宿主机挂载路径。
         settings_file = self.root / "settings.json"
         settings_file.write_text(json.dumps(settings), encoding="utf-8")
         model_file = self.root / "model.env"

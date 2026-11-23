@@ -115,6 +115,17 @@ class QualitySuiteTest(unittest.TestCase):
             "mount = next(a for a in sys.argv if a.endswith(':/workspace/repo:ro'))\n"
             "pid = Path(mount[:-len(':/workspace/repo:ro')]).parent.name\n"
             "payload = json.loads((Path(os.environ['FIXTURE_RESULTS']) / (pid + '.json')).read_text())\n"
+            "ctx = next(a for a in sys.argv if a.endswith(':/workspace/context:ro'))\n"
+            "schema_file = Path(ctx[:-len(':/workspace/context:ro')]) / 'dimension.schema.json'\n"
+            "if schema_file.exists():\n"
+            "    schema = json.loads(schema_file.read_text())\n"
+            "    ids = set(schema['properties']['items']['items']['properties']['id']['enum'])\n"
+            "    payload['items'] = [i for i in payload['items'] if i['id'] in ids]\n"
+            "    payload['issues'] = [i for i in payload['issues'] if i['item_id'] in ids]\n"
+            "    payload['dimension_notes'] = [d for d in payload['dimension_notes'] if d['dimension'] == next(iter(ids)).split('.')[0]]\n"
+            "    payload['need_info_list'] = [dict(g, items=[i for i in g['items'] if i in ids]) for g in payload['need_info_list']]\n"
+            "    payload['need_info_list'] = [g for g in payload['need_info_list'] if g['items']]\n"
+            "    payload = {k: v for k, v in payload.items() if k in schema['properties']}\n"
             "print(json.dumps([{'result': json.dumps(payload), 'stats': {'turns': 1, 'tool_calls': 1}}]))\n",
             encoding="utf-8",
         )

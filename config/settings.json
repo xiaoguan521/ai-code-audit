@@ -4,6 +4,7 @@
   "claude_bin": "claude",
   "model": "",
   "max_parallel": 2,
+  "max_model_concurrency": 2,
   "per_project_timeout_sec": 3600,
   "per_project_budget_usd": 15,
   "full_scan_weekday": 6,
@@ -36,6 +37,8 @@
   },
   "agent": {
     "type": "pi-docker",
+    "strategy": "dimensions",
+    "dimension_parallelism": 4,
     "image": "ai-code-audit:1.0",
     "env_file": "/etc/ai-audit/model.env",
     "network": "",

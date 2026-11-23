@@ -24,10 +24,11 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import scoring  # noqa: E402
 import evidence  # noqa: E402
 import code_map  # noqa: E402
+import segments  # noqa: E402
 
 SKILL_FILE = ROOT / "skill" / "eight-quality-audit" / "SKILL.md"
 SCHEMA_FILE = ROOT / "config" / "result.schema.json"
@@ -140,7 +142,7 @@ def audit_fingerprint(p: dict, settings: dict) -> str:
         "semgrep_rules_dir": settings.get("semgrep_rules_dir", ""),
         "code_map_enabled": settings.get("code_map_enabled", True),
         "code_map_max_entries": settings.get("code_map_max_entries", 120),
-        "agent": {k: ag.get(k) for k in ("type", "image")},
+        "agent": {k: ag.get(k) for k in ("type", "image", "strategy")},
         "model": settings.get("model", ""),
         # 模型别名指向的服务或权重变化时，由部署者更新此值。
         "audit_revision": settings.get("audit_revision", ""),
@@ -160,7 +162,8 @@ def audit_fingerprint(p: dict, settings: dict) -> str:
             inputs["model_configuration"] = "unavailable"
     h = hashlib.sha256(json.dumps(inputs, sort_keys=True, ensure_ascii=False).encode("utf-8"))
     for file in (SKILL_FILE, SCHEMA_FILE, ROOT / "config" / "checklist.json",
-                 ROOT / "runner" / "evidence.py", ROOT / "runner" / "code_map.py", ROOT / "runner" / "scoring.py"):
+                 ROOT / "runner" / "evidence.py", ROOT / "runner" / "code_map.py", ROOT / "runner" / "scoring.py",
+                 ROOT / "runner" / "segments.py"):
         h.update(file.read_bytes())
     return h.hexdigest()
 
@@ -343,12 +346,19 @@ def build_prompt(p: dict, mode: str, commit: str, settings: dict, prescan_dir: s
 
 
 def call_claude(prompt: str, repo: Path, extra_dirs: list[Path], settings: dict, timeout: int) -> dict:
-    schema = SCHEMA_FILE.read_text(encoding="utf-8")
+    context = extra_dirs[0]
+    dimension_schema = context / "dimension.schema.json"
+    dimension_skill = context / "dimension.skill.md"
+    if dimension_schema.exists() != dimension_skill.exists():
+        raise RuntimeError("分维度 Schema 和 Skill 必须同时存在")
+    schema_file = dimension_schema if dimension_schema.exists() else SCHEMA_FILE
+    skill_file = dimension_skill if dimension_skill.exists() else SKILL_FILE
+    schema = schema_file.read_text(encoding="utf-8")
     cmd = [
         settings.get("claude_bin", "claude"), "--bare", "-p", prompt,
         "--output-format", "json",
         "--json-schema", schema,
-        "--append-system-prompt-file", str(SKILL_FILE),
+        "--append-system-prompt-file", str(skill_file),
         "--permission-mode", "dontAsk",
         "--permission-prompts", "none",
         "--tools", "Read,Grep,Glob,Bash",
@@ -392,11 +402,12 @@ REQUIRED_KEYS = ["inventory", "items", "issues", "need_info_list", "dimension_no
 MAX_PROBLEMS_IN_PROMPT = 30
 
 
-def extract_json(text: str) -> dict:
+def extract_json(text: str, required_keys: list[str] | None = None) -> dict:
     """从模型最终回复中取出 JSON 对象（容忍 ```json 代码块和前后多余文字）。
 
     不按 ``` 切分文本：证据里引用的代码片段本身可能带 ```，切分会把 JSON 切断。
     做法是从每个 "{" 尝试解码一个完整 JSON 对象，取最后一个带齐顶层字段的。"""
+    required_keys = REQUIRED_KEYS if required_keys is None else required_keys
     t = text or ""
     dec = json.JSONDecoder()
     found: list[dict] = []
@@ -412,23 +423,23 @@ def extract_json(text: str) -> dict:
         if isinstance(obj, dict):
             found.append(obj)
         i = t.find("{", end)
-    complete = [o for o in found if all(k in o for k in REQUIRED_KEYS)]
+    complete = [o for o in found if all(k in o for k in required_keys)]
     if complete:
         return complete[-1]
-    best = max(found, key=lambda o: sum(k in o for k in REQUIRED_KEYS), default=None)
+    best = max(found, key=lambda o: sum(k in o for k in required_keys), default=None)
     # 一个顶层字段都没有、同时又有解析失败：多半是输出被截断，只解出了内部的子对象，按解析失败报
-    if best is not None and (any(k in best for k in REQUIRED_KEYS) or not first_err):
-        raise AgentOutputError(f"JSON 缺少顶层字段：{[k for k in REQUIRED_KEYS if k not in best]}")
+    if best is not None and (any(k in best for k in required_keys) or not first_err):
+        raise AgentOutputError(f"JSON 缺少顶层字段：{[k for k in required_keys if k not in best]}")
     if first_err:
         raise AgentOutputError(f"JSON 解析失败：{first_err}")
     raise AgentOutputError("最终回复中没有 JSON 对象")
 
 
 def check_output(result: dict, checklist: dict, repo: Path | None = None,
-                 verification_stats: dict | None = None) -> list[str]:
+                 verification_stats: dict | None = None, schema: dict | None = None) -> list[str]:
     """先按 JSON Schema 校验结构，不合格抛 AgentOutputError（走重试，绝不进入评分）；
     结构合格后再做语义校验（证据、问题清单是否一致），返回语义问题列表。"""
-    structural = scoring.schema_errors(result)
+    structural = scoring.schema_errors(result, schema)
     if structural:
         raise AgentOutputError(f"输出不符合 JSON Schema（{len(structural)} 处）：{structural[:3]}", structural)
     if repo is not None:
@@ -513,6 +524,8 @@ def backend_problem(settings: dict) -> str | None:
     kind = agent.get("type") if isinstance(agent, dict) else None
     if kind not in SUPPORTED_AGENTS:
         return "settings.json 的 agent.type 必须显式设为 pi-docker、qwen-docker 或 claude"
+    if agent.get("strategy", "single") not in {"single", "dimensions"}:
+        return "settings.json 的 agent.strategy 必须为 single 或 dimensions"
     return None
 
 
@@ -581,7 +594,9 @@ def call_pi_docker(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: 
         raise AgentCallError(f"Pi 输出不是 JSON（exit={r.returncode}）：{r.stdout[-400:]} {stderr[-600:]}", stats=stats)
     last = events[-1] if isinstance(events, list) and events else {}
     try:
-        result = extract_json(last.get("result", ""))
+        dimension_schema = ctx / "dimension.schema.json"
+        required = json.loads(dimension_schema.read_text(encoding="utf-8"))["required"] if dimension_schema.exists() else None
+        result = extract_json(last.get("result", ""), required)
     except AgentOutputError as e:
         e.stats = last.get("stats") or stats
         raise
@@ -594,16 +609,124 @@ def call_agent(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: int)
     if problem:
         raise RuntimeError(problem)
     kind = settings["agent"]["type"]
-    if kind in {"pi-docker", "qwen-docker"}:
-        return call_pi_docker(prompt, repo, ctx, settings, timeout)
-    if kind == "claude":
-        return call_claude(prompt, repo, [ctx], settings, timeout)
+    with settings.get("_model_limiter", nullcontext()):
+        if kind in {"pi-docker", "qwen-docker"}:
+            return call_pi_docker(prompt, repo, ctx, settings, timeout)
+        if kind == "claude":
+            return call_claude(prompt, repo, [ctx], settings, timeout)
     raise RuntimeError(problem or "不支持的模型后端")
 
 
 def ctx_view(settings: dict, ctx: Path) -> str:
     """模型看到的上下文目录路径：容器内固定为 /workspace/context。"""
     return "/workspace/context" if settings.get("agent", {}).get("type") in {"pi-docker", "qwen-docker"} else str(ctx)
+
+
+def call_agent_dimensions(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: int,
+                          checklist: dict, previous: dict | None, changes: list[str] | None,
+                          materials_changed: bool) -> dict:
+    """分维度调用模型、独立校验重试，再合并为现有的完整结果。"""
+    dimensions = [d["id"] for d in checklist["dimensions"]]
+    base_schema = scoring.load_schema()
+    skill = SKILL_FILE.read_text(encoding="utf-8")
+    common = list(ctx.iterdir())
+    parts_root = ctx / "dimensions"
+    parts_root.mkdir()
+
+    def link_or_copy(src: str, dst: str) -> str:
+        try:
+            os.link(src, dst)
+            return dst
+        except OSError:
+            return shutil.copy2(src, dst)
+
+    def prepare(dimension: str) -> tuple[Path, dict, dict]:
+        part_ctx = parts_root / dimension
+        part_ctx.mkdir()
+        for source in common:
+            if source.is_dir():
+                shutil.copytree(source, part_ctx / source.name, copy_function=link_or_copy)
+            elif source.is_file():
+                link_or_copy(str(source), str(part_ctx / source.name))
+        part_schema = segments.schema_for_dimension(checklist, base_schema, dimension)
+        (part_ctx / "dimension.schema.json").write_text(json.dumps(part_schema, ensure_ascii=False), encoding="utf-8")
+        (part_ctx / "dimension.skill.md").write_text(segments.skill_for_dimension(skill, checklist, dimension), encoding="utf-8")
+        part_checklist = dict(checklist,
+                              dimensions=[d for d in checklist["dimensions"] if d["id"] == dimension],
+                              items=[i for i in checklist["items"] if i["dimension"] == dimension])
+        return part_ctx, part_schema, part_checklist
+
+    prepared = {dimension: prepare(dimension) for dimension in dimensions}
+
+    def audit(dimension: str) -> dict:
+        part_ctx, part_schema, part_checklist = prepared[dimension]
+        part_prompt = prompt.replace(ctx_view(settings, ctx) + "/", ctx_view(settings, part_ctx) + "/")
+        ids = [item["id"] for item in part_checklist["items"]]
+        part_prompt += f"\n\n本次仅输出维度 {dimension} 的检查项：{', '.join(ids)}；其他维度由其他会话负责。"
+        attempts, best = [], None
+        for attempt in (1, 2):
+            metrics = {"attempt": attempt}
+            attempts.append(metrics)
+            try:
+                with measure(metrics, "model_seconds"):
+                    out = call_agent(part_prompt, repo, part_ctx, settings, timeout)
+                metrics["stats"] = out.get("stats")
+                metrics["usage_last_message"] = out.get("usage")
+                metrics["cost_usd"] = out.get("cost_usd")
+                with measure(metrics, "validation_seconds"):
+                    metrics["evidence_check"] = {}
+                    problems = check_output(out["result"], part_checklist, repo, metrics["evidence_check"], part_schema)
+                    if previous is not None:
+                        problems.extend(incremental_problems(out["result"], previous, changes or [], materials_changed, repo))
+                best = (out, problems)
+            except AgentOutputError as exc:
+                metrics.update(status="invalid", error_type=type(exc).__name__, validation_problem_count=len(exc.problems))
+                if exc.stats is not None:
+                    metrics["stats"] = exc.stats
+                problems = exc.problems
+                if not exc.retryable:
+                    return {"attempts": attempts, "error": str(exc), "best": best}
+            except Exception as exc:
+                metrics.update(status="error", error_type=type(exc).__name__)
+                if getattr(exc, "stats", None) is not None:
+                    metrics["stats"] = exc.stats
+                return {"attempts": attempts, "error": str(exc), "best": best}
+            else:
+                metrics.update(status="invalid" if problems else "ok", validation_problem_count=len(problems))
+            if not problems:
+                write_private_json(part_ctx / "verified_result.json", out["result"])
+                return {"attempts": attempts, "out": out}
+            log(f"维度 {dimension}: 第 {attempt} 次输出校验未通过: {problems[:3]}")
+            if attempt == 1:
+                shown = problems[:MAX_PROBLEMS_IN_PROMPT]
+                if best is not None:
+                    write_private_json(part_ctx / "previous_attempt.json", best[0]["result"])
+                    part_prompt += (f"\n\n上次本维度的结果保存在 {ctx_view(settings, part_ctx)}/previous_attempt.json；"
+                                    "请仅读取并修复有问题的检查项，保留其他已验证内容。")
+                part_prompt += "\n\n## 本维度上次输出校验未通过，请修正\n" + "\n".join(f"- {p}" for p in shown)
+        return {"attempts": attempts, "error": "两次输出仍未通过校验", "best": best}
+
+    workers = max(1, min(len(dimensions), int(settings.get("agent", {}).get("dimension_parallelism", 2))))
+    with cf.ThreadPoolExecutor(max_workers=workers) as executor:
+        tasks = {executor.submit(audit, dimension): dimension for dimension in dimensions}
+        completed = {}
+        for task in cf.as_completed(tasks):
+            dimension = tasks[task]
+            try:
+                completed[dimension] = task.result()
+            except Exception as exc:
+                completed[dimension] = {"attempts": [], "error": f"{type(exc).__name__}: {exc}"}
+    stats = {dimension: {"attempts": completed[dimension]["attempts"],
+                         "status": "error" if "error" in completed[dimension] else "ok"}
+             for dimension in dimensions}
+    failed = [dimension for dimension in dimensions if "error" in completed[dimension]]
+    if failed:
+        details = "; ".join(f"{dimension}: {completed[dimension]['error']}" for dimension in failed)
+        raise AgentOutputError(f"分维度审查失败（{details}），本次不评分", stats={"dimensions": stats}, retryable=False)
+    parts = {dimension: completed[dimension]["out"]["result"] for dimension in dimensions}
+    costs = [completed[dimension]["out"].get("cost_usd") for dimension in dimensions]
+    return {"result": segments.merge(checklist, parts), "cost_usd": sum(costs) if all(c is not None for c in costs) else None,
+            "session_id": None, "usage": None, "stats": {"dimensions": stats}}
 
 
 # ---------- 单项目流程 ----------
@@ -728,7 +851,11 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
                 metrics["model_attempts"].append(attempt_metrics)
                 try:
                     with measure(attempt_metrics, "model_seconds"):
-                        out = call_agent(prompt, repo, ctx, settings, timeout)
+                        if settings.get("agent", {}).get("strategy", "single") == "dimensions":
+                            out = call_agent_dimensions(prompt, repo, ctx, settings, timeout, checklist,
+                                                        previous_result, changes, materials_changed)
+                        else:
+                            out = call_agent(prompt, repo, ctx, settings, timeout)
                     attempt_metrics["stats"] = out.get("stats")
                     attempt_metrics["usage_last_message"] = out.get("usage")
                     attempt_metrics["cost_usd"] = out.get("cost_usd")
@@ -738,6 +865,8 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
                         if previous_result is not None:
                             problems.extend(incremental_problems(out["result"], previous_result, changes or [], materials_changed, repo))
                     best = (out, problems)
+                    if problems and settings.get("agent", {}).get("strategy", "single") == "dimensions":
+                        raise AgentOutputError("分维度结果合并后未通过校验，本次不评分", problems, retryable=False)
                 except AgentOutputError as e:
                     # 结构不合格的输出不能拿去评分；两次都没有结构合格的输出，本项目记为失败
                     attempt_metrics.update({"status": "invalid", "error_type": type(e).__name__,
@@ -833,6 +962,15 @@ def main() -> int:
             log(f"拒绝启动：{problem}")
             return 2
         log(f"警告：{problem}")
+    try:
+        model_concurrency = int(settings.get("max_model_concurrency", settings.get("max_parallel", 3)))
+        dimension_parallelism = int(settings.get("agent", {}).get("dimension_parallelism", 2))
+        if model_concurrency < 1 or dimension_parallelism < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        log("拒绝启动：max_model_concurrency 和 dimension_parallelism 必须为正整数")
+        return 2
+    settings["_model_limiter"] = threading.BoundedSemaphore(model_concurrency)
     statuses = set(settings.get("scan_statuses", ["在研"]))
     projects = load_projects(Path(args.projects), statuses)
     if args.only:

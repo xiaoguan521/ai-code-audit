@@ -195,6 +195,43 @@ jobs:
               assert not problems, problems
               print(f'{arch}: 完整 64 项结果通过调度器结构和语义校验')
           PY
+          python3 - <<'PY'
+          import json, sys
+          from pathlib import Path
+          sys.path.insert(0, 'runner')
+          import scoring, segments
+          ck = scoring.load_checklist()
+          ctx = Path('/tmp/pi-entrypoint-test/context')
+          schema = segments.schema_for_dimension(ck, scoring.load_schema(), '6')
+          (ctx / 'dimension.schema.json').write_text(json.dumps(schema, ensure_ascii=False))
+          skill = Path('skill/eight-quality-audit/SKILL.md').read_text()
+          (ctx / 'dimension.skill.md').write_text(segments.skill_for_dimension(skill, ck, '6'))
+          PY
+          for arch in amd64 arm64; do
+            docker run --rm --network none --platform "linux/$arch" \
+              --read-only --tmpfs /tmp:rw,size=512m --tmpfs /home/node:rw,size=256m,uid=1000,gid=1000 \
+              -e CI=1 -e AUDIT_TEST_ARCH="$arch" -e AUDIT_TEST_DIMENSION=6 \
+              -v /tmp/pi-entrypoint-test/context:/workspace/context:ro \
+              -v /tmp/pi-entrypoint-test/repo:/workspace/repo:ro \
+              -v /tmp/pi-entrypoint-test/results:/workspace/test-results \
+              --entrypoint node "ai-code-audit:ci-$arch" /workspace/context/pi_entrypoint_smoke.cjs
+          done
+          python3 - <<'PY'
+          import json, sys
+          from pathlib import Path
+          sys.path.insert(0, 'runner')
+          import run_daily, scoring
+          ck = scoring.load_checklist()
+          part = dict(ck, dimensions=[d for d in ck['dimensions'] if d['id'] == '6'],
+                      items=[i for i in ck['items'] if i['dimension'] == '6'])
+          schema = json.loads(Path('/tmp/pi-entrypoint-test/context/dimension.schema.json').read_text())
+          for arch in ('amd64', 'arm64'):
+              events = json.loads(Path(f'/tmp/pi-entrypoint-test/results/{arch}-dimension-6.json').read_text())
+              result = run_daily.extract_json(events[-1]['result'], schema['required'])
+              problems = run_daily.check_output(result, part, Path('/tmp/pi-entrypoint-test/repo'), schema=schema)
+              assert not problems, problems
+              print(f'{arch}: 安全维度的 9 项结果和源码证据校验通过')
+          PY
 
       - name: 构建调度器 amd64（本地加载用于冒烟测试）
         uses: docker/build-push-action@v6

@@ -18,8 +18,16 @@ async function main() {
   const model = process.env.OPENAI_MODEL;
   if (!baseUrl || !model) throw new PiOutputError('需要 OPENAI_BASE_URL 和 OPENAI_MODEL');
   const prompt = fs.readFileSync('/workspace/context/prompt.md', 'utf8');
-  const skill = fs.readFileSync('/opt/audit/skills/eight-quality-code-audit/SKILL.md', 'utf8');
-  const schema = fs.readFileSync('/opt/audit/result.schema.json', 'utf8');
+  const dimensionSkill = '/workspace/context/dimension.skill.md';
+  const dimensionSchema = '/workspace/context/dimension.schema.json';
+  const hasDimensionSkill = fs.existsSync(dimensionSkill);
+  if (hasDimensionSkill !== fs.existsSync(dimensionSchema)) {
+    throw new PiOutputError('分维度 Schema 和 Skill 必须同时存在');
+  }
+  const skill = fs.readFileSync(hasDimensionSkill ? dimensionSkill : '/opt/audit/skills/eight-quality-code-audit/SKILL.md', 'utf8');
+  const schema = fs.readFileSync(hasDimensionSkill ? dimensionSchema : '/opt/audit/result.schema.json', 'utf8');
+  // 在调用模型前就拒绝损坏的契约，避免带着无效 Schema 长时间运行。
+  JSON.parse(schema);
   const maxTurns = positiveInteger('MAX_SESSION_TURNS', 300);
   const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-audit-pi-'));
   let collector = null;
