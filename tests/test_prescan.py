@@ -69,6 +69,27 @@ class PrescanStatusTest(unittest.TestCase):
             status = run_daily.prescan(self.repo, self.out, ["cloc", "lizard"], {"prescan_parallelism": 2})
         self.assertEqual({tool: data["status"] for tool, data in status.items()}, {"cloc": "ok", "lizard": "ok"})
 
+    def test_incremental_prescan_passes_only_changed_files_and_excludes_scope(self):
+        (self.repo / "changed.py").write_text("print(1)\n", encoding="utf-8")
+        (self.repo / "dist").mkdir()
+        (self.repo / "dist" / "bundle.js").write_text("minified\n", encoding="utf-8")
+        commands = []
+
+        def fake_run(cmd, **_kwargs):
+            commands.append(cmd)
+            if cmd[0] == "cloc":
+                return subprocess.CompletedProcess(cmd, 0, stdout='{"SUM": {"code": 1}}', stderr="")
+            if cmd[0] == "lizard":
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with mock.patch.object(run_daily.shutil, "which", return_value="/bin/tool"), \
+                mock.patch.object(run_daily, "run", side_effect=fake_run):
+            status = run_daily.prescan(self.repo, self.out, ["cloc", "lizard"],
+                                       {"default_scope_out": ["dist/"]}, ["changed.py", "dist/bundle.js"])
+        self.assertEqual({tool: info["status"] for tool, info in status.items()}, {"cloc": "ok", "lizard": "ok"})
+        self.assertTrue(any("changed.py" in cmd and "dist/bundle.js" not in cmd for cmd in commands))
+
 
 if __name__ == "__main__":
     unittest.main()

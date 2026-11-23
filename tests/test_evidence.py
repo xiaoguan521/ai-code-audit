@@ -74,6 +74,15 @@ class EvidenceTest(unittest.TestCase):
         r["items"][0]["evidence"] = []
         self.assertTrue(any("1.1" in e and "无证据" in e for e in run_daily.check_output(r, CK, self.repo)))
 
+    def test_issue_fingerprint_ignores_model_title_but_distinguishes_location(self):
+        first = {"item_id": "6.4", "title": "旧措辞", "evidence": [{"path": "a.py", "start_line": 2}]}
+        second = {"item_id": "6.4", "title": "完全不同的措辞", "evidence": [{"path": "a.py", "start_line": 2}]}
+        moved = {"item_id": "6.4", "title": "完全不同的措辞", "evidence": [{"path": "a.py", "start_line": 3}]}
+        self.assertEqual(run_daily.scoring.issue_fingerprint("p1", first),
+                         run_daily.scoring.issue_fingerprint("p1", second))
+        self.assertNotEqual(run_daily.scoring.issue_fingerprint("p1", first),
+                            run_daily.scoring.issue_fingerprint("p1", moved))
+
 
 class TrustBoundaryTest(unittest.TestCase):
     def setUp(self):
@@ -88,24 +97,21 @@ class TrustBoundaryTest(unittest.TestCase):
         repo.mkdir(parents=True)
         (repo / "a.py").write_text("pass\n", encoding="utf-8")
 
-    def test_invalid_evidence_is_quarantined_without_score_or_state(self):
+    def test_invalid_evidence_is_downgraded_without_model_retry(self):
         result = valid_result()
         result["items"][0]["evidence"] = [{"path": "missing.py", "start_line": 999}]
         output = {"result": result, "cost_usd": None, "session_id": "s"}
         with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
                 mock.patch.object(run_daily, "call_agent", return_value=output):
             rec = run_daily.scan_project(self.project, self.settings, "2026-11-22", self.args, CK)
-        self.assertEqual(rec["status"], "error")
+        self.assertEqual(rec["status"], "ok")
         self.assertEqual(rec["metrics"]["model_attempts"][0]["evidence_check"]["invalid_references"], 1)
-        self.assertFalse((self.root / "out/results/2026-11-22/p1.json").exists())
-        self.assertFalse((self.root / "out/state/p1.json").exists())
-        quarantine = self.root / "out/unverified/2026-11-22/p1.json"
-        self.assertTrue(quarantine.exists())
-        self.assertEqual(quarantine.stat().st_mode & 0o777, 0o600)
-        stored = json.loads(quarantine.read_text(encoding="utf-8"))
-        self.assertEqual(stored["status"], "unverified")
-        self.assertTrue(any("文件不存在" in s for s in stored["problems"]))
-        self.assertNotIn("score", stored["result"])
+        self.assertEqual(rec["metrics"]["model_attempts"][0]["evidence_check"]["invalid_references_before_repair"], 1)
+        self.assertTrue((self.root / "out/results/2026-11-22/p1.json").exists())
+        self.assertFalse((self.root / "out/unverified/2026-11-22/p1.json").exists())
+        stored = json.loads((self.root / "out/results/2026-11-22/p1.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored["items"][0]["result"], "NEED_INFO-证据不足")
+        self.assertEqual(stored["items"][0]["evidence"], [])
 
     def test_unchanged_result_reuses_but_scope_change_forces_full(self):
         def fake_agent(*_args):
@@ -142,6 +148,19 @@ class TrustBoundaryTest(unittest.TestCase):
         self.assertEqual(agent.call_count, 1)
         data = json.loads((self.root / "out/results/2026-11-23/p1.json").read_text(encoding="utf-8"))
         self.assertEqual(data["meta"]["commit"], "b" * 40)
+
+    def test_excluded_only_change_reuses_without_model(self):
+        settings = copy.deepcopy(self.settings)
+        settings["default_scope_out"] = ["dist/"]
+        output = {"result": valid_result(), "cost_usd": None, "session_id": "s"}
+        with mock.patch.object(run_daily, "sync_repo", side_effect=["a" * 40, "b" * 40]), \
+                mock.patch.object(run_daily, "changed_files", return_value=["dist/bundle.js"]), \
+                mock.patch.object(run_daily, "call_agent", return_value=output) as agent:
+            first = run_daily.scan_project(self.project, settings, "2026-11-22", self.args, CK)
+            second = run_daily.scan_project(self.project, settings, "2026-11-23", self.args, CK)
+        self.assertEqual((first["mode"], second["mode"]), ("full", "reuse"))
+        self.assertEqual(agent.call_count, 1)
+        self.assertEqual(second["ignored_changes"], ["dist/bundle.js"])
 
     def test_same_workspace_cannot_run_two_batches(self):
         with run_daily.batch_lock(self.settings):
@@ -185,20 +204,18 @@ class TrustBoundaryTest(unittest.TestCase):
         self.assertEqual(agent.call_count, 1)
         self.assertEqual(rec["metrics"]["model_attempts"][0]["stats"]["turns"], 2)
 
-    def test_semantic_retry_receives_the_first_result(self):
+    def test_semantic_problem_is_repaired_without_retry(self):
         first = valid_result()
         first["items"][0]["result"] = "WARN"
-        def agent(prompt, _repo, ctx, _settings, _timeout):
-            if "previous_attempt.json" in prompt:
-                prior = json.loads((ctx / "previous_attempt.json").read_text(encoding="utf-8"))
-                self.assertEqual(prior["items"][0]["result"], "WARN")
-                return {"result": valid_result(), "cost_usd": None, "session_id": "s2"}
+        def agent(_prompt, _repo, _ctx, _settings, _timeout):
             return {"result": copy.deepcopy(first), "cost_usd": None, "session_id": "s1"}
         with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
                 mock.patch.object(run_daily, "call_agent", side_effect=agent) as mocked:
             rec = run_daily.scan_project(self.project, self.settings, "2026-11-22", self.args, CK)
         self.assertEqual(rec["status"], "ok")
-        self.assertEqual(mocked.call_count, 2)
+        self.assertEqual(mocked.call_count, 1)
+        stored = json.loads((self.root / "out/results/2026-11-22/p1.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored["items"][0]["result"], "NEED_INFO-证据不足")
 
     def test_pi_failure_keeps_statistics_without_log_marker(self):
         stats, clean = run_daily.pi_stderr_stats('error\nAI_AUDIT_STATS:{"turns":3,"tool_calls":2}\n')
@@ -255,7 +272,7 @@ class TrustBoundaryTest(unittest.TestCase):
         self.assertTrue(any("1.1" in p and "不得标记为沿用" in p for p in material_problems))
         changed = result["items"][0]
         changed.update(carried_over=False, result="NEED_INFO-补充材料")
-        self.assertTrue(any("change_reason" in p for p in run_daily.incremental_problems(result, previous, [], False)))
+        self.assertTrue(any("必须原样沿用" in p for p in run_daily.incremental_problems(result, previous, [], False)))
 
     def test_changed_symlink_target_invalidates_carried_evidence(self):
         repo = Path(self.settings["workdir"]) / "p1" / "repo"

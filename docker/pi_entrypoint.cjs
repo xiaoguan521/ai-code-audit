@@ -3,7 +3,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { PiEventCollector, PiOutputError } = require('./pi_events.cjs');
-const { optionalSamplingParams } = require('./pi_config.cjs');
+const { optionalSamplingParams, optionalResponseFormat } = require('./pi_config.cjs');
 
 function positiveInteger(name, fallback) {
   const raw = process.env[name] || String(fallback);
@@ -34,13 +34,16 @@ async function main() {
   try {
     const systemPath = path.join(agentDir, 'system.md');
     fs.writeFileSync(systemPath, `${skill}\n\n## 输出格式（批量模式强制）\n完成审查后，最终回复只输出一个符合下列 JSON Schema 的 JSON 对象，不要输出解释或 Markdown。\n${schema}`, { mode: 0o600 });
-    const samplingParams = optionalSamplingParams(process.env);
+    const samplingParams = {
+      ...(optionalSamplingParams(process.env) || {}),
+      ...(optionalResponseFormat(process.env, JSON.parse(schema)) || {}),
+    };
     const models = { providers: { 'audit-internal': {
       baseUrl,
       api: 'openai-completions',
       apiKey: '$OPENAI_API_KEY',
       models: [{ id: model, contextWindow: positiveInteger('PI_CONTEXT_WINDOW', 128000), maxTokens: positiveInteger('PI_MAX_OUTPUT_TOKENS', 16384),
-        ...(samplingParams ? { samplingParams } : {}) }],
+        ...(Object.keys(samplingParams).length ? { samplingParams } : {}) }],
     } } };
     fs.writeFileSync(path.join(agentDir, 'models.json'), JSON.stringify(models), { mode: 0o600 });
     const args = [

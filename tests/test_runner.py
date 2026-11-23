@@ -101,6 +101,15 @@ class CheckOutputTest(unittest.TestCase):
         self.assertTrue(any("1.1" in p and "待补充" in p for p in problems))
         self.assertTrue(any("维度结论" in p for p in problems))
 
+    def test_need_info_cannot_reference_unknown_item(self):
+        result = valid_result()
+        result["need_info_list"] = [{"items": ["9.9"], "missing": "材料", "why": "原因",
+                                     "form": "文档", "unlocks": "结论", "priority": "中"}]
+        problems = run_daily.check_output(result, CK)
+        self.assertTrue(any("不存在的检查项" in p for p in problems))
+        self.assertEqual(run_daily.repair_semantics(result, CK), [])
+        self.assertEqual(result["need_info_list"], [])
+
 
 class ExtractJsonTest(unittest.TestCase):
     def setUp(self):
@@ -192,8 +201,7 @@ class RetryTest(unittest.TestCase):
 
     def test_semantic_then_structural_does_not_score(self):
         rec, n = self.run_scan([with_semantic_problem(), with_structural_problem()])
-        self.assertEqual((rec["status"], n), ("error", 2))
-        self.assertIn("不评分", rec["error"])
+        self.assertEqual((rec["status"], n), ("ok", 1))
 
     def test_unparseable_then_good(self):
         rec, n = self.run_scan([run_daily.AgentOutputError("最终回复中没有 JSON 对象"), valid_result()])

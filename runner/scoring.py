@@ -112,6 +112,9 @@ def validate(result: dict, checklist: dict) -> list[str]:
         problems.append("维度结论缺失、重复或包含未知维度")
     issue_items = {i["item_id"] for i in result.get("issues", [])}
     need_items = {item for group in result.get("need_info_list", []) for item in group.get("items", [])}
+    extra_need = need_items - expected
+    if extra_need:
+        problems.append(f"待补充清单引用了不存在的检查项: {sorted(extra_need)}")
     for it in result.get("items", []):
         if it["result"] in ("PASS", "WARN", "FAIL"):
             if not it.get("evidence"):
@@ -134,10 +137,20 @@ def validate(result: dict, checklist: dict) -> list[str]:
 
 
 def issue_fingerprint(project_id: str, issue: dict) -> str:
-    """跨天跟踪同一问题：项目 + 检查项 + 首个证据文件路径（不含行号）+ 标题。"""
+    """跨天跟踪同一问题：不依赖模型自由文本标题的稳定指纹。
+
+    同一检查项在同一文件的不同位置用首个证据行区分；标题、影响和建议都不
+    参与指纹，因此模型换一种措辞不会把同一个问题误报成“新增”。
+    """
     ref = (issue.get("evidence") or [""])[0]
-    first = ref.get("path", "") if isinstance(ref, dict) else ref.split(":")[0].strip()
-    key = f"{project_id}|{issue['item_id']}|{first}|{issue['title'].strip()}"
+    if isinstance(ref, dict):
+        first = str(ref.get("path", ""))
+        line = ref.get("start_line", "")
+    else:
+        parts = str(ref).split(":", 1)
+        first = parts[0].strip()
+        line = parts[1].strip() if len(parts) == 2 else ""
+    key = f"{project_id}|{issue['item_id']}|{first}|{line}"
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
 
 

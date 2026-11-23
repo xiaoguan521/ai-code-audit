@@ -9,4 +9,17 @@ function optionalSamplingParams(env) {
   return { temperature: value };
 }
 
-module.exports = { optionalSamplingParams };
+function optionalResponseFormat(env, schema) {
+  const mode = (env.PI_RESPONSE_FORMAT || '').trim().toLowerCase();
+  if (!mode || mode === 'off') return undefined;
+  if (mode === 'json_object') return { response_format: { type: 'json_object' } };
+  if (mode === 'json_schema') {
+    if (!schema || typeof schema !== 'object') throw new Error('PI_RESPONSE_FORMAT=json_schema 需要有效 JSON Schema');
+    return { response_format: { type: 'json_schema', json_schema: {
+      name: 'eight_quality_audit_result', strict: true, schema,
+    } } };
+  }
+  throw new Error('PI_RESPONSE_FORMAT 必须是 off、json_object 或 json_schema');
+}
+
+module.exports = { optionalSamplingParams, optionalResponseFormat };

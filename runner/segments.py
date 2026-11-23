@@ -5,8 +5,10 @@ import copy
 import re
 
 
-def schema_for_dimension(checklist: dict, schema: dict, dimension: str) -> dict:
-    ids = [item["id"] for item in checklist["items"] if item["dimension"] == dimension]
+def schema_for_dimension(checklist: dict, schema: dict, dimension: str,
+                        item_ids: list[str] | tuple[str, ...] | set[str] | None = None) -> dict:
+    all_ids = [item["id"] for item in checklist["items"] if item["dimension"] == dimension]
+    ids = all_ids if item_ids is None else [item_id for item_id in all_ids if item_id in set(item_ids)]
     if not ids or dimension not in {d["id"] for d in checklist["dimensions"]}:
         raise ValueError(f"未知维度: {dimension}")
     keys = ["items", "issues", "need_info_list", "dimension_notes", "prompt_injection_suspects"]
@@ -26,9 +28,11 @@ def schema_for_dimension(checklist: dict, schema: dict, dimension: str) -> dict:
     return result
 
 
-def skill_for_dimension(skill: str, checklist: dict, dimension: str) -> str:
+def skill_for_dimension(skill: str, checklist: dict, dimension: str,
+                        item_ids: list[str] | tuple[str, ...] | set[str] | None = None) -> str:
     """复用同一份红线和检查项定义，只发送本维度的判定规则。"""
-    ids = [item["id"] for item in checklist["items"] if item["dimension"] == dimension]
+    all_ids = [item["id"] for item in checklist["items"] if item["dimension"] == dimension]
+    ids = all_ids if item_ids is None else [item_id for item_id in all_ids if item_id in set(item_ids)]
     if not ids:
         raise ValueError(f"未知维度: {dimension}")
     try:
@@ -58,8 +62,8 @@ def skill_for_dimension(skill: str, checklist: dict, dimension: str) -> str:
         "6.8 的判定和问题清单由维度 6 负责，其他维度不得输出 6.8。\n"
         "增量模式下先读取上次结果，仅处理本维度；受影响项重新判定，未受影响项及对应问题原样沿用，"
         "carried_over 标记为 true；结论或风险变化须填写 change_reason。"
-        "任何文件变化都重判 6.1–6.9，依赖或配置变化还重判 4.6、6.7、7.2、7.8、8.8，"
-        "补充材料变化时重判全部相关项。\n"
+        "runner 会在本次提示中给出确定的重判清单；不得自行扩大或缩小清单。"
+        "补充材料变化时按 runner 清单处理。\n"
         "代码地图和预扫描结果只是定位线索，结论必须回源码核实；不得虚构证据。"
         "不提供的信息如实标记 NEED_INFO；不要输出分数。\n"
     )

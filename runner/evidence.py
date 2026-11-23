@@ -102,3 +102,45 @@ def verify(result: dict, repo: Path) -> list[str]:
     for issue in result.get("issues", []):
         check(f"问题 {issue.get('item_id', '未知检查项')}", issue.get("evidence", []))
     return problems
+
+
+def prune_invalid(result: dict, repo: Path) -> tuple[list[str], set[str], set[int]]:
+    """删除无法核验的引用，返回 ``(问题、受影响检查项、受影响问题索引)``。
+
+    这是语义修复阶段使用的窄接口：结构校验仍由调用方负责，引用本身只做
+    失败关闭处理。有效引用保留原样，不从源码回填片段，也不替模型补造证据。
+    """
+    normalize_references(result, repo)
+    invalid_items: set[str] = set()
+    invalid_issues: set[int] = set()
+    problems: list[str] = []
+
+    for item in result.get("items", []):
+        refs = list(item.get("evidence", []))
+        valid: list = []
+        for ref in refs:
+            probe = {"items": [{"id": item.get("id", "未知检查项"), "evidence": [ref]}], "issues": []}
+            current = verify(probe, repo)
+            if current:
+                problems.extend(current)
+            else:
+                valid.append(ref)
+        if len(valid) != len(refs):
+            invalid_items.add(str(item.get("id", "")))
+            item["evidence"] = valid
+
+    for index, issue in enumerate(result.get("issues", [])):
+        refs = list(issue.get("evidence", []))
+        valid = []
+        for ref in refs:
+            probe = {"items": [], "issues": [{"item_id": issue.get("item_id", "未知检查项"),
+                                                  "evidence": [ref]}]}
+            current = verify(probe, repo)
+            if current:
+                problems.extend(current)
+            else:
+                valid.append(ref)
+        if len(valid) != len(refs):
+            invalid_issues.add(index)
+            issue["evidence"] = valid
+    return problems, invalid_items, invalid_issues

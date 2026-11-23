@@ -30,7 +30,7 @@
     "semgrep",
     "lizard"
   ],
-  "prescan_parallelism": 1,
+  "prescan_parallelism": 2,
   "alert": {
     "score_drop_threshold": 1.0,
     "new_p0": true

@@ -17,9 +17,11 @@ import segments  # noqa: E402
 from test_runner import CK, valid_result  # noqa: E402
 
 
-def make_part(dimension):
+def make_part(dimension, item_ids=None):
     whole = valid_result()
     ids = {item["id"] for item in CK["items"] if item["dimension"] == dimension}
+    if item_ids is not None:
+        ids &= set(item_ids)
     return {
         **({"inventory": whole["inventory"]} if dimension == "1" else {}),
         "items": [item for item in whole["items"] if item["id"] in ids],
@@ -40,6 +42,12 @@ class SegmentContractTest(unittest.TestCase):
             wrong = make_part(d)
             wrong["items"][0]["id"] = "8.1" if d != "8" else "1.1"
             self.assertTrue(scoring.schema_errors(wrong, schema))
+
+    def test_incremental_contract_can_emit_only_recheck_items(self):
+        schema = segments.schema_for_dimension(CK, scoring.load_schema(), "5", ["5.3", "5.4"])
+        part = make_part("5", ["5.3", "5.4"])
+        self.assertEqual(scoring.schema_errors(part, schema), [])
+        self.assertTrue(scoring.schema_errors(make_part("5"), schema))
 
     def test_merge_preserves_all_missing_information(self):
         parts = {}
@@ -82,10 +90,10 @@ class SegmentRunnerTest(unittest.TestCase):
         self.settings = {"agent": {"type": "pi-docker", "strategy": "dimensions", "dimension_parallelism": 4}}
 
     def call(self, ctx):
-        ctx.mkdir()
+        ctx.mkdir(exist_ok=True)
         return run_daily.call_agent_dimensions("MODE: batch", self.repo, ctx, self.settings, 10, CK, None, None, False)
 
-    def test_only_invalid_dimension_is_retried_and_merged(self):
+    def test_invalid_dimension_is_downgraded_and_merged_without_retry(self):
         counts = {}
         lock = threading.Lock()
         def fake(_prompt, _repo, ctx, _settings, _timeout):
@@ -101,29 +109,29 @@ class SegmentRunnerTest(unittest.TestCase):
             return {"result": part, "cost_usd": None, "session_id": "s"}
         with mock.patch.object(run_daily, "call_agent", side_effect=fake):
             out = self.call(self.root / "ctx")
-        self.assertEqual(counts, {str(n): (2 if n == 6 else 1) for n in range(1, 9)})
+        self.assertEqual(counts, {str(n): 1 for n in range(1, 9)})
         self.assertEqual(run_daily.check_output(out["result"], CK, self.repo), [])
         self.assertEqual(len(out["result"]["items"]), 64)
         self.assertEqual(out["stats"]["dimensions"]["6"]["attempts"][0]["evidence_check"]["invalid_references"], 1)
 
-    def test_persistently_invalid_dimension_prevents_a_result(self):
+    def test_persistently_invalid_dimension_is_scored_as_need_info(self):
         def fake(_prompt, _repo, ctx, _settings, _timeout):
             part = make_part(ctx.name)
             if ctx.name == "6":
                 part["items"][0]["evidence"][0]["path"] = "missing.py"
             return {"result": part, "cost_usd": None, "session_id": "s"}
         with mock.patch.object(run_daily, "call_agent", side_effect=fake):
-            with self.assertRaisesRegex(run_daily.AgentOutputError, "不评分") as cm:
-                self.call(self.root / "ctx")
-        self.assertEqual(cm.exception.stats["dimensions"]["6"]["status"], "error")
-        self.assertEqual(cm.exception.stats["dimensions"]["5"]["status"], "ok")
-        self.assertFalse(cm.exception.retryable)
+            out = self.call(self.root / "ctx")
+        self.assertEqual(out["stats"]["dimensions"]["6"]["status"], "ok")
+        item = next(item for item in out["result"]["items"] if item["id"] == "6.1")
+        self.assertEqual(item["result"], "NEED_INFO-证据不足")
 
-    def test_incremental_rechecks_security_without_repeating_other_dimensions(self):
+    def test_incremental_rechecks_only_affected_dimensions(self):
         previous = valid_result()
         ctx = self.root / "ctx"
         ctx.mkdir()
         (ctx / "previous_result.json").write_text(json.dumps(previous), encoding="utf-8")
+        plan = run_daily.incremental.plan(CK, previous, ["README.md"], False)
         counts = {}
         lock = threading.Lock()
         def fake(_prompt, _repo, part_ctx, _settings, _timeout):
@@ -131,15 +139,16 @@ class SegmentRunnerTest(unittest.TestCase):
             self.assertTrue((part_ctx / "previous_result.json").exists())
             with lock:
                 counts[dimension] = counts.get(dimension, 0) + 1
-                count = counts[dimension]
-            part = make_part(dimension)
+            selected = {item["id"] for item in CK["items"] if item["dimension"] == dimension}
+            selected &= plan.affected_items
+            part = make_part(dimension, selected)
             for item in part["items"]:
-                item["carried_over"] = not (dimension == "6" and count > 1)
+                item["carried_over"] = False
             return {"result": part, "cost_usd": None, "session_id": "s"}
         with mock.patch.object(run_daily, "call_agent", side_effect=fake):
-            out = run_daily.call_agent_dimensions("增量", self.repo, ctx, self.settings, 10, CK, previous, ["new.py"], False)
-        self.assertEqual(counts, {str(n): (2 if n == 6 else 1) for n in range(1, 9)})
-        self.assertEqual(run_daily.incremental_problems(out["result"], previous, ["new.py"], False, self.repo), [])
+            out = run_daily.call_agent_dimensions("增量", self.repo, ctx, self.settings, 10, CK, previous, ["README.md"], False, plan)
+        self.assertEqual(counts, {"5": 1, "6": 1, "8": 1})
+        self.assertEqual(run_daily.incremental_problems(out["result"], previous, ["README.md"], False, self.repo, plan), [])
 
     def test_hard_limit_is_not_retried_unchanged(self):
         counts = {}
@@ -154,6 +163,23 @@ class SegmentRunnerTest(unittest.TestCase):
             with self.assertRaisesRegex(run_daily.AgentOutputError, "长度上限"):
                 self.call(self.root / "ctx")
         self.assertEqual(counts, {str(n): 1 for n in range(1, 9)})
+
+    def test_dimension_call_can_be_restarted_after_structural_failure(self):
+        ctx = self.root / "ctx-restart"
+        allow_dimension_six = False
+
+        def fake(_prompt, _repo, part_ctx, _settings, _timeout):
+            part = make_part(part_ctx.name)
+            if part_ctx.name == "6" and not allow_dimension_six:
+                part["items"].pop()
+            return {"result": part, "cost_usd": None, "session_id": "s"}
+
+        with mock.patch.object(run_daily, "call_agent", side_effect=fake):
+            with self.assertRaises(run_daily.AgentOutputError):
+                self.call(ctx)
+            allow_dimension_six = True
+            out = self.call(ctx)
+        self.assertEqual(len(out["result"]["items"]), 64)
 
     def test_global_limit_covers_concurrent_projects(self):
         self.settings["agent"].update(network="test", dimension_parallelism=8)

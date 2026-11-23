@@ -13,11 +13,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import concurrent.futures as cf
 import csv
 import datetime as dt
 import fcntl
-import fnmatch
 import hashlib
 import json
 import os
@@ -37,6 +37,8 @@ import scoring  # noqa: E402
 import evidence  # noqa: E402
 import code_map  # noqa: E402
 import segments  # noqa: E402
+import incremental  # noqa: E402
+import facts  # noqa: E402
 
 SKILL_FILE = ROOT / "skill" / "eight-quality-audit" / "SKILL.md"
 SCHEMA_FILE = ROOT / "config" / "result.schema.json"
@@ -163,7 +165,7 @@ def audit_fingerprint(p: dict, settings: dict) -> str:
     h = hashlib.sha256(json.dumps(inputs, sort_keys=True, ensure_ascii=False).encode("utf-8"))
     for file in (SKILL_FILE, SCHEMA_FILE, ROOT / "config" / "checklist.json",
                  ROOT / "runner" / "evidence.py", ROOT / "runner" / "code_map.py", ROOT / "runner" / "scoring.py",
-                 ROOT / "runner" / "segments.py"):
+                 ROOT / "runner" / "segments.py", ROOT / "runner" / "incremental.py", ROOT / "runner" / "facts.py"):
         h.update(file.read_bytes())
     return h.hexdigest()
 
@@ -229,7 +231,13 @@ def write_private_json(path: Path, value: dict) -> None:
 
 # ---------- 预扫描（可选，确定性工具，结果只作线索） ----------
 
-def prescan(repo: Path, out: Path, tools: list[str], settings: dict) -> dict[str, dict]:
+def prescan(repo: Path, out: Path, tools: list[str], settings: dict,
+            files: list[str] | None = None) -> dict[str, dict]:
+    """运行确定性预扫描。
+
+    ``files`` 非空时只扫描 Git 变更文件，并统一应用 default_scope_out；全量模式
+    仍扫描仓库根目录。工具的输出只作为模型定位线索，不能替代源码证据。
+    """
     out.mkdir(parents=True, exist_ok=True)
     out = out.resolve()
     tools = list(dict.fromkeys(tools))
@@ -237,11 +245,17 @@ def prescan(repo: Path, out: Path, tools: list[str], settings: dict) -> dict[str
     if parallelism < 1:
         raise ValueError("prescan_parallelism 必须为正整数")
     if parallelism > 1 and len(tools) > 1:
-        # 每个工具各写一份报告；默认串行，可按机器资源显式打开有限并发。
+        # 每个工具各写一份报告；使用有限并发，避免预扫描工具互相挤占资源。
         single = dict(settings, prescan_parallelism=1)
         with cf.ThreadPoolExecutor(max_workers=min(parallelism, len(tools), 4)) as pool:
-            entries = pool.map(lambda name: prescan(repo, out, [name], single), tools)
+            entries = pool.map(lambda name: prescan(repo, out, [name], single, files), tools)
             return {name: entry[name] for name, entry in zip(tools, entries)}
+    scope_out = [str(pattern) for pattern in settings.get("default_scope_out", [])]
+    scan_files = None
+    if files is not None:
+        scan_files = [path for path in dict.fromkeys(incremental.normalize_path(path) for path in files)
+                      if path and not code_map.excluded(path, scope_out) and (repo / path).is_file()]
+    targets = scan_files if scan_files is not None else ["."]
     status: dict[str, dict] = {}
     for tool in tools:
         entry = status[tool] = {"status": "skipped"}
@@ -255,20 +269,46 @@ def prescan(repo: Path, out: Path, tools: list[str], settings: dict) -> dict[str
         if tool == "semgrep" and not rules:
             entry["reason"] = "未配置离线规则"
             continue
+        if scan_files is not None and not scan_files:
+            entry.update(reason="没有未排除的变更文件", scan_scope="changed_files")
+            continue
         filename = {"cloc": "cloc.json", "gitleaks": "gitleaks.json",
                     "semgrep": "semgrep.json", "lizard": "lizard_warnings.txt"}[tool]
         target = out / filename
+        entry["scan_scope"] = "changed_files" if scan_files is not None else "repository"
+        entry["file_count"] = len(targets) if scan_files is not None else None
         commands = {
-            "cloc": (["cloc", "--json", "--quiet", "--vcs=git", "."], 900),
+            "cloc": (["cloc", "--json", "--quiet", "--vcs=git", *targets], 900),
             "gitleaks": (["gitleaks", "detect", "--no-git", "--redact", "--no-banner", "--exit-code", "0",
                           "--report-format", "json", "--report-path", str(target), "--source", "."], 1800),
             "semgrep": (["semgrep", "scan", "--config", rules or "", "--json", "--metrics=off", "--quiet",
-                         "--output", str(target), "."], 3600),
-            "lizard": (["lizard", "-w", "-C", "15", "-L", "200", "."], 1800),
+                         "--output", str(target), *targets], 3600),
+            "lizard": (["lizard", "-w", "-C", "15", "-L", "200", *targets], 1800),
         }
         try:
             with measure(entry, "duration_seconds"):
                 cmd, timeout = commands[tool]
+                if tool == "gitleaks" and scan_files is not None:
+                    # gitleaks dir 接受单个文件/目录；对变更文件逐个运行并合并报告，
+                    # 避免把未变更的仓库内容重新扫描一遍。
+                    findings = []
+                    for index, path in enumerate(scan_files):
+                        partial = out / f".gitleaks-{index}.json"
+                        r = run(["gitleaks", "dir", "--redact", "--no-banner", "--exit-code", "0",
+                                 "--report-format", "json", "--report-path", str(partial), path],
+                                cwd=repo, timeout=timeout)
+                        if r.returncode != 0:
+                            entry.update(status="failed", reason="工具退出失败", exit_code=r.returncode)
+                            break
+                        if partial.is_file():
+                            findings.extend(json.loads(partial.read_text(encoding="utf-8")))
+                            partial.unlink(missing_ok=True)
+                    else:
+                        target.write_text(json.dumps(findings, ensure_ascii=False), encoding="utf-8")
+                        entry.update(status="ok", output=filename, findings=len(findings))
+                    if entry["status"] != "skipped" and entry["status"] != "ok":
+                        target.unlink(missing_ok=True)
+                    continue
                 r = run(cmd, cwd=repo, timeout=timeout)
                 entry["exit_code"] = r.returncode
                 # Lizard 用 1 表示有复杂度告警；仅在输出确实包含告警时接受。
@@ -304,7 +344,9 @@ def prescan(repo: Path, out: Path, tools: list[str], settings: dict) -> dict[str
 
 def build_prompt(p: dict, mode: str, commit: str, settings: dict, prescan_dir: str | None,
                  prev_file: str | None, changes: list[str] | None, materials_changed: bool,
-                 changes_file: str | None = None, code_map_file: str | None = None) -> str:
+                 changes_file: str | None = None, code_map_file: str | None = None,
+                 incremental_plan: incremental.IncrementalPlan | None = None,
+                 facts_file: str | None = None) -> str:
     scope_out = [s for s in (p.get("scope_out") or "").replace("；", ";").split(";") if s.strip()]
     scope_out += settings.get("default_scope_out", [])
     lines = [
@@ -329,6 +371,8 @@ def build_prompt(p: dict, mode: str, commit: str, settings: dict, prescan_dir: s
         lines.append(f"- 预扫描工具输出目录（仅作线索，须回源码核实）: {prescan_dir}")
     if code_map_file:
         lines.append(f"- Git 跟踪文件的代码地图: {code_map_file}；候选路径仅供定位，不能代替源码核实")
+    if facts_file:
+        lines.append(f"- runner 生成的确定性事实与 inventory: {facts_file}；事实用于定位和盘点，语义结论仍须回源码核实")
     if mode == "incremental" and prev_file:
         lines += [
             "",
@@ -337,6 +381,11 @@ def build_prompt(p: dict, mode: str, commit: str, settings: dict, prescan_dir: s
             f"- 补充材料是否有变化: {'是' if materials_changed else '否'}",
             "- 本次变更文件清单:",
         ]
+        if incremental_plan is not None:
+            affected = sorted(incremental_plan.affected_items, key=lambda value: (value.split(".")[0], value))
+            lines.append(f"- runner 预计算的本次重判检查项（必须 carried_over=false）：{', '.join(affected) or '无'}")
+            lines.append("- 未列入重判清单的检查项必须原样沿用上次结论、证据和问题，并标记 carried_over=true。")
+            lines.append("- 重判原因仅可基于变更文件或补充材料，不得因模型随机性改动沿用项。")
         shown = (changes or [])[:800]
         # 文件名属于不可信仓库数据；JSON 转义防止换行伪造额外提示。
         lines += [f"  - {json.dumps(c, ensure_ascii=False)}" for c in shown]
@@ -456,22 +505,16 @@ def check_output(result: dict, checklist: dict, repo: Path | None = None,
 
 
 def incremental_problems(result: dict, previous: dict, changes: list[str], materials_changed: bool,
-                         repo: Path | None = None) -> list[str]:
+                         repo: Path | None = None,
+                         plan: incremental.IncrementalPlan | None = None) -> list[str]:
     """核对声称沿用的结论；未命中这些规则不代表变更必然无影响。"""
     previous_items = {item["id"]: item for item in previous.get("items", [])}
-    changed = set(changes)
-    # 新增的任意文件可能引入秘密、注入文字或其他安全风险，不能只按旧证据反推。
-    forced = {f"6.{i}" for i in range(1, 10)} if changed else set()
-    config_suffixes = (".json", ".yaml", ".yml", ".toml", ".ini", ".properties", ".xml", ".lock")
-    dependency_names = ("go.mod", "go.sum", "dockerfile*", "jenkinsfile", "requirements*.txt", "gemfile*", "cargo.toml")
-    if any(path.lower().endswith(config_suffixes) or
-           any(fnmatch.fnmatchcase(Path(path).name.lower(), pattern) for pattern in dependency_names) or
-           path.startswith((".github/workflows/", ".circleci/", ".buildkite/"))
-           for path in changed):
-        forced.update({"4.6", "6.7", "7.2", "7.8", "8.8"})
-    if materials_changed:
-        # 新材料可能影响此前没有证据的任何结论，无法仅凭旧证据反推安全范围。
-        forced.update(previous_items)
+    changed = {incremental.normalize_path(path) for path in changes if incremental.normalize_path(path)}
+    if plan is None:
+        # 兼容旧调用方：没有提供规划结果时仍使用保守的旧规则。
+        item_ids = [{"id": item_id} for item_id in previous_items]
+        plan = incremental.plan({"items": item_ids}, previous, changes, materials_changed)
+    forced = set(plan.affected_items)
 
     def normalized_issues(data: dict, item_id: str) -> list[str]:
         issues = [{k: v for k, v in issue.items() if k not in {"fingerprint", "_id"}}
@@ -479,7 +522,7 @@ def incremental_problems(result: dict, previous: dict, changes: list[str], mater
         return sorted(json.dumps(issue, ensure_ascii=False, sort_keys=True) for issue in issues)
 
     def ref_changed(ref: dict) -> bool:
-        path = ref.get("path")
+        path = incremental.normalize_path(ref.get("path", ""))
         if path in changed:
             return True
         if repo is not None and isinstance(path, str):
@@ -493,7 +536,11 @@ def incremental_problems(result: dict, previous: dict, changes: list[str], mater
     problems = []
     for item in result.get("items", []):
         old = previous_items.get(item["id"])
+        clean = lambda value: {k: v for k, v in value.items() if k not in {"carried_over", "change_reason"}}
         if not item.get("carried_over"):
+            if old and item["id"] not in forced:
+                problems.append(f"{item['id']} 未受变更影响，必须原样沿用并标记 carried_over")
+                continue
             changed_judgment = old and (any(old.get(k) != item.get(k) for k in ("result", "risk")) or
                                         bool(old.get("conditional")) != bool(item.get("conditional")))
             if changed_judgment and not str(item.get("change_reason", "")).strip():
@@ -505,7 +552,6 @@ def incremental_problems(result: dict, previous: dict, changes: list[str], mater
             continue
         if item_id in forced:
             problems.append(f"{item_id} 受代码、配置或材料变化影响，不得标记为沿用")
-        clean = lambda value: {k: v for k, v in value.items() if k not in {"carried_over", "change_reason"}}
         if clean(item) != clean(old):
             problems.append(f"{item_id} 标记为沿用，但检查结论或证据已改变")
         refs = list(old.get("evidence", []))
@@ -517,6 +563,165 @@ def incremental_problems(result: dict, previous: dict, changes: list[str], mater
         if normalized_issues(result, item_id) != normalized_issues(previous, item_id):
             problems.append(f"{item_id} 标记为沿用，但对应问题清单已改变")
     return problems
+
+
+def _merge_need_info(result: dict, item_ids: set[str], *, missing: str, why: str) -> None:
+    """把需要补充的检查项加入清单，并将过多分组压缩到 Schema 上限。"""
+    if not item_ids:
+        return
+    groups = result.setdefault("need_info_list", [])
+    remaining = set(item_ids)
+    for group in groups:
+        selected = remaining & set(group.get("items", []))
+        if selected:
+            group["items"] = list(dict.fromkeys([*group.get("items", []), *sorted(selected)]))
+            remaining -= selected
+    if remaining:
+        groups.append({"items": sorted(remaining), "missing": missing, "why": why,
+                       "form": "源码证据或补充材料", "unlocks": "恢复可评分结论", "priority": "中"})
+    # 保留前 14 组，把溢出组聚合成一组，符合 result.schema.json 的 maxItems=15。
+    if len(groups) > 15:
+        overflow = groups[14:]
+        combined = {"items": list(dict.fromkeys(item for group in overflow for item in group.get("items", []))),
+                    "missing": "；".join(dict.fromkeys(group.get("missing", "") for group in overflow if group.get("missing"))),
+                    "why": "；".join(dict.fromkeys(group.get("why", "") for group in overflow if group.get("why"))),
+                    "form": "源码证据或补充材料", "unlocks": "恢复可评分结论", "priority": "中"}
+        groups[:] = [*groups[:14], combined]
+
+
+def _repair_incremental_result(result: dict, previous: dict, plan: incremental.IncrementalPlan,
+                               checklist: dict) -> int:
+    """将未受影响的输出恢复为上次结果，避免模型抄写错误污染基线。"""
+    expected = {item["id"] for item in checklist.get("items", [])}
+    affected = set(plan.affected_items) & expected
+    old_items = {item.get("id"): item for item in previous.get("items", [])}
+    repaired = 0
+    for index, item in enumerate(result.get("items", [])):
+        item_id = item.get("id")
+        old = old_items.get(item_id)
+        if old is None or item_id not in expected:
+            continue
+        if item_id not in affected:
+            replacement = copy.deepcopy(old)
+            replacement["carried_over"] = True
+            replacement.pop("change_reason", None)
+            if {k: v for k, v in item.items() if k not in {"carried_over", "change_reason"}} != \
+                    {k: v for k, v in replacement.items() if k not in {"carried_over", "change_reason"}} or \
+                    not item.get("carried_over"):
+                result["items"][index] = replacement
+                repaired += 1
+        elif item.get("carried_over"):
+            item["carried_over"] = False
+            old_judgment = (old.get("result"), old.get("risk"), bool(old.get("conditional")))
+            new_judgment = (item.get("result"), item.get("risk"), bool(item.get("conditional")))
+            if old_judgment != new_judgment and not str(item.get("change_reason", "")).strip():
+                item["change_reason"] = "受变更影响，已重新核验"
+            repaired += 1
+
+    # 受影响项使用模型当前的问题，未受影响项使用旧问题；这样标题改写不会
+    # 触发语义重试，也不会破坏历史问题的连续性。
+    current_issues = [issue for issue in result.get("issues", [])
+                      if issue.get("item_id") in affected]
+    old_issues = [copy.deepcopy(issue) for issue in previous.get("issues", [])
+                  if issue.get("item_id") in expected and issue.get("item_id") not in affected]
+    if result.get("issues", []) != [*current_issues, *old_issues]:
+        result["issues"] = [*current_issues, *old_issues]
+        repaired += 1
+
+    # need_info 也按同一边界合并，过滤掉其它维度的 ID。
+    groups = []
+    for source, allowed in ((result.get("need_info_list", []), affected),
+                            (previous.get("need_info_list", []), expected - affected)):
+        for group in source:
+            selected = [item_id for item_id in group.get("items", []) if item_id in allowed]
+            if selected:
+                copy_group = copy.deepcopy(group)
+                copy_group["items"] = list(dict.fromkeys(selected))
+                groups.append(copy_group)
+    if result.get("need_info_list", []) != groups:
+        result["need_info_list"] = groups
+        repaired += 1
+    return repaired
+
+
+def repair_semantics(result: dict, checklist: dict, repo: Path | None = None,
+                     verification_stats: dict | None = None,
+                     previous: dict | None = None,
+                     plan: incremental.IncrementalPlan | None = None,
+                     schema: dict | None = None) -> list[str]:
+    """修复可确定的语义不一致，不重新启动整次模型会话。
+
+    结构错误仍由 ``check_output`` 抛出并允许一次结构重试；这里处理的是不真实
+    的证据、孤立问题和增量沿用抄写错误。无法安全修复的残留问题会原样返回，
+    由调用方失败关闭。
+    """
+    repairs = 0
+    if previous is not None and plan is not None:
+        repairs += _repair_incremental_result(result, previous, plan, checklist)
+
+    # 待补充分组是模型自由组织的字段；完整 Schema 约束了每个维度的局部输出，
+    # 但旧版完整 Schema 没有给其中的 item ID 加 enum，故在这里过滤未知编号。
+    expected_ids = {item["id"] for item in checklist.get("items", [])}
+    filtered_need_info = []
+    for group in result.get("need_info_list", []):
+        selected = [item_id for item_id in group.get("items", []) if item_id in expected_ids]
+        if selected:
+            copy_group = copy.deepcopy(group)
+            copy_group["items"] = list(dict.fromkeys(selected))
+            filtered_need_info.append(copy_group)
+    if filtered_need_info != result.get("need_info_list", []):
+        result["need_info_list"] = filtered_need_info
+        repairs += 1
+
+    invalid_items: set[str] = set()
+    invalid_issue_indices: set[int] = set()
+    if repo is not None:
+        evidence_problems, invalid_items, invalid_issue_indices = evidence.prune_invalid(result, repo)
+        if verification_stats is not None:
+            verification_stats["invalid_references_before_repair"] = len(evidence_problems)
+            verification_stats["repaired_references"] = len(invalid_items) + len(invalid_issue_indices)
+        repairs += len(invalid_items) + len(invalid_issue_indices)
+
+    item_map = {item.get("id"): item for item in result.get("items", [])}
+    valid_issues = []
+    for index, issue in enumerate(result.get("issues", [])):
+        source = item_map.get(issue.get("item_id"))
+        if (index in invalid_issue_indices or not issue.get("evidence") or source is None or
+                source.get("result") not in ("WARN", "FAIL")):
+            repairs += 1
+            continue
+        valid_issues.append(issue)
+    result["issues"] = valid_issues
+    issue_ids = {issue.get("item_id") for issue in valid_issues}
+
+    needs: set[str] = set()
+    for item in result.get("items", []):
+        item_id = item.get("id")
+        judged = item.get("result") in ("PASS", "WARN", "FAIL")
+        if item_id in invalid_items or (judged and not item.get("evidence")) or \
+                (item.get("result") in ("WARN", "FAIL") and item_id not in issue_ids):
+            item.update(result="NEED_INFO-证据不足", risk="none", conditional=True,
+                        conclusion="源码证据或问题清单无法核验，暂不下结论")
+            item["evidence"] = []
+            item.pop("change_reason", None)
+            needs.add(item_id)
+            repairs += 1
+    _merge_need_info(result, needs, missing="可核验的源码证据或问题清单",
+                     why="当前输出中的证据/问题引用无法通过 runner 核验")
+    # 降级后的 NEED_INFO 项不能继续挂着 WARN/FAIL 问题。
+    downgraded = needs
+    if downgraded:
+        result["issues"] = [issue for issue in result.get("issues", [])
+                             if issue.get("item_id") not in downgraded]
+    if verification_stats is not None:
+        verification_stats["semantic_repairs"] = verification_stats.get("semantic_repairs", 0) + repairs
+    before_invalid = verification_stats.get("invalid_references", 0) if verification_stats is not None else 0
+    residual = check_output(result, checklist, repo, verification_stats, schema)
+    if verification_stats is not None and before_invalid:
+        # 保留本次模型原始输出中被修复的引用数；最终复核为 0 不应抹掉审计指标。
+        verification_stats["invalid_references"] = max(before_invalid,
+                                                        verification_stats.get("invalid_references", 0))
+    return residual
 
 
 def backend_problem(settings: dict) -> str | None:
@@ -624,13 +829,20 @@ def ctx_view(settings: dict, ctx: Path) -> str:
 
 def call_agent_dimensions(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: int,
                           checklist: dict, previous: dict | None, changes: list[str] | None,
-                          materials_changed: bool) -> dict:
+                          materials_changed: bool,
+                          plan: incremental.IncrementalPlan | None = None) -> dict:
     """分维度调用模型、独立校验重试，再合并为现有的完整结果。"""
     dimensions = [d["id"] for d in checklist["dimensions"]]
+    if previous is not None and plan is None:
+        plan = incremental.plan(checklist, previous, changes or [], materials_changed)
     base_schema = scoring.load_schema()
     skill = SKILL_FILE.read_text(encoding="utf-8")
-    common = list(ctx.iterdir())
     parts_root = ctx / "dimensions"
+    # 外层项目级结构重试会复用同一个 context；不要把上次的维度目录再次当作
+    # 输入复制，也不要因 mkdir 已存在而把本应重试的项目直接打成失败。
+    if parts_root.exists():
+        shutil.rmtree(parts_root)
+    common = list(ctx.iterdir())
     parts_root.mkdir()
 
     def link_or_copy(src: str, dst: str) -> str:
@@ -640,7 +852,7 @@ def call_agent_dimensions(prompt: str, repo: Path, ctx: Path, settings: dict, ti
         except OSError:
             return shutil.copy2(src, dst)
 
-    def prepare(dimension: str) -> tuple[Path, dict, dict]:
+    def prepare(dimension: str) -> tuple[Path, dict, dict, dict, dict]:
         part_ctx = parts_root / dimension
         part_ctx.mkdir()
         for source in common:
@@ -648,21 +860,132 @@ def call_agent_dimensions(prompt: str, repo: Path, ctx: Path, settings: dict, ti
                 shutil.copytree(source, part_ctx / source.name, copy_function=link_or_copy)
             elif source.is_file():
                 link_or_copy(str(source), str(part_ctx / source.name))
-        part_schema = segments.schema_for_dimension(checklist, base_schema, dimension)
+        full_items = [item for item in checklist["items"] if item["dimension"] == dimension]
+        full_ids = {item["id"] for item in full_items}
+        if previous is not None and plan is not None:
+            selected_ids = full_ids & set(plan.affected_items)
+            # 未受影响维度不会启动模型，会直接走 carried_part；为保持其旧契约，
+            # 这里仍给它完整的维度 schema。
+            if not selected_ids:
+                selected_ids = full_ids
+        else:
+            selected_ids = full_ids
+        part_schema = segments.schema_for_dimension(checklist, base_schema, dimension, selected_ids)
         (part_ctx / "dimension.schema.json").write_text(json.dumps(part_schema, ensure_ascii=False), encoding="utf-8")
-        (part_ctx / "dimension.skill.md").write_text(segments.skill_for_dimension(skill, checklist, dimension), encoding="utf-8")
+        (part_ctx / "dimension.skill.md").write_text(
+            segments.skill_for_dimension(skill, checklist, dimension, selected_ids), encoding="utf-8")
         part_checklist = dict(checklist,
                               dimensions=[d for d in checklist["dimensions"] if d["id"] == dimension],
-                              items=[i for i in checklist["items"] if i["dimension"] == dimension])
-        return part_ctx, part_schema, part_checklist
+                              items=[i for i in full_items if i["id"] in selected_ids])
+        full_schema = segments.schema_for_dimension(checklist, base_schema, dimension, full_ids)
+        full_checklist = dict(checklist,
+                              dimensions=[d for d in checklist["dimensions"] if d["id"] == dimension],
+                              items=full_items)
+        return part_ctx, part_schema, part_checklist, full_schema, full_checklist
 
     prepared = {dimension: prepare(dimension) for dimension in dimensions}
 
+    def carried_part(dimension: str) -> dict:
+        """为未受影响维度生成可信的沿用结果，不启动模型会话。"""
+        if previous is None:
+            raise ValueError("没有上次结果，不能沿用维度")
+        ids = {item["id"] for item in prepared[dimension][4]["items"]}
+        old_items = {item["id"]: item for item in previous.get("items", [])}
+        if not ids.issubset(old_items):
+            raise ValueError(f"上次结果缺少维度 {dimension} 的检查项")
+        items = []
+        for item_id in (item["id"] for item in checklist["items"] if item["dimension"] == dimension):
+            item = json.loads(json.dumps(old_items[item_id], ensure_ascii=False))
+            item["carried_over"] = True
+            item.pop("change_reason", None)
+            items.append(item)
+        issues = [json.loads(json.dumps(issue, ensure_ascii=False))
+                  for issue in previous.get("issues", []) if issue.get("item_id") in ids]
+        need_info = []
+        for group in previous.get("need_info_list", []):
+            selected = [item_id for item_id in group.get("items", []) if item_id in ids]
+            if selected:
+                copy_group = json.loads(json.dumps(group, ensure_ascii=False))
+                copy_group["items"] = selected
+                need_info.append(copy_group)
+        notes = [json.loads(json.dumps(note, ensure_ascii=False))
+                 for note in previous.get("dimension_notes", []) if note.get("dimension") == dimension]
+        if len(notes) != 1:
+            raise ValueError(f"上次结果缺少维度 {dimension} 的结论")
+        part = {"items": items, "issues": issues, "need_info_list": need_info,
+                "dimension_notes": notes}
+        if dimension == "1":
+            part["inventory"] = json.loads(json.dumps(previous.get("inventory", {}), ensure_ascii=False))
+        if dimension == "6":
+            part["prompt_injection_suspects"] = list(previous.get("prompt_injection_suspects", []))
+        return part
+
+    def complete_part(dimension: str, part: dict, model_ids: set[str]) -> dict:
+        """把增量会话只输出的检查项与旧结果合成为完整维度结果。"""
+        if previous is None:
+            return part
+        full_ids = [item["id"] for item in checklist["items"] if item["dimension"] == dimension]
+        old_items = {item.get("id"): item for item in previous.get("items", [])}
+        current_items = {item.get("id"): item for item in part.get("items", [])}
+        merged_items = []
+        for item_id in full_ids:
+            if item_id in current_items:
+                merged_items.append(current_items[item_id])
+            elif item_id in old_items:
+                old = copy.deepcopy(old_items[item_id])
+                old["carried_over"] = True
+                old.pop("change_reason", None)
+                merged_items.append(old)
+            else:
+                raise ValueError(f"上次结果缺少维度 {dimension} 的检查项 {item_id}")
+        current_issues = [copy.deepcopy(issue) for issue in part.get("issues", []) if issue.get("item_id") in model_ids]
+        old_issues = [copy.deepcopy(issue) for issue in previous.get("issues", [])
+                      if issue.get("item_id") in set(full_ids) - model_ids]
+        groups = []
+        for source, allowed in ((part.get("need_info_list", []), model_ids),
+                                (previous.get("need_info_list", []), set(full_ids) - model_ids)):
+            for group in source:
+                selected = [item_id for item_id in group.get("items", []) if item_id in allowed]
+                if selected:
+                    copy_group = copy.deepcopy(group)
+                    copy_group["items"] = list(dict.fromkeys(selected))
+                    groups.append(copy_group)
+        merged = dict(part)
+        merged["items"] = merged_items
+        merged["issues"] = [*current_issues, *old_issues]
+        merged["need_info_list"] = groups
+        if dimension == "1" and not merged.get("inventory"):
+            merged["inventory"] = copy.deepcopy(previous.get("inventory", {}))
+        if dimension == "6" and "6.8" not in model_ids:
+            merged["prompt_injection_suspects"] = list(previous.get("prompt_injection_suspects", []))
+        return merged
+
     def audit(dimension: str) -> dict:
-        part_ctx, part_schema, part_checklist = prepared[dimension]
+        part_ctx, part_schema, part_checklist, full_schema, full_checklist = prepared[dimension]
+        dimension_ids = {item["id"] for item in full_checklist["items"]}
+        model_ids = {item["id"] for item in part_checklist["items"]}
+        if previous is not None and plan is not None and not (dimension_ids & plan.affected_items):
+            part = carried_part(dimension)
+            evidence_stats = {}
+            problems = check_output(part, part_checklist, repo, evidence_stats, part_schema)
+            if problems:
+                problems = repair_semantics(part, part_checklist, repo, evidence_stats,
+                                            schema=part_schema)
+            if problems:
+                return {"attempts": [{"attempt": 0, "status": "invalid", "reused": True,
+                                      "evidence_check": evidence_stats}],
+                        "error": "沿用维度未通过证据核验"}
+            return {"attempts": [{"attempt": 0, "status": "reused", "reused": True,
+                                  "evidence_check": evidence_stats}],
+                    "out": {"result": part, "cost_usd": 0, "session_id": None,
+                             "usage": None, "stats": {"reused": True}}}
         part_prompt = prompt.replace(ctx_view(settings, ctx) + "/", ctx_view(settings, part_ctx) + "/")
         ids = [item["id"] for item in part_checklist["items"]]
         part_prompt += f"\n\n本次仅输出维度 {dimension} 的检查项：{', '.join(ids)}；其他维度由其他会话负责。"
+        if plan is not None:
+            recheck = sorted(dimension_ids & plan.affected_items, key=lambda value: (value.split(".")[0], value))
+            part_prompt += (f"\n本维度本次必须重判：{', '.join(recheck) or '无'}；"
+                            "其余检查项必须原样沿用并标记 carried_over=true。")
         attempts, best = [], None
         for attempt in (1, 2):
             metrics = {"attempt": attempt}
@@ -677,8 +1000,17 @@ def call_agent_dimensions(prompt: str, repo: Path, ctx: Path, settings: dict, ti
                     metrics["evidence_check"] = {}
                     problems = check_output(out["result"], part_checklist, repo, metrics["evidence_check"], part_schema)
                     if previous is not None:
-                        problems.extend(incremental_problems(out["result"], previous, changes or [], materials_changed, repo))
+                        problems.extend(incremental_problems(out["result"], previous, changes or [], materials_changed, repo, plan))
+                    if problems:
+                        problems = repair_semantics(out["result"], part_checklist, repo,
+                                                    metrics["evidence_check"], previous, plan, part_schema)
+                        if previous is not None:
+                            problems.extend(incremental_problems(out["result"], previous, changes or [],
+                                                                materials_changed, repo, plan))
                 best = (out, problems)
+                if problems:
+                    # 结构合格但语义修复后仍残留的问题不能靠重复同一提示词解决。
+                    raise AgentOutputError("维度结果语义校验无法自动修复", problems, retryable=False)
             except AgentOutputError as exc:
                 metrics.update(status="invalid", error_type=type(exc).__name__, validation_problem_count=len(exc.problems))
                 if exc.stats is not None:
@@ -694,6 +1026,29 @@ def call_agent_dimensions(prompt: str, repo: Path, ctx: Path, settings: dict, ti
             else:
                 metrics.update(status="invalid" if problems else "ok", validation_problem_count=len(problems))
             if not problems:
+                if previous is not None and model_ids != dimension_ids:
+                    completed_out = out
+                    try:
+                        completed_part = complete_part(dimension, out["result"], model_ids)
+                        full_stats = {}
+                        full_problems = check_output(completed_part, full_checklist, repo, full_stats, full_schema)
+                        if full_problems:
+                            problems = full_problems
+                        elif plan is not None:
+                            problems = incremental_problems(completed_part, previous, changes or [],
+                                                            materials_changed, repo, plan)
+                        if not problems:
+                            completed_out = dict(out, result=completed_part)
+                            out = completed_out
+                    except (ValueError, AgentOutputError) as exc:
+                        problems = [str(exc)]
+                    if problems:
+                        # 合并旧结果后的完整维度仍未通过校验时，不能把未合并的局部结果当作成功。
+                        # 这属于不可由重复同一会话修复的契约问题，交给上层以失败收口。
+                        best = (completed_out, problems)
+                        return {"attempts": attempts,
+                                "error": "增量维度合并后校验无法通过",
+                                "best": best}
                 write_private_json(part_ctx / "verified_result.json", out["result"])
                 return {"attempts": attempts, "out": out}
             log(f"维度 {dimension}: 第 {attempt} 次输出校验未通过: {problems[:3]}")
@@ -777,26 +1132,60 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
                 mode = "reuse"  # 新提交未改变仓库文件；到期全量已在上面判断。
             else:
                 mode = "incremental" if changes is not None else "full"
+        # 生成文件、依赖缓存和其它配置的排除范围不应仅因为提交而唤醒模型；锁文件
+        # 虽然不进入常规源码地图，仍是依赖/可复现性检查的触发源，不能过滤。
+        effective_changes = changes
+        if mode == "incremental" and changes is not None:
+            project_scope_out = [s.strip() for s in (p.get("scope_out") or "").replace("；", ";").split(";") if s.strip()]
+            planning_scope_out = project_scope_out + [pattern for pattern in settings.get("default_scope_out", [])
+                                                       if pattern != "*.lock"]
+            effective_changes = [path for path in changes
+                                 if not code_map.excluded(incremental.normalize_path(path), planning_scope_out)]
+            if not effective_changes and not materials_changed:
+                rec["ignored_changes"] = list(changes)
+                mode, changes = "reuse", []
+            else:
+                changes = effective_changes
         previous_result = None
+        incremental_plan = None
         if mode == "incremental":
             try:
                 previous_result = json.loads(prev_file.read_text(encoding="utf-8"))
                 if check_output(previous_result, checklist):
                     raise ValueError("上次结果不自洽")
+                incremental_plan = incremental.plan(checklist, previous_result, changes or [], materials_changed)
+                if incremental_plan.full_scan:
+                    mode = "full"
+                    previous_result = None
+                    changes = None
+                    incremental_plan = None
+                    log(f"{pid}: 变更影响面过大，升级全量扫描")
             except (OSError, UnicodeError, json.JSONDecodeError, AgentOutputError, ValueError):
                 previous_result, changes, mode = None, None, "full"
+                incremental_plan = None
                 log(f"{pid}: 上次结果无效，回退全量扫描")
         rec.update({"commit": commit, "mode": mode})
+        if incremental_plan is not None:
+            rec["incremental_plan"] = {
+                "changed_files": list(incremental_plan.changed_files),
+                "affected_items": sorted(incremental_plan.affected_items),
+                "affected_dimensions": sorted(incremental_plan.affected_dimensions),
+                "reasons": {item_id: list(incremental_plan.reasons.get(item_id, ()))
+                            for item_id in sorted(incremental_plan.affected_items)},
+            }
         log(f"{pid}: {commit[:10]} → {mode}" + (f"（{len(changes)} 个变更文件）" if changes else ""))
         if args.dry_run:
             rec["status"] = "dry-run"
             return rec
 
+        facts_data = None
         if mode == "reuse":
             data = json.loads(prev_file.read_text(encoding="utf-8"))
             verification_stats = {}
             with measure(metrics["stages_seconds"], "reuse_validation"):
                 problems = check_output(data, checklist, repo, verification_stats)
+                if problems:
+                    problems = repair_semantics(data, checklist, repo, verification_stats)
             metrics["evidence_check"] = verification_stats
             if problems:
                 raise AgentOutputError("上次结果无法通过源码引用核验，本次不评分", problems)
@@ -811,8 +1200,13 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
             if ctx.exists():
                 shutil.rmtree(ctx)
             pre_dir = ctx / "prescan"
+            facts_file = None
+            prescan_settings = dict(settings)
+            project_scope_out = [s.strip() for s in (p.get("scope_out") or "").replace("；", ";").split(";") if s.strip()]
+            prescan_settings["default_scope_out"] = project_scope_out + list(settings.get("default_scope_out", []))
             with measure(metrics["stages_seconds"], "prescan"):
-                prescan_status = prescan(repo, pre_dir, settings.get("prescan_tools", []), settings)
+                prescan_status = prescan(repo, pre_dir, settings.get("prescan_tools", []), prescan_settings,
+                                          changes if mode == "incremental" else None)
             metrics["prescan_tools"] = prescan_status
             tools_done = [tool for tool, info in prescan_status.items() if info["status"] == "ok"]
             unavailable = [f"{tool}: {info.get('reason', info['status'])}" for tool, info in prescan_status.items()
@@ -823,8 +1217,7 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
             if settings.get("code_map_enabled", True):
                 try:
                     with measure(metrics["stages_seconds"], "code_map"):
-                        scope_out = [s.strip() for s in (p.get("scope_out") or "").replace("；", ";").split(";") if s.strip()]
-                        scope_out += settings.get("default_scope_out", [])
+                        scope_out = prescan_settings["default_scope_out"]
                         repo_map = code_map.build(repo, commit, scope_out, settings.get("code_map_max_entries", 120))
                         (ctx / "code_map.json").write_text(json.dumps(repo_map, ensure_ascii=True, indent=2), encoding="utf-8")
                     map_file = "code_map.json"
@@ -832,6 +1225,23 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
                 except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
                     metrics["code_map"] = {"status": "failed", "reason": type(e).__name__}
                     log(f"{pid}: 代码地图生成失败，继续常规审查")
+            try:
+                with measure(metrics["stages_seconds"], "facts"):
+                    facts_data = facts.collect(repo, commit, repo_map if map_file else None,
+                                               prescan_settings["default_scope_out"], pre_dir,
+                                               full_inventory=(mode != "incremental"),
+                                               files=changes if mode == "incremental" else None,
+                                               previous_inventory=(previous_result or {}).get("inventory"))
+                    write_json_atomic(ctx / "facts.json", facts_data)
+                facts_file = f"{ctx_view(settings, ctx)}/facts.json"
+                metrics["facts"] = {
+                    "status": "ok",
+                    "finding_count": len(facts_data.get("findings", [])),
+                    "tracked_files": facts_data.get("inventory", {}).get("file_count", 0),
+                }
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+                metrics["facts"] = {"status": "failed", "reason": type(e).__name__}
+                log(f"{pid}: 确定性事实生成失败，继续模型审查")
             prev_copy = None
             if mode == "incremental":
                 prev_copy = ctx / "previous_result.json"
@@ -843,7 +1253,7 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
                 changes_file = f"{view}/changed_files.json"
             prompt = build_prompt(p, mode, commit, settings, f"{view}/prescan" if tools_done else None,
                                   f"{view}/previous_result.json" if prev_copy else None, changes, materials_changed, changes_file,
-                                  f"{view}/{map_file}" if map_file else None)
+                                  f"{view}/{map_file}" if map_file else None, incremental_plan, facts_file)
             timeout = int(settings.get("per_project_timeout_sec", 3600))
             best = None  # 最近一次结构合格的输出（可能仍有语义问题）及其问题清单
             for attempt in (1, 2):  # 输出不合格时带着问题清单重试一次
@@ -853,7 +1263,7 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
                     with measure(attempt_metrics, "model_seconds"):
                         if settings.get("agent", {}).get("strategy", "single") == "dimensions":
                             out = call_agent_dimensions(prompt, repo, ctx, settings, timeout, checklist,
-                                                        previous_result, changes, materials_changed)
+                                                        previous_result, changes, materials_changed, incremental_plan)
                         else:
                             out = call_agent(prompt, repo, ctx, settings, timeout)
                     attempt_metrics["stats"] = out.get("stats")
@@ -863,10 +1273,19 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
                         attempt_metrics["evidence_check"] = {}
                         problems = check_output(out["result"], checklist, repo, attempt_metrics["evidence_check"])
                         if previous_result is not None:
-                            problems.extend(incremental_problems(out["result"], previous_result, changes or [], materials_changed, repo))
+                            problems.extend(incremental_problems(out["result"], previous_result, changes or [], materials_changed,
+                                                                repo, incremental_plan))
+                        if problems:
+                            problems = repair_semantics(out["result"], checklist, repo,
+                                                        attempt_metrics["evidence_check"], previous_result,
+                                                        incremental_plan)
+                            if previous_result is not None:
+                                problems.extend(incremental_problems(out["result"], previous_result,
+                                                                    changes or [], materials_changed, repo,
+                                                                    incremental_plan))
                     best = (out, problems)
-                    if problems and settings.get("agent", {}).get("strategy", "single") == "dimensions":
-                        raise AgentOutputError("分维度结果合并后未通过校验，本次不评分", problems, retryable=False)
+                    if problems:
+                        raise AgentOutputError("结果语义校验无法自动修复，本次不评分", problems, retryable=False)
                 except AgentOutputError as e:
                     # 结构不合格的输出不能拿去评分；两次都没有结构合格的输出，本项目记为失败
                     attempt_metrics.update({"status": "invalid", "error_type": type(e).__name__,
@@ -905,12 +1324,44 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
                 raise AgentOutputError("两次输出仍未通过校验，本次不评分", problems)
             out, problems = best
             data = out["result"]
+            if facts_data is not None:
+                # 确定性扫描只允许覆盖本次确实需要重判的项目；不会把增量沿用项
+                # 静默改写。发现只会上调风险，模型更严重的结论保持不变。
+                allowed = incremental_plan.affected_items if incremental_plan is not None else None
+                metrics["deterministic_overrides"] = facts.apply_findings(
+                    data, facts_data.get("findings", []), allowed
+                )
+                post_stats = {}
+                post_problems = check_output(data, checklist, repo, post_stats)
+                if post_problems:
+                    post_problems = repair_semantics(data, checklist, repo, post_stats)
+                if post_stats:
+                    evidence_stats = attempt_metrics.setdefault("evidence_check", {})
+                    for key, value in post_stats.items():
+                        if key in {"references", "invalid_references"}:
+                            evidence_stats[key] = max(evidence_stats.get(key, 0), value)
+                        else:
+                            evidence_stats[key] = value
+                if post_problems:
+                    # 这类问题由 runner 的语义修复阶段处理；若仍残留，拒绝评分。
+                    raise AgentOutputError("确定性事实合并后结果不自洽", post_problems, retryable=False)
             data["meta"] = {"date": run_date, "mode": mode, "commit": commit, "cost_usd": out["cost_usd"],
                             "session_id": out["session_id"], "prescan_tools": tools_done, "agent": settings.get("agent", {}).get("type", "claude"),
                             "prescan_status": prescan_status,
                             "usage": out.get("usage"),
                             "evidence_check": attempt_metrics.get("evidence_check", {}),
                             "validation_problems": problems, "evidence_verified": True, "scanned_at": now().isoformat()}
+        if facts_data is not None:
+            # inventory 是 runner 的确定性输出，不再接受模型对文件数/语言/入口的自由改写。
+            data["inventory"] = facts_data["inventory"]
+            if facts_data.get("prompt_injection_suspects"):
+                data["prompt_injection_suspects"] = list(dict.fromkeys(
+                    [*data.get("prompt_injection_suspects", []), *facts_data["prompt_injection_suspects"]]
+                ))
+            data.setdefault("meta", {})["deterministic_facts"] = {
+                "finding_count": len(facts_data.get("findings", [])),
+                "signals": facts_data.get("signals", {}),
+            }
         data["meta"]["project"] = {k: p.get(k, "") for k in
                                    ("project_id", "project_name", "department", "owner", "git_url", "branch", "tech_stack")}
         with measure(metrics["stages_seconds"], "scoring"):
