@@ -6,8 +6,8 @@
     python3 runner/run_daily.py --only demo-order --force-full
     python3 runner/run_daily.py --dry-run       # 只打印将执行的动作，不调用模型
 
-每个项目的流程：拉取代码（只读副本）→ 判断扫描类型 → 可选预扫描工具 → 调用 Claude Code
-无界面模式（只读工具 + JSON Schema 约束输出）→ 校验 → 确定性评分 → 落盘。
+每个项目的流程：拉取代码（只读副本）→ 判断扫描类型 → 可选预扫描工具 → 调用配置的 Agent Adapter
+（Pi/Claude 的结构化结果，或完整 Harness Headless 的最终 Markdown）→ 校验 → 确定性评分 → 落盘。
 全部项目完成后调用 render.py 生成日报与看板。
 """
 from __future__ import annotations
@@ -39,6 +39,9 @@ import code_map  # noqa: E402
 import segments  # noqa: E402
 import incremental  # noqa: E402
 import facts  # noqa: E402
+from adapters import harness as harness_adapter  # noqa: E402
+from adapters import summary as summary_adapter  # noqa: E402
+from parsers import audit_markdown  # noqa: E402
 
 SKILL_FILE = ROOT / "skill" / "eight-quality-audit" / "SKILL.md"
 SCHEMA_FILE = ROOT / "config" / "result.schema.json"
@@ -51,7 +54,7 @@ ALLOWED_TOOLS = [
     "Bash(git rev-parse *)", "Bash(wc *)", "Bash(ls *)",
 ]
 DISALLOWED_TOOLS = ["Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "mcp__*"]
-SUPPORTED_AGENTS = {"pi-docker", "qwen-docker", "claude"}
+SUPPORTED_AGENTS = {"pi-docker", "qwen-docker", "claude", "deepseek-harness"}
 
 
 def now() -> dt.datetime:
@@ -144,7 +147,8 @@ def audit_fingerprint(p: dict, settings: dict) -> str:
         "semgrep_rules_dir": settings.get("semgrep_rules_dir", ""),
         "code_map_enabled": settings.get("code_map_enabled", True),
         "code_map_max_entries": settings.get("code_map_max_entries", 120),
-        "agent": {k: ag.get(k) for k in ("type", "image", "strategy")},
+        "agent": {k: ag.get(k) for k in ("type", "image", "strategy", "launcher", "bin", "args",
+                                          "prompt_mode", "network", "success_reason_kinds")},
         "model": settings.get("model", ""),
         # 模型别名指向的服务或权重变化时，由部署者更新此值。
         "audit_revision": settings.get("audit_revision", ""),
@@ -153,7 +157,8 @@ def audit_fingerprint(p: dict, settings: dict) -> str:
     env_file = ag.get("env_file")
     if env_file:
         try:
-            names = {"OPENAI_BASE_URL", "OPENAI_MODEL", "PI_CONTEXT_WINDOW", "PI_MAX_OUTPUT_TOKENS", "PI_TEMPERATURE"}
+            names = {"OPENAI_BASE_URL", "OPENAI_MODEL", "DEEPSEEK_MODEL", "DSH_HOME",
+                     "PI_CONTEXT_WINDOW", "PI_MAX_OUTPUT_TOKENS", "PI_TEMPERATURE"}
             selected = {}
             for line in Path(env_file).read_text(encoding="utf-8").splitlines():
                 key, sep, value = line.strip().partition("=")
@@ -165,7 +170,9 @@ def audit_fingerprint(p: dict, settings: dict) -> str:
     h = hashlib.sha256(json.dumps(inputs, sort_keys=True, ensure_ascii=False).encode("utf-8"))
     for file in (SKILL_FILE, SCHEMA_FILE, ROOT / "config" / "checklist.json",
                  ROOT / "runner" / "evidence.py", ROOT / "runner" / "code_map.py", ROOT / "runner" / "scoring.py",
-                 ROOT / "runner" / "segments.py", ROOT / "runner" / "incremental.py", ROOT / "runner" / "facts.py"):
+                 ROOT / "runner" / "segments.py", ROOT / "runner" / "incremental.py", ROOT / "runner" / "facts.py",
+                 ROOT / "runner" / "adapters" / "harness.py",
+                 ROOT / "runner" / "parsers" / "audit_markdown.py"):
         h.update(file.read_bytes())
     return h.hexdigest()
 
@@ -349,11 +356,18 @@ def build_prompt(p: dict, mode: str, commit: str, settings: dict, prescan_dir: s
                  facts_file: str | None = None) -> str:
     scope_out = [s for s in (p.get("scope_out") or "").replace("；", ";").split(";") if s.strip()]
     scope_out += settings.get("default_scope_out", [])
+    is_harness = settings.get("agent", {}).get("type") == "deepseek-harness"
+    output_instruction = audit_markdown.output_instructions() if is_harness else (
+        "最终只返回符合 JSON Schema 的结构化结果。"
+    )
     lines = [
         "MODE: batch",
+        f"OUTPUT_FORMAT: {'markdown' if is_harness else 'json'}",
         f"SCAN_TYPE: {mode}",
         "请严格按系统提示中的《八性代码质量审查 Skill》执行，对当前工作目录下的仓库做只读静态审查，"
-        "最终只返回符合 JSON Schema 的结构化结果。",
+        + output_instruction,
+        *(["本次使用完整 Harness Agent Loop，请自行规划检查步骤、工具调用和必要的子任务；Runner 不规定中间步骤。"]
+          if is_harness else []),
         "",
         "## 项目元数据",
         f"- PROJECT_ID: {p['project_id']}",
@@ -433,18 +447,21 @@ def call_claude(prompt: str, repo: Path, extra_dirs: list[Path], settings: dict,
 
 
 class AgentCallError(RuntimeError):
-    def __init__(self, msg: str, stats: dict | None = None):
+    def __init__(self, msg: str, stats: dict | None = None, agent_status: str = "failed"):
         super().__init__(msg)
         self.stats = stats
+        self.agent_status = agent_status
 
 
 class AgentOutputError(AgentCallError):
     """模型输出无法解析为合格 JSON 或结构不符合 Schema；可带问题清单重试。"""
 
-    def __init__(self, msg: str, problems: list[str] | None = None, stats: dict | None = None, retryable: bool = True):
-        super().__init__(msg, stats)
+    def __init__(self, msg: str, problems: list[str] | None = None, stats: dict | None = None,
+                 retryable: bool = True, raw_text: str | None = None):
+        super().__init__(msg, stats, "completed")
         self.problems = problems or [msg]
         self.retryable = retryable
+        self.raw_text = raw_text
 
 
 REQUIRED_KEYS = ["inventory", "items", "issues", "need_info_list", "dimension_notes", "summary", "self_check"]
@@ -517,7 +534,9 @@ def incremental_problems(result: dict, previous: dict, changes: list[str], mater
     forced = set(plan.affected_items)
 
     def normalized_issues(data: dict, item_id: str) -> list[str]:
-        issues = [{k: v for k, v in issue.items() if k not in {"fingerprint", "_id"}}
+        # issue_id 是给报告和 Summary 引用的显示标识，不参与沿用语义比较；
+        # 模型可能在两次审查中重新编号，但问题事实由其余字段决定。
+        issues = [{k: v for k, v in issue.items() if k not in {"fingerprint", "issue_id", "_id"}}
                   for issue in data.get("issues", []) if issue.get("item_id") == item_id]
         return sorted(json.dumps(issue, ensure_ascii=False, sort_keys=True) for issue in issues)
 
@@ -728,9 +747,17 @@ def backend_problem(settings: dict) -> str | None:
     agent = settings.get("agent")
     kind = agent.get("type") if isinstance(agent, dict) else None
     if kind not in SUPPORTED_AGENTS:
-        return "settings.json 的 agent.type 必须显式设为 pi-docker、qwen-docker 或 claude"
+        return "settings.json 的 agent.type 必须显式设为 pi-docker、qwen-docker、claude 或 deepseek-harness"
     if agent.get("strategy", "single") not in {"single", "dimensions"}:
         return "settings.json 的 agent.strategy 必须为 single 或 dimensions"
+    if kind == "deepseek-harness" and agent.get("strategy", "single") != "single":
+        return "deepseek-harness 必须使用 strategy=single，由 Harness 自己负责任务拆分和 Agent Loop"
+    if kind == "deepseek-harness":
+        launcher = agent.get("launcher", "docker")
+        if launcher not in {"docker", "local"}:
+            return "deepseek-harness 的 agent.launcher 必须为 docker 或 local"
+        if launcher == "docker" and not str(agent.get("image", "")).strip():
+            return "deepseek-harness 的 Docker launcher 必须配置 agent.image"
     return None
 
 
@@ -738,10 +765,13 @@ def network_problem(settings: dict) -> str | None:
     """容器后端必须显式指定容器网络。被审查的代码是不可信输入（可能藏提示注入），
     留空会落到 Docker 默认网桥、可以访问任意外网地址。确实要用默认网桥，须显式写 "bridge"。"""
     ag = settings.get("agent", {})
-    if ag.get("type") not in {"pi-docker", "qwen-docker"} or (ag.get("network") or "").strip():
+    requires_network = ag.get("type") in {"pi-docker", "qwen-docker"} or (
+        ag.get("type") == "deepseek-harness" and ag.get("launcher", "docker") == "docker"
+    )
+    if not requires_network or (ag.get("network") or "").strip():
         return None
-    return ("settings.json 的 agent.network 未配置：容器会落到默认网桥、可访问任意地址。"
-            "请创建只放行内网千问的专用 Docker 网络并填入（见 README“网络隔离”）；"
+    return ("settings.json 的 agent.network 未配置：扫描容器会落到默认网桥、可访问任意地址。"
+            "请创建只放行模型服务的专用 Docker 网络并填入（见 README“网络隔离”）；"
             "确需使用默认网桥，请显式填写 \"bridge\"")
 
 
@@ -809,6 +839,35 @@ def call_pi_docker(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: 
             "usage": last.get("usage"), "stats": last.get("stats") or stats}
 
 
+def call_deepseek_harness(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: int) -> dict:
+    """启动完整 Harness Headless 任务；不介入其内部 Agent Loop。"""
+    try:
+        return harness_adapter.run(prompt, repo, ctx, settings, timeout)
+    except harness_adapter.HarnessError as exc:
+        raise AgentCallError(str(exc), stats=exc.stats, agent_status=exc.agent_status) from exc
+
+
+def normalize_agent_output(out: dict, checklist: dict) -> dict:
+    """Project a Harness final Markdown answer into the existing result shape."""
+    if isinstance(out.get("result"), dict):
+        return out
+    raw_text = out.get("raw_text")
+    if not isinstance(raw_text, str):
+        raise AgentOutputError("Agent 没有返回结构化结果或最终 Markdown",
+                               stats=out.get("stats"))
+    try:
+        parsed = audit_markdown.parse(raw_text, checklist)
+    except audit_markdown.AuditMarkdownError as exc:
+        raise AgentOutputError("Markdown 结果未通过结构契约",
+                               problems=exc.problems, stats=out.get("stats"),
+                               raw_text=raw_text) from exc
+    normalized = dict(out)
+    normalized["result"] = parsed.result
+    normalized["audit_metadata"] = parsed.metadata
+    normalized["audit_sha256"] = parsed.raw_sha256
+    return normalized
+
+
 def call_agent(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: int) -> dict:
     problem = backend_problem(settings)
     if problem:
@@ -817,6 +876,8 @@ def call_agent(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: int)
     with settings.get("_model_limiter", nullcontext()):
         if kind in {"pi-docker", "qwen-docker"}:
             return call_pi_docker(prompt, repo, ctx, settings, timeout)
+        if kind == "deepseek-harness":
+            return call_deepseek_harness(prompt, repo, ctx, settings, timeout)
         if kind == "claude":
             return call_claude(prompt, repo, [ctx], settings, timeout)
     raise RuntimeError(problem or "不支持的模型后端")
@@ -824,7 +885,11 @@ def call_agent(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: int)
 
 def ctx_view(settings: dict, ctx: Path) -> str:
     """模型看到的上下文目录路径：容器内固定为 /workspace/context。"""
-    return "/workspace/context" if settings.get("agent", {}).get("type") in {"pi-docker", "qwen-docker"} else str(ctx)
+    agent = settings.get("agent", {})
+    in_container = agent.get("type") in {"pi-docker", "qwen-docker"} or (
+        agent.get("type") == "deepseek-harness" and agent.get("launcher", "docker") == "docker"
+    )
+    return "/workspace/context" if in_container else str(ctx)
 
 
 def call_agent_dimensions(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: int,
@@ -993,6 +1058,7 @@ def call_agent_dimensions(prompt: str, repo: Path, ctx: Path, settings: dict, ti
             try:
                 with measure(metrics, "model_seconds"):
                     out = call_agent(part_prompt, repo, part_ctx, settings, timeout)
+                    out = normalize_agent_output(out, part_checklist)
                 metrics["stats"] = out.get("stats")
                 metrics["usage_last_message"] = out.get("usage")
                 metrics["cost_usd"] = out.get("cost_usd")
@@ -1080,8 +1146,24 @@ def call_agent_dimensions(prompt: str, repo: Path, ctx: Path, settings: dict, ti
         raise AgentOutputError(f"分维度审查失败（{details}），本次不评分", stats={"dimensions": stats}, retryable=False)
     parts = {dimension: completed[dimension]["out"]["result"] for dimension in dimensions}
     costs = [completed[dimension]["out"].get("cost_usd") for dimension in dimensions]
-    return {"result": segments.merge(checklist, parts), "cost_usd": sum(costs) if all(c is not None for c in costs) else None,
-            "session_id": None, "usage": None, "stats": {"dimensions": stats}}
+    raw_fragments = {
+        dimension: completed[dimension]["out"]["raw_text"]
+        for dimension in dimensions
+        if isinstance(completed[dimension]["out"].get("raw_text"), str)
+    }
+    event_log = []
+    for dimension in dimensions:
+        for event in completed[dimension]["out"].get("event_log", []) or []:
+            event_log.append({"dimension": dimension, **event})
+    agent_ran = any(
+        any(not attempt.get("reused") for attempt in completed[dimension].get("attempts", []))
+        for dimension in dimensions
+    )
+    return {"result": segments.merge(checklist, parts),
+            "cost_usd": sum(costs) if all(c is not None for c in costs) else None,
+            "session_id": None, "usage": None, "stats": {"dimensions": stats},
+            "raw_fragments": raw_fragments, "event_log": event_log,
+            "agent_status": "completed" if agent_ran else "not_run"}
 
 
 # ---------- 单项目流程 ----------
@@ -1092,6 +1174,83 @@ def save_unverified(outdir: Path, run_date: str, pid: str, commit: str, best: tu
         "project_id": pid, "date": run_date, "commit": commit,
         "status": "unverified", "problems": problems, "result": candidate["result"],
     })
+    raw_text = candidate.get("raw_text")
+    if isinstance(raw_text, str):
+        write_text_atomic(outdir / "unverified" / run_date / f"{pid}.md", raw_text, mode=0o600)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_text_atomic(path: Path, value: str, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(value)
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def save_audit_artifacts(outdir: Path, run_date: str, pid: str, data: dict,
+                         metrics: dict, agent_output: dict | None = None) -> Path:
+    """Persist raw Harness output separately from the verified operational result."""
+    artifact_dir = outdir / "artifacts" / run_date / pid
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    if agent_output:
+        raw_text = agent_output.get("raw_text")
+        if isinstance(raw_text, str):
+            write_text_atomic(artifact_dir / "audit.md", raw_text)
+        fragments = agent_output.get("raw_fragments")
+        if isinstance(fragments, dict):
+            for dimension, fragment in sorted(fragments.items()):
+                if isinstance(fragment, str):
+                    write_text_atomic(artifact_dir / "dimensions" / f"{dimension}.md", fragment)
+        event_log = agent_output.get("event_log")
+        if isinstance(event_log, list):
+            write_text_atomic(
+                artifact_dir / "run-events.jsonl",
+                "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in event_log),
+            )
+    else:
+        # reuse 模式没有新的 Agent 回复，但原始审查 Markdown 仍是审计凭据；
+        # 将上一份 artifact 的副本带入本次归档，避免“已验证结果没有原文”。
+        previous_dir = data.get("meta", {}).get("artifact_dir")
+        previous_markdown = Path(previous_dir) / "audit.md" if previous_dir else None
+        if previous_markdown and previous_markdown.is_file():
+            try:
+                write_text_atomic(artifact_dir / "audit.md",
+                                  previous_markdown.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError):
+                pass
+    write_json_atomic(artifact_dir / "audit.json", data)
+    write_json_atomic(artifact_dir / "metrics.json", metrics)
+    return artifact_dir
+
+
+def save_summary_artifacts(artifact_dir: Path, summary: dict) -> None:
+    write_text_atomic(artifact_dir / "summary.md", summary["text"])
+    metadata = {
+        key: value for key, value in summary.items()
+        if key not in {"text", "event_log"}
+    }
+    write_json_atomic(artifact_dir / "summary.meta.json", metadata)
+    event_log = summary.get("event_log")
+    if isinstance(event_log, list) and event_log:
+        write_text_atomic(
+            artifact_dir / "summary-events.jsonl",
+            "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in event_log),
+        )
 
 
 def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) -> dict:
@@ -1105,6 +1264,7 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
     day_dir.mkdir(parents=True, exist_ok=True)
     rec = {"project_id": pid, "project_name": p["project_name"], "department": p.get("department", ""),
            "owner": p.get("owner", ""), "date": run_date, "status": "ok", "metrics": metrics}
+    agent_output = None
     try:
         state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
         repo = work / "repo"
@@ -1194,6 +1354,8 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
             data["meta"]["evidence_verified"] = True
             data["meta"]["evidence_check"] = verification_stats
             data["meta"]["usage"] = None
+            data["meta"]["agent_status"] = "not_run"
+            data["meta"]["audit_status"] = "verified"
         else:
             # 只把本项目的上下文目录（预扫描结果 + 上次结果副本）开放给模型，不暴露其它项目
             ctx = work / "context"
@@ -1261,11 +1423,13 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
                 metrics["model_attempts"].append(attempt_metrics)
                 try:
                     with measure(attempt_metrics, "model_seconds"):
-                        if settings.get("agent", {}).get("strategy", "single") == "dimensions":
+                        if (settings.get("agent", {}).get("strategy", "single") == "dimensions"
+                                and settings.get("agent", {}).get("type") != "deepseek-harness"):
                             out = call_agent_dimensions(prompt, repo, ctx, settings, timeout, checklist,
                                                         previous_result, changes, materials_changed, incremental_plan)
                         else:
                             out = call_agent(prompt, repo, ctx, settings, timeout)
+                            out = normalize_agent_output(out, checklist)
                     attempt_metrics["stats"] = out.get("stats")
                     attempt_metrics["usage_last_message"] = out.get("usage")
                     attempt_metrics["cost_usd"] = out.get("cost_usd")
@@ -1292,7 +1456,15 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
                                             "validation_problem_count": len(e.problems)})
                     if e.stats is not None:
                         attempt_metrics["stats"] = e.stats
+                    if e.raw_text:
+                        (ctx / "previous_attempt.md").write_text(e.raw_text, encoding="utf-8")
+                        if settings.get("agent", {}).get("type") == "deepseek-harness":
+                            prompt += (f"\n\n上次原始 Markdown 保存在 {view}/previous_attempt.md；"
+                                       "如需修复结构，请先读取它，但仍由 Harness 自己决定后续审查步骤。")
                     if not e.retryable or (attempt == 2 and best is None):
+                        if e.raw_text:
+                            write_text_atomic(outdir / "unverified" / run_date / f"{pid}.md",
+                                              e.raw_text, mode=0o600)
                         if best is not None:
                             save_unverified(outdir, run_date, pid, commit, best)
                         raise
@@ -1311,18 +1483,27 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
                 if attempt == 1:
                     shown = problems[:MAX_PROBLEMS_IN_PROMPT]
                     more = len(problems) - len(shown)
+                    is_harness = settings.get("agent", {}).get("type") == "deepseek-harness"
                     if best is not None:
-                        write_json_atomic(ctx / "previous_attempt.json", best[0]["result"])
-                        prompt += (f"\n\n上次结构合格的结果保存在 {view}/previous_attempt.json；"
-                                   "请先读取该结果，仅修复下列问题，保留其他已验证内容；"
-                                   "涉及源码引用时必须重新核实，最终仍输出完整 JSON。")
-                    prompt += ("\n\n## 上次输出校验未通过，请修正后重新输出完整 JSON\n" + "\n".join(f"- {x}" for x in shown)
+                        if is_harness and best[0].get("raw_text"):
+                            (ctx / "previous_attempt.md").write_text(best[0]["raw_text"], encoding="utf-8")
+                            prompt += (f"\n\n上次 Markdown 保存在 {view}/previous_attempt.md；"
+                                       "请只修复结构问题，保留已核实的事实和证据，不要改变 Harness 的自主审查流程。")
+                        else:
+                            write_json_atomic(ctx / "previous_attempt.json", best[0]["result"])
+                            prompt += (f"\n\n上次结构合格的结果保存在 {view}/previous_attempt.json；"
+                                       "请先读取该结果，仅修复下列问题，保留其他已验证内容；"
+                                       "涉及源码引用时必须重新核实，最终仍输出完整 JSON。")
+                    retry_format = audit_markdown.output_instructions() if is_harness else "仍输出完整 JSON。"
+                    prompt += ("\n\n## 上次输出校验未通过，请修正后重新输出\n" + "\n".join(f"- {x}" for x in shown)
+                               + f"\n\n{retry_format}"
                                + (f"\n- ……另有 {more} 处同类问题" if more > 0 else ""))
             if problems:
                 if best is not None:
                     save_unverified(outdir, run_date, pid, commit, best)
                 raise AgentOutputError("两次输出仍未通过校验，本次不评分", problems)
             out, problems = best
+            agent_output = out
             data = out["result"]
             if facts_data is not None:
                 # 确定性扫描只允许覆盖本次确实需要重判的项目；不会把增量沿用项
@@ -1345,8 +1526,18 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
                 if post_problems:
                     # 这类问题由 runner 的语义修复阶段处理；若仍残留，拒绝评分。
                     raise AgentOutputError("确定性事实合并后结果不自洽", post_problems, retryable=False)
-            data["meta"] = {"date": run_date, "mode": mode, "commit": commit, "cost_usd": out["cost_usd"],
-                            "session_id": out["session_id"], "prescan_tools": tools_done, "agent": settings.get("agent", {}).get("type", "claude"),
+            audit_sha = out.get("audit_sha256")
+            if not audit_sha and isinstance(out.get("raw_text"), str):
+                audit_sha = hashlib.sha256(out["raw_text"].encode("utf-8")).hexdigest()
+            data["meta"] = {"date": run_date, "mode": mode, "commit": commit, "commit_sha": commit,
+                            "cost_usd": out["cost_usd"], "session_id": out["session_id"],
+                            "prescan_tools": tools_done, "agent": settings.get("agent", {}).get("type", "claude"),
+                            "agent_model": out.get("agent_model") or settings.get("model", ""),
+                            "agent_status": out.get("agent_status", "completed"),
+                            "audit_status": "verified", "audit_sha256": audit_sha,
+                            "skill_sha256": sha256_file(SKILL_FILE),
+                            "parser_version": audit_markdown.PARSER_VERSION,
+                            "scoring_version": sha256_file(ROOT / "runner" / "scoring.py"),
                             "prescan_status": prescan_status,
                             "usage": out.get("usage"),
                             "evidence_check": attempt_metrics.get("evidence_check", {}),
@@ -1367,10 +1558,42 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
         with measure(metrics["stages_seconds"], "scoring"):
             weights = scoring.parse_weights(p.get("weights"), checklist)
             data["score"] = scoring.score_result(data, checklist, weights)
+            used_issue_ids = set()
             for iss in data.get("issues", []):
                 iss["fingerprint"] = scoring.issue_fingerprint(pid, iss)
+                issue_id = iss.get("issue_id")
+                if not isinstance(issue_id, str) or not issue_id.strip() or issue_id in used_issue_ids:
+                    issue_id = f"Q{iss['fingerprint'].upper()}"
+                iss["issue_id"] = issue_id
+                used_issue_ids.add(issue_id)
         metrics["total_seconds"] = round(time.perf_counter() - started, 4)
         data["meta"]["metrics"] = metrics
+        artifact_dir = save_audit_artifacts(outdir, run_date, pid, data, metrics, agent_output)
+        data["meta"]["artifact_dir"] = str(artifact_dir)
+        write_json_atomic(artifact_dir / "audit.json", data)
+        with measure(metrics["stages_seconds"], "summary"):
+            summary = summary_adapter.generate(
+                data, artifact_dir, settings,
+                int(settings.get("summary", {}).get("timeout_sec", 900)),
+            )
+        metrics["summary"] = {
+            "status": summary.get("status"),
+            "agent_status": summary.get("agent_status"),
+            "error": summary.get("error"),
+        }
+        data["meta"]["summary"] = {
+            "status": summary.get("status"),
+            "agent_status": summary.get("agent_status"),
+            "path": str(artifact_dir / "summary.md"),
+            "meta_path": str(artifact_dir / "summary.meta.json"),
+            "source_issue_ids": summary.get("metadata", {}).get("source_issue_ids", []),
+        }
+        data["meta"]["summary_version"] = summary_adapter.SCHEMA_VERSION
+        save_summary_artifacts(artifact_dir, summary)
+        metrics["total_seconds"] = round(time.perf_counter() - started, 4)
+        data["meta"]["metrics"] = metrics
+        write_json_atomic(artifact_dir / "metrics.json", metrics)
+        write_json_atomic(artifact_dir / "audit.json", data)
         result_path = day_dir / f"{pid}.json"
         write_json_atomic(result_path, data)
 
@@ -1381,9 +1604,16 @@ def scan_project(p: dict, settings: dict, run_date: str, args, checklist: dict) 
         write_json_atomic(state_file, state)
         (day_dir / f"{pid}.error.txt").unlink(missing_ok=True)
         rec.update({"total": data["score"]["total"], "security": data["score"]["security_score"],
-                    "cost_usd": data["meta"].get("cost_usd"), "validation_problems": len(data["meta"].get("validation_problems", []))})
+                    "cost_usd": data["meta"].get("cost_usd"),
+                    "validation_problems": len(data["meta"].get("validation_problems", [])),
+                    "agent_status": data["meta"].get("agent_status", "completed"),
+                    "audit_status": data["meta"].get("audit_status", "verified"),
+                    "summary_status": data["meta"].get("summary", {}).get("status", "unknown"),
+                    "artifact_dir": data["meta"].get("artifact_dir")})
     except Exception as e:  # 单项目失败不影响其它项目
-        rec.update({"status": "error", "error": str(e)[:800]})
+        rec.update({"status": "error", "error": str(e)[:800],
+                    "agent_status": getattr(e, "agent_status", "completed" if isinstance(e, AgentOutputError) else "failed"),
+                    "audit_status": "unverified"})
         log(f"{pid}: 失败 {e}")
         if not args.dry_run:
             (day_dir / f"{pid}.error.txt").write_text(traceback.format_exc(), encoding="utf-8")

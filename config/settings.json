@@ -35,6 +35,21 @@
     "score_drop_threshold": 1.0,
     "new_p0": true
   },
+  "summary": {
+    "enabled": false,
+    "timeout_sec": 900,
+    "agent": {
+      "type": "deepseek-harness",
+      "strategy": "single",
+      "launcher": "docker",
+      "image": "deepseek-harness:固定版本",
+      "network": "ai-audit-net",
+      "bin": "dsh",
+      "args": ["headless", "--json", "--permission-mode", "read-only", "--approval-policy", "never"],
+      "env_file": "/etc/ai-audit/deepseek.env"
+    },
+    "_说明": "enabled=true 时启动独立 Summary Agent；它只读取 audit.md/audit.json，不读取源码；未配置凭证、启动失败或输出无效时自动使用确定性摘要，不影响审查评分"
+  },
   "agent": {
     "type": "pi-docker",
     "strategy": "dimensions",
@@ -45,6 +60,6 @@
     "memory": "6g",
     "cpus": 2,
     "max_session_turns": 300,
-    "_说明": "type 可选 pi-docker（内网 OpenAI 兼容模型）或 claude；pi-docker 必须填 network，留空拒绝启动，确需默认网桥显式填 bridge。旧的 qwen-docker 名称保留兼容，应使用 Pi 扫描镜像"
+    "_说明": "type 可选 pi-docker（内网 OpenAI 兼容模型）、claude 或 deepseek-harness；deepseek-harness 必须 strategy=single，由完整 Harness Agent Loop 自己拆分任务，并配置 launcher=docker、image、network；pi-docker 必须填 network，留空拒绝启动，确需默认网桥显式填 bridge。旧的 qwen-docker 名称保留兼容，应使用 Pi 扫描镜像"
   }
 }

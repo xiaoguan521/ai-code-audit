@@ -81,7 +81,7 @@ tbody tr:hover{background:var(--surface-0)}
     <th data-k="total" class="num">总评分</th><th data-k="grade">档位</th><th data-k="delta_total" class="num">较上次</th>
     <th data-k="security" class="num">安全评分</th><th data-k="security_p0" class="num">安全 P0/P1</th>
     <th data-k="coverage" class="num">覆盖率</th><th data-k="P0" class="num">P0</th><th data-k="P1" class="num">P1</th>
-    <th data-k="P2" class="num">P2</th><th data-k="P3" class="num">P3</th><th data-k="new_p0p1" class="num">新增 P0/P1</th><th data-k="mode">扫描</th>
+    <th data-k="P2" class="num">P2</th><th data-k="P3" class="num">P3</th><th data-k="new_p0p1" class="num">新增 P0/P1</th><th data-k="mode">扫描</th><th data-k="summary_status">总结</th>
   </tr></thead><tbody></tbody></table></div>
   <div class="detail" id="detail"></div>
 </div>
@@ -139,8 +139,8 @@ function table(rows){
     <td class="num">${dl(r.delta_total)}</td><td class="num"><b>${f1(r.security)}</b></td>
     <td class="num">${r.security_p0 ?? "—"}/${r.security_p1 ?? "—"}</td><td class="num">${pc(r.coverage)}</td>
     <td class="num">${r.P0 ?? "—"}</td><td class="num">${r.P1 ?? "—"}</td><td class="num">${r.P2 ?? "—"}</td><td class="num">${r.P3 ?? "—"}</td>
-    <td class="num">${r.new_p0p1 ?? "—"}</td><td>${esc(r.mode)}</td></tr>`).join("") ||
-    '<tr><td colspan="15" class="muted">没有符合筛选条件的项目</td></tr>';
+    <td class="num">${r.new_p0p1 ?? "—"}</td><td>${esc(r.mode)}</td><td>${esc(r.summary_status||"—")}</td></tr>`).join("") ||
+    '<tr><td colspan="16" class="muted">没有符合筛选条件的项目</td></tr>';
   document.querySelectorAll("#tbl tbody tr[data-id]").forEach(tr => tr.onclick = () => detail(tr.dataset.id));
 }
 
@@ -148,7 +148,7 @@ function detail(id){
   const r = DATA.rows.find(x => x.project_id === id), d = DATA.details[id], el = $("#detail");
   el.style.display = "block";
   if (!d){ el.innerHTML = `<h2>${esc(r.project_name)}</h2><p class="muted">本次扫描失败：${esc(r.error||"")}</p>`; return; }
-  el.innerHTML = `<h2>${esc(r.project_name)} · 提交 ${esc(r.commit)} · ${esc(r.mode)}</h2>
+  el.innerHTML = `<h2>${esc(r.project_name)} · 提交 ${esc(r.commit)} · ${esc(r.mode)} · 总结 ${esc(r.summary_status||"—")}</h2>
    <div class="grid2"><div><div class="sub" style="margin-bottom:6px">维度得分（灰底＝证据不足，暂不评分）</div><div class="dimbars">${d.dims.map(x =>
      `<div><span>${x.id}. ${esc(x.name)}</span><span class="bar" title="覆盖率 ${pc(x.coverage)}"><span style="width:${x.score==null?0:x.score*10}%"></span></span><span class="num">${x.score==null?"暂不评分":f1(x.score)}</span></div>`).join("")}</div>
      ${d.need_info.length ? `<div class="sub" style="margin-top:10px">待补充信息：${d.need_info.map(esc).join("；")}</div>` : ""}</div>

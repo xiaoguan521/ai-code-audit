@@ -88,6 +88,16 @@ def project_report(data: dict, checklist: dict) -> str:
     if data["summary"].get("top_risks"):
         L.append("- 最需优先处理：" + "；".join(data["summary"]["top_risks"][:3]))
     L.append(f"- 尚未定论：{data['summary'].get('undetermined', '—')}\n")
+    summary_ref = meta.get("summary") if isinstance(meta.get("summary"), dict) else {}
+    summary_path = summary_ref.get("path") if isinstance(summary_ref, dict) else None
+    if summary_path:
+        try:
+            summary_text = Path(summary_path).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            summary_text = ""
+        if summary_text:
+            L.append("## 0.1 独立 AI 综合总结\n")
+            L.append(summary_text + "\n")
 
     L.append("## 1. 项目盘点摘要\n")
     L.append(f"- 语言 / 框架 / 构建：{', '.join(inv.get('languages', []))} / {', '.join(inv.get('frameworks', []))} / {', '.join(inv.get('build_tools', []))}")
@@ -118,7 +128,7 @@ def project_report(data: dict, checklist: dict) -> str:
     L.append("## 3. 风险问题清单\n")
     L.append("| ID | 维度 | 等级 | 问题标题 | 证据 | 影响 | 修复建议 | 工作量 |\n|---|---|---|---|---|---|---|---|")
     for n, i in enumerate(issues, 1):
-        i["_id"] = f"Q{n:03d}"
+        i["_id"] = i.get("issue_id") or f"Q{n:03d}"
         L.append(f"| {i['_id']} | {dim_names[i['item_id'].split('.')[0]]} {i['item_id']} | {i['level']} | {esc(i['title'])} | "
                  f"{esc(evidence_text(i.get('evidence', [])))} | {esc(i['impact'])} | 建议：{esc(i['suggestion'])} | {i['effort']} |")
     if not issues:
@@ -192,13 +202,15 @@ def project_report(data: dict, checklist: dict) -> str:
 
 def row_of(pid: str, data: dict) -> dict:
     sc, meta = data["score"], data["meta"]
+    summary_meta = meta.get("summary") if isinstance(meta.get("summary"), dict) else {}
     r = {"project_id": pid, "project_name": meta["project"]["project_name"], "department": meta["project"].get("department", ""),
          "owner": meta["project"].get("owner", ""), "date": meta["date"], "mode": meta.get("mode", ""),
          "commit": meta.get("commit", "")[:10], "total": sc["total"], "grade": sc["grade"],
          "security": sc["security_score"], "coverage": sc["coverage"], "scored_dims": sc["scored_dimensions"],
          **{lv: sc["issue_counts"][lv] for lv in LEVELS},
          "security_p0": sc["security_p0"], "security_p1": sc["security_p1"],
-         "cost_usd": meta.get("cost_usd")}
+         "cost_usd": meta.get("cost_usd"),
+         "summary_status": summary_meta.get("status", "unknown")}
     for did, d in sc["dimensions"].items():
         r[f"d{did}"] = d["score"]
     return r
@@ -226,11 +238,15 @@ def render_all(outdir: Path, date: str, projects_csv: Path, settings: dict) -> N
         new_issues = [i for i in data.get("issues", []) if i.get("fingerprint") not in old_fp] if p else []
         row["new_p0p1"] = sum(1 for i in new_issues if i["level"] in ("P0", "P1"))
         rows.append(row)
+        summary_meta = data.get("meta", {}).get("summary")
+        if not isinstance(summary_meta, dict):
+            summary_meta = {}
         details[pid] = {
             "dims": [{"id": d["id"], "name": d["name"], "score": d["score"], "coverage": d["coverage"]} for d in data["score"]["dimensions"].values()],
             "issues": [{"level": i["level"], "item": i["item_id"], "title": i["title"], "evidence": evidence_text(i.get("evidence", [])[:2]),
                         "new": i in new_issues} for i in sorted(data.get("issues", []), key=lambda x: x["level"])[:30]],
             "need_info": [x["missing"] for x in data.get("need_info_list", [])][:8],
+            "summary_status": summary_meta.get("status", "unknown"),
         }
     for pid, e in errors.items():
         if pid not in today:
@@ -241,7 +257,7 @@ def render_all(outdir: Path, date: str, projects_csv: Path, settings: dict) -> N
     # 最新评分表（Excel 可直接打开）
     cols = ["project_id", "project_name", "department", "owner", "date", "mode", "commit", "total", "grade", "delta_total",
             "security", "delta_security", "security_p0", "security_p1", "coverage", "scored_dims", *LEVELS, "new_p0p1",
-            *[f"d{i}" for i in range(1, 9)], "cost_usd", "error"]
+            *[f"d{i}" for i in range(1, 9)], "cost_usd", "summary_status", "error"]
     for f in (rep_dir / "_scores.csv", outdir / "scores_latest.csv"):
         with f.open("w", newline="", encoding="utf-8-sig") as fh:
             w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")

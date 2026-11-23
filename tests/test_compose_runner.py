@@ -11,7 +11,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
+sys.path.insert(0, str(ROOT / "docker"))
 from test_runner import valid_result  # noqa: E402
+import compose_entrypoint  # noqa: E402
 
 
 class ComposeRunnerTest(unittest.TestCase):
@@ -26,6 +28,63 @@ class ComposeRunnerTest(unittest.TestCase):
             check=True, capture_output=True, text=True,
         )
         return result.stdout.strip()
+
+    def test_compose_can_select_harness_without_dimension_split(self):
+        settings = {"agent": {"type": "pi-docker", "strategy": "dimensions"}}
+        configured = compose_entrypoint.configure_settings(settings, {
+            "AUDIT_DATA_DIR": str(self.root / "data"),
+            "AUDIT_MODEL_NETWORK": "harness-net",
+            "AUDIT_AGENT_TYPE": "deepseek-harness",
+            "AUDIT_SCANNER_IMAGE": "harbor.example/deepseek-harness:2026.11.23",
+            "AUDIT_MODEL_ENV_PATH": "/run/secrets/deepseek.env",
+            "AUDIT_HARNESS_ARGS": '["headless", "--json"]',
+        })
+        agent = configured["agent"]
+        self.assertEqual(agent["type"], "deepseek-harness")
+        self.assertEqual(agent["strategy"], "single")
+        self.assertEqual(agent["launcher"], "docker")
+        self.assertEqual(agent["image"], "harbor.example/deepseek-harness:2026.11.23")
+        self.assertEqual(agent["network"], "harness-net")
+        self.assertEqual(agent["args"], ["headless", "--json"])
+
+        defaults = compose_entrypoint.configure_settings(
+            {"agent": {"type": "pi-docker", "strategy": "dimensions"}},
+            {"AUDIT_DATA_DIR": str(self.root / "data"),
+             "AUDIT_MODEL_NETWORK": "harness-net",
+             "AUDIT_AGENT_TYPE": "deepseek-harness",
+             "AUDIT_SCANNER_IMAGE": "harness:test"},
+        )["agent"]
+        self.assertEqual(defaults["args"], [
+            "headless", "--json", "--permission-mode", "read-only", "--approval-policy", "never",
+        ])
+
+    def test_compose_rejects_shell_harness_args(self):
+        with self.assertRaisesRegex(ValueError, "JSON 字符串数组"):
+            compose_entrypoint.configure_settings(
+                {"agent": {}},
+                {"AUDIT_DATA_DIR": str(self.root / "data"),
+                 "AUDIT_MODEL_NETWORK": "harness-net",
+                 "AUDIT_AGENT_TYPE": "deepseek-harness",
+                 "AUDIT_HARNESS_ARGS": "dsh headless --json"},
+            )
+
+    def test_compose_can_enable_isolated_summary_with_harness_defaults(self):
+        configured = compose_entrypoint.configure_settings(
+            {"agent": {"type": "pi-docker"}, "summary": {"enabled": False}},
+            {"AUDIT_DATA_DIR": str(self.root / "data"),
+             "AUDIT_MODEL_NETWORK": "harness-net",
+             "AUDIT_AGENT_TYPE": "deepseek-harness",
+             "AUDIT_SCANNER_IMAGE": "harness:test",
+             "AUDIT_MODEL_ENV_PATH": "/run/secrets/model.env",
+             "AUDIT_SUMMARY_ENABLED": "true"},
+        )
+        summary_agent = configured["summary"]["agent"]
+        self.assertTrue(configured["summary"]["enabled"])
+        self.assertEqual(summary_agent["type"], "deepseek-harness")
+        self.assertEqual(summary_agent["strategy"], "single")
+        self.assertEqual(summary_agent["image"], "harness:test")
+        self.assertEqual(summary_agent["network"], "harness-net")
+        self.assertEqual(summary_agent["env_file"], "/run/secrets/model.env")
 
     def make_repo(self, name):
         repo = self.root / name

@@ -16,8 +16,16 @@ services:
     environment:
       AUDIT_DATA_DIR: ${AUDIT_DATA_DIR:?请先从 .env.example 创建 .env 并设置绝对路径}
       AUDIT_MODEL_NETWORK: ${AUDIT_MODEL_NETWORK:-ai-audit-model-net}
+      AUDIT_AGENT_TYPE: ${AUDIT_AGENT_TYPE:-pi-docker}
       AUDIT_SCANNER_IMAGE: *scanner-image
       AUDIT_MODEL_ENV_PATH: /run/secrets/model.env
+      AUDIT_HARNESS_LAUNCHER: ${AUDIT_HARNESS_LAUNCHER:-docker}
+      AUDIT_HARNESS_BIN: ${AUDIT_HARNESS_BIN:-dsh}
+      AUDIT_HARNESS_ARGS: '${AUDIT_HARNESS_ARGS:-["headless","--json","--permission-mode","read-only","--approval-policy","never"]}'
+      AUDIT_SUMMARY_ENABLED: ${AUDIT_SUMMARY_ENABLED:-false}
+      AUDIT_SUMMARY_IMAGE: ${AUDIT_SUMMARY_IMAGE:-}
+      AUDIT_SUMMARY_NETWORK: ${AUDIT_SUMMARY_NETWORK:-}
+      AUDIT_SUMMARY_MODEL_ENV_PATH: ${AUDIT_SUMMARY_MODEL_ENV_PATH:-}
       TZ: Asia/Shanghai
     volumes:
       # Docker CLI 通过宿主机的 daemon 启动只读的扫描容器。

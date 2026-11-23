@@ -28,7 +28,7 @@ RUN apk add --no-cache \
 WORKDIR /opt/ai-code-audit
 COPY runner/ runner/
 COPY config/checklist.json config/result.schema.json config/settings.json config/
-COPY skill/eight-quality-audit/SKILL.md skill/eight-quality-audit/SKILL.md
+COPY skill/eight-quality-audit/ skill/eight-quality-audit/
 COPY docker/compose_entrypoint.py docker/compose_entrypoint.py
 COPY docker/git-credential-readonly.sh docker/git-credential-readonly.sh
 RUN chmod 0555 docker/git-credential-readonly.sh

@@ -11,6 +11,28 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def _env_bool(env: dict, key: str, default: bool) -> bool:
+    raw = env.get(key)
+    if raw is None or not str(raw).strip():
+        return default
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{key} 必须是 true/false")
+
+
+def _json_args(raw: str, key: str) -> list[str]:
+    try:
+        args = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{key} 必须是 JSON 字符串数组，例如 [\"headless\",\"--json\"]") from exc
+    if not isinstance(args, list) or not all(isinstance(value, str) for value in args):
+        raise ValueError(f"{key} 必须是 JSON 字符串数组")
+    return list(args)
+
+
 def configure_settings(settings: dict, env: dict) -> dict:
     data_dir = env.get("AUDIT_DATA_DIR", "")
     if not data_dir or not Path(data_dir).is_absolute() or ":" in data_dir:
@@ -22,12 +44,37 @@ def configure_settings(settings: dict, env: dict) -> dict:
     settings["workdir"] = str(Path(data_dir) / "work")
     settings["output_dir"] = str(Path(data_dir) / "output")
     agent = settings.setdefault("agent", {})
-    agent.update({
-        "type": "pi-docker",
-        "image": env.get("AUDIT_SCANNER_IMAGE") or "ghcr.io/xiaoguan521/ai-code-audit:main",
-        "env_file": env.get("AUDIT_MODEL_ENV_PATH") or "/run/secrets/model.env",
-        "network": network,
-    })
+    agent_type = (env.get("AUDIT_AGENT_TYPE") or agent.get("type") or "pi-docker").strip()
+    if agent_type not in {"pi-docker", "qwen-docker", "deepseek-harness"}:
+        raise ValueError("AUDIT_AGENT_TYPE 必须为 pi-docker、qwen-docker 或 deepseek-harness")
+    image = env.get("AUDIT_SCANNER_IMAGE") or agent.get("image") or "ghcr.io/xiaoguan521/ai-code-audit:main"
+    env_file = env.get("AUDIT_MODEL_ENV_PATH") or agent.get("env_file") or "/run/secrets/model.env"
+    agent.update({"type": agent_type, "image": image, "env_file": env_file, "network": network})
+    if agent_type == "deepseek-harness":
+        agent["strategy"] = "single"
+        agent["launcher"] = env.get("AUDIT_HARNESS_LAUNCHER", agent.get("launcher", "docker"))
+        agent["bin"] = env.get("AUDIT_HARNESS_BIN", agent.get("bin", "dsh"))
+        raw_args = env.get("AUDIT_HARNESS_ARGS")
+        if raw_args:
+            agent["args"] = _json_args(raw_args, "AUDIT_HARNESS_ARGS")
+        else:
+            agent["args"] = [str(value) for value in agent.get(
+                "args", ["headless", "--json", "--permission-mode", "read-only", "--approval-policy", "never"]
+            )]
+    summary = settings.setdefault("summary", {})
+    summary["enabled"] = _env_bool(env, "AUDIT_SUMMARY_ENABLED", bool(summary.get("enabled", False)))
+    if summary["enabled"] and agent_type == "deepseek-harness":
+        summary_agent = summary.setdefault("agent", {})
+        summary_agent.update({
+            "type": "deepseek-harness",
+            "strategy": "single",
+            "launcher": "docker",
+            "image": env.get("AUDIT_SUMMARY_IMAGE") or image,
+            "network": env.get("AUDIT_SUMMARY_NETWORK") or network,
+            "env_file": env.get("AUDIT_SUMMARY_MODEL_ENV_PATH") or env_file,
+            "bin": env.get("AUDIT_SUMMARY_BIN") or agent.get("bin", "dsh"),
+            "args": agent.get("args", ["headless", "--json", "--permission-mode", "read-only", "--approval-policy", "never"]),
+        })
     return settings
 
 

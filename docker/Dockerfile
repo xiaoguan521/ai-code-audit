@@ -13,7 +13,7 @@ RUN apt-get update \
  && npm cache clean --force \
  && pi --version
 
-COPY skill/eight-quality-audit/SKILL.md /opt/audit/skills/eight-quality-code-audit/SKILL.md
+COPY skill/eight-quality-audit/ /opt/audit/skills/eight-quality-code-audit/
 COPY config/result.schema.json /opt/audit/result.schema.json
 COPY docker/entrypoint.sh docker/pi_entrypoint.cjs docker/pi_events.cjs docker/pi_config.cjs docker/pi_guard.mjs /opt/audit/
 COPY docker/pi_rg.cjs /opt/audit/bin/rg

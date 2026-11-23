@@ -1,6 +1,6 @@
 # 八性 AI 代码检查 · 部署包
 
-支持两种模型后端（config/settings.json 的 agent.type）：**pi-docker**（推荐，Pi + 内网 OpenAI 兼容模型，在一次性 Docker 容器中运行）和 **claude**（Claude Code 直连）。基于智能体无界面模式，对全公司在研项目每天做一次只读静态审查，按“八性”64 项检查项出逐项结论，由程序按固定规则出分，生成单项目报告、每日汇总、评分表和静态看板。
+支持三种模型后端（config/settings.json 的 agent.type）：**pi-docker**（兼容旧链路，Pi + 内网 OpenAI 兼容模型，在一次性 Docker 容器中运行）、**deepseek-harness**（完整 DeepSeek Harness Headless Agent，在一次性 Docker 容器中运行）和 **claude**（Claude Code 直连）。基于智能体无界面模式，对全公司在研项目每天做一次只读静态审查，按“八性”64 项检查项出逐项结论，由程序按固定规则出分，生成单项目报告、每日汇总、评分表和静态看板。
 
 ## 仓库维护（GitHub）
 
@@ -32,6 +32,9 @@ config/projects.csv                  项目 Git 地址清单（张玲维护，�
 config/settings.json                 运行参数（目录、并发、预算、全量扫描日、模型后端 agent 等）
 docker/                              Pi 扫描镜像：Dockerfile、入口脚本、构建与冒烟测试脚本
 runner/run_daily.py                  每日扫描入口
+runner/adapters/harness.py           完整 DeepSeek Harness Headless Docker Adapter
+runner/adapters/summary.py           只读审查结果的独立 AI 总结 Adapter（含确定性降级）
+runner/parsers/audit_markdown.py     版本化 Markdown 机器字段解析与覆盖校验
 runner/evidence.py                   核验引用的仓库路径、行号及可选片段
 runner/code_map.py                   生成有界的 Git 跟踪文件地图
 runner/scoring.py                    校验与评分（确定性计算）
@@ -94,11 +97,38 @@ run_daily.py ──git fetch（只读凭据，只在宿主机）     Pi + 八性
 
 模型说明：Pi 使用 OpenAI 兼容的 Chat Completions 接口，模型需支持流式输出和工具调用；可继续使用内网千问模型。镜像入口将 Schema 附在系统提示中，runner 解析并校验结果。Pi 默认按 128000 token 上下文、16384 token 最大输出配置模型，可在 `model.env` 中用 `PI_CONTEXT_WINDOW` 和 `PI_MAX_OUTPUT_TOKENS` 按实际模型调整。服务支持时可配置 `PI_TEMPERATURE=0` 降低随机性，但不能保证结论完全可复现；未配置时保持服务默认值。超出轮次时可调整 `agent.max_session_turns`。旧配置中的 `qwen-docker` 名称暂时保留兼容，应使用新的 Pi 扫描镜像。
 
+## DeepSeek Harness Headless + Docker
+
+deepseek-harness 后端只启动一个完整的 Headless Agent 任务。Runner 不按八性维度拆分任务，也不介入 Harness 的规划、工具调用、多轮推理或子 Agent；它只负责启动容器、传入顶层任务、检查进程退出码与最终事件、保存脱敏事件，并解析最终 Markdown。该后端必须使用 strategy: single。
+
+Harness 镜像应预装 dsh、八性 Skill 和所需 Profile；源码与扫描上下文以只读方式挂载。示例配置：
+
+~~~json
+{
+  "agent": {
+    "type": "deepseek-harness",
+    "strategy": "single",
+    "launcher": "docker",
+    "image": "deepseek-harness:固定版本",
+    "network": "ai-audit-net",
+    "bin": "dsh",
+    "args": ["headless", "--json", "--permission-mode", "read-only", "--approval-policy", "never"],
+    "env_file": "/etc/ai-audit/deepseek.env"
+  }
+}
+~~~
+
+Harness 的 `--json` 是运行事件流，不是要求模型输出 JSON。Adapter 默认把顶层任务作为 argv 传给 `dsh`，并强制使用只读权限和 `--approval-policy never`；如某个固定版本只从 stdin 读取，可配置 `prompt_mode: "stdin"`。Adapter 只从最终事件提取 Markdown；退出码为 0 但缺少 `final.reason.kind`、最终状态失败或 Markdown 不完整时，审查仍标记为 unverified，不进入评分。若需要调整事件成功状态，可配置 `success_reason_kinds`，但不要修改 Harness 的内部任务流程。
+
+### 独立 AI 综合总结
+
+`summary.enabled` 默认关闭。Compose 部署可用 `AUDIT_SUMMARY_ENABLED=true` 开启；Harness 模式默认复用扫描镜像、网络和模型环境，但会启动独立的 Summary Agent 进程/会话。该会话只读 `audit.json` 与 `audit.md`，不挂载源码，也不能修改逐项结论、证据或评分。它只负责管理层摘要、重复问题聚合和整改优先级，并通过 `summary-theme` 的 `source_issue_ids` 引用已存在的问题。未配置凭证、启动失败或输出引用无效时，自动生成确定性摘要，审查结果仍保持有效。
+
 ## Docker Compose 批量扫描
 
 内网部署、离线镜像导入与运维排障详见[内网部署运维手册](docs/内网部署运维手册.md)。
 
-Compose 中 `scanner-image` 指向 GitHub 发布的 Pi 扫描镜像；`audit` 使用同一工作流发布的调度镜像，负责拉取仓库、管理扫描状态和生成报告。调度器通过本机 Docker 为每个项目启动一个 `scanner-image` 对应镜像的独立容器。扫描完成后调度容器退出；再次运行会使用保存的状态，按原有规则选择全量、增量或复用。两个镜像的发布需要相应代码进入 `main` 且 `Build image` 工作流成功；PR 测试阶段只构建和测试，不推送镜像。
+Compose 中 `scanner-image` 可以指向 Pi 回滚镜像，也可以指向包含完整 DeepSeek Harness 的扫描镜像；`AUDIT_AGENT_TYPE` 决定实际后端。`audit` 使用调度镜像，负责拉取仓库、管理扫描状态和生成报告；调度器通过本机 Docker 为每个项目启动一个扫描镜像的独立容器。扫描完成后调度容器退出；再次运行会使用保存的状态，按原有规则选择全量、增量或复用。
 
 1. 在有 Docker Engine 和 Compose 的运行机上，从项目目录准备配置：
    ```sh
@@ -123,8 +153,8 @@ Compose 中 `scanner-image` 指向 GitHub 发布的 Pi 扫描镜像；`audit` �
    - **SSH deploy key**：将私钥及经过验证的 `known_hosts` 放到 `secrets/ssh/`，私钥权限设为 `600`，并将对应项目的 `git_url` 改为 SSH 地址。多个 Git 服务器可在该目录放 `config`，为各主机指定不同的 `IdentityFile`。
 
    Git 凭据只挂载给调度容器；不使用 HTTPS 凭据时可以把 `secrets/git-credentials` 清空并保留文件。该文件和 `model.env` 都是明文，应保留 `600` 权限并使用只读凭据。`.env`、`model.env`、本地项目清单及 `secrets/` 都被 Git 忽略，也不会发给 Docker 构建器。
-5. 检查 `.env`。`AUDIT_DATA_DIR` 必须是运行机上的绝对路径，调度容器和宿主机使用同一路径，以便 Docker 挂载项目副本；默认是当前项目目录下的 `audit-data/`，更换路径时先创建该目录。`AUDIT_SCANNER_IMAGE` 和 `AUDIT_RUNNER_IMAGE` 分别配置扫描和调度镜像，可改为内网镜像。Docker socket 不在 `/var/run/docker.sock` 时，修改 `AUDIT_DOCKER_SOCKET`。
-6. 拉取两个 GitHub 镜像并试跑：
+5. 检查 `.env`。`AUDIT_DATA_DIR` 必须是运行机上的绝对路径，调度容器和宿主机使用同一路径，以便 Docker 挂载项目副本；默认是当前项目目录下的 `audit-data/`，更换路径时先创建该目录。`AUDIT_AGENT_TYPE=deepseek-harness` 时，`AUDIT_SCANNER_IMAGE` 必须是预装 dsh、Skill 和 Profile 的 Harness 镜像；`AUDIT_HARNESS_ARGS` 必须保持为 `["headless","--json","--permission-mode","read-only","--approval-policy","never"]` 这样的 JSON 数组。若暂时回滚 Pi，设置 `AUDIT_AGENT_TYPE=pi-docker` 并使用 Pi 扫描镜像。`AUDIT_RUNNER_IMAGE` 配置调度镜像；Docker socket 不在 `/var/run/docker.sock` 时，修改 `AUDIT_DOCKER_SOCKET`。
+6. 拉取两个镜像并试跑：
    ```sh
    docker compose --profile images pull scanner-image audit
    docker compose run --rm audit --dry-run
@@ -158,6 +188,11 @@ Compose 会创建 `AUDIT_MODEL_NETWORK` 指定的 Docker 网络。该网络本�
 ```
 output_dir/results/<日期>/<项目ID>.json   原始结构化结果（含逐项、问题、评分、元数据）
 output_dir/results/<日期>/_run.json       批次进度、耗时、每次模型尝试及预扫描状态
+output_dir/artifacts/<日期>/<项目ID>/audit.md          Harness 原始 Markdown
+output_dir/artifacts/<日期>/<项目ID>/audit.json        程序解析、核验后的结果
+output_dir/artifacts/<日期>/<项目ID>/run-events.jsonl  脱敏后的运行事件
+output_dir/artifacts/<日期>/<项目ID>/summary.md        独立 AI 总结或确定性降级摘要
+output_dir/artifacts/<日期>/<项目ID>/summary.meta.json  总结校验元数据与状态
 output_dir/unverified/<日期>/<项目ID>.json 待核实结果（不参与评分）
 output_dir/reports/<日期>/<项目ID>.md     单项目完整报告（按模板第六节格式）
 output_dir/reports/<日期>/_summary.md     每日汇总报告
