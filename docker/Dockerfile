@@ -9,7 +9,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && git config --system safe.directory '*' \
  && git config --system core.fsmonitor false \
- && npm install -g --omit=dev "@deepseek-ai/dsh@${DSH_VERSION}" \
+ && npm install -g --omit=dev --include=optional \
+      --allow-scripts=@deepseek-ai/dsh-subprocess-local,koffi,node-pty,@google/genai,protobufjs \
+      "@deepseek-ai/dsh@${DSH_VERSION}" \
  && npm cache clean --force \
  && dsh --version
 
