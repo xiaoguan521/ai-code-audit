@@ -6,7 +6,7 @@ const { spawn } = require('node:child_process');
 const checklist = JSON.parse(fs.readFileSync('/workspace/context/checklist.json', 'utf8'));
 const answer = JSON.stringify({
   inventory: { languages: ['Python'], frameworks: [], build_tools: [], file_count: 1, loc_estimate: 10, modules: [], checked_scope: '全部', unchecked: [] },
-  items: checklist.items.map((item) => ({ id: item.id, result: 'PASS', evidence: ['fixture.txt:1'], risk: 'none', conclusion: 'ok', carried_over: false })),
+  items: checklist.items.map((item) => ({ id: item.id, result: 'PASS', evidence: [{ path: 'fixture.txt', start_line: 1 }], risk: 'none', conclusion: 'ok', carried_over: false })),
   issues: [], need_info_list: [],
   dimension_notes: checklist.dimensions.map((dimension) => ({ dimension: dimension.id, conclusion: 'ok', key_analysis: '-' })),
   summary: { key_findings: [], top_risks: [], undetermined: '中文测试'.repeat(20_000) + 'AUDIT_MOCK_END' },
@@ -17,6 +17,7 @@ let sawPrompt = false;
 let sawAllowedTools = false;
 let sawReadResult = false;
 let sawAuth = false;
+let sawTemperature = false;
 let sawOutsideBlocked = false;
 let sawEnvBlocked = false;
 let sawSecretSearch = false;
@@ -47,6 +48,7 @@ const server = http.createServer((req, res) => {
     try { payload = JSON.parse(body); } catch { res.writeHead(400).end(); return; }
     requests++;
     sawAuth ||= req.headers.authorization === 'Bearer mock-key';
+    sawTemperature ||= payload.temperature === 0;
     sawPrompt ||= body.includes('AUDIT_ENTRYPOINT_TEST') && body.includes('name: eight-quality-code-audit');
     const names = (payload.tools || []).map((tool) => tool.function?.name).filter(Boolean);
     sawAllowedTools ||= names.includes('read') && names.every((name) => ['read', 'grep', 'find', 'ls'].includes(name));
@@ -74,7 +76,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(0, '127.0.0.1', () => {
   const child = spawn('/opt/audit/entrypoint.sh', [], {
-    env: { ...process.env, OPENAI_BASE_URL: `http://127.0.0.1:${server.address().port}/v1`, OPENAI_API_KEY: 'mock-key', OPENAI_MODEL: 'mock-model', MAX_SESSION_TURNS: '10' },
+    env: { ...process.env, OPENAI_BASE_URL: `http://127.0.0.1:${server.address().port}/v1`, OPENAI_API_KEY: 'mock-key', OPENAI_MODEL: 'mock-model', MAX_SESSION_TURNS: '10', PI_TEMPERATURE: '0' },
   });
   let stdout = '';
   let stderr = '';
@@ -89,8 +91,8 @@ server.listen(0, '127.0.0.1', () => {
     server.close();
     let complete = false;
     try { const events = JSON.parse(stdout); complete = Array.isArray(events) && events.at(-1)?.result === answer; } catch {}
-    if (code !== 0 || !sawPrompt || !sawAllowedTools || !sawReadResult || !sawOutsideBlocked || !sawEnvBlocked || !sawSecretSearch || leakedSecret || !sawAuth || !complete) {
-      console.error(`Pi 入口测试失败：exit=${code}, requests=${requests}, prompt=${sawPrompt}, tools=${sawAllowedTools}, read=${sawReadResult}, outside=${sawOutsideBlocked}, env=${sawEnvBlocked}, grep=${sawSecretSearch}, leaked=${leakedSecret}, auth=${sawAuth}, complete=${complete}, bytes=${Buffer.byteLength(stdout)}`);
+    if (code !== 0 || !sawPrompt || !sawAllowedTools || !sawReadResult || !sawOutsideBlocked || !sawEnvBlocked || !sawSecretSearch || leakedSecret || !sawAuth || !sawTemperature || !complete) {
+      console.error(`Pi 入口测试失败：exit=${code}, requests=${requests}, prompt=${sawPrompt}, tools=${sawAllowedTools}, read=${sawReadResult}, outside=${sawOutsideBlocked}, env=${sawEnvBlocked}, grep=${sawSecretSearch}, leaked=${leakedSecret}, auth=${sawAuth}, temperature=${sawTemperature}, complete=${complete}, bytes=${Buffer.byteLength(stdout)}`);
       console.error(stderr);
       process.exitCode = 1;
       return;

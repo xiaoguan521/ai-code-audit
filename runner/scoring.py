@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
-NEED_INFO = ("NEED_INFO-运行数据", "NEED_INFO-补充材料")
+NEED_INFO = ("NEED_INFO-运行数据", "NEED_INFO-补充材料", "NEED_INFO-证据不足")
 
 
 def load_checklist() -> dict:
@@ -35,7 +35,7 @@ _TYPES = {
 
 def schema_errors(value, schema: dict | None = None, path: str = "$") -> list[str]:
     """按 result.schema.json 校验结构（支持其中用到的 type / required / properties / items /
-    enum / pattern / minItems / maxItems）。Pi 的结果在评分前必须先过这一关，
+    enum / pattern / minimum / minLength / maxLength / minItems / maxItems）。Pi 的结果在评分前必须先过这一关，
     否则字段缺失或枚举值写错会在评分时直接崩溃。返回问题列表（空表示通过）。"""
     if schema is None:
         schema = load_schema()
@@ -47,6 +47,13 @@ def schema_errors(value, schema: dict | None = None, path: str = "$") -> list[st
         errs.append(f"{path} 取值 {json.dumps(value, ensure_ascii=False)} 不在允许范围 {schema['enum']}")
     if "pattern" in schema and isinstance(value, str) and not re.search(schema["pattern"], value):
         errs.append(f"{path} 取值 {value!r} 不符合格式 {schema['pattern']}")
+    if "minimum" in schema and isinstance(value, (int, float)) and not isinstance(value, bool) and value < schema["minimum"]:
+        errs.append(f"{path} 不能小于 {schema['minimum']}")
+    if isinstance(value, str):
+        if "minLength" in schema and len(value) < schema["minLength"]:
+            errs.append(f"{path} 长度不能小于 {schema['minLength']}")
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            errs.append(f"{path} 长度不能大于 {schema['maxLength']}")
     if isinstance(value, dict):
         for k in schema.get("required", []):
             if k not in value:
@@ -99,25 +106,37 @@ def validate(result: dict, checklist: dict) -> list[str]:
         problems.append(f"多余检查项: {sorted(extra)}")
     if dup:
         problems.append(f"重复检查项: {sorted(dup)}")
+    expected_dims = {d["id"] for d in checklist["dimensions"]}
+    dims = [d["dimension"] for d in result.get("dimension_notes", [])]
+    if set(dims) != expected_dims or len(dims) != len(set(dims)):
+        problems.append("维度结论缺失、重复或包含未知维度")
     issue_items = {i["item_id"] for i in result.get("issues", [])}
+    need_items = {item for group in result.get("need_info_list", []) for item in group.get("items", [])}
     for it in result.get("items", []):
-        if it["result"] in ("WARN", "FAIL"):
-            ev = [e for e in it.get("evidence", []) if e and "静态未见" not in e]
-            if not ev:
+        if it["result"] in ("PASS", "WARN", "FAIL"):
+            if not it.get("evidence"):
                 problems.append(f"{it['id']} 为 {it['result']} 但无证据")
+        if it["result"] in ("WARN", "FAIL"):
             if it["id"] not in issue_items:
                 problems.append(f"{it['id']} 为 {it['result']} 但问题清单无对应条目")
+        if (it["result"] in NEED_INFO or it.get("conditional")) and it["id"] not in need_items:
+            problems.append(f"{it['id']} 尚未定论，但待补充清单无对应条目")
     item_map = {i["id"]: i for i in result.get("items", [])}
     for iss in result.get("issues", []):
         src = item_map.get(iss["item_id"])
-        if src and src["result"] not in ("WARN", "FAIL"):
+        if not src:
+            problems.append(f"问题「{iss['title']}」引用了不存在的检查项 {iss['item_id']}")
+        elif src["result"] not in ("WARN", "FAIL"):
             problems.append(f"问题「{iss['title']}」挂在 {iss['item_id']}，但该项结果为 {src['result']}")
+        if not iss.get("evidence"):
+            problems.append(f"问题「{iss['title']}」无证据")
     return problems
 
 
 def issue_fingerprint(project_id: str, issue: dict) -> str:
     """跨天跟踪同一问题：项目 + 检查项 + 首个证据文件路径（不含行号）+ 标题。"""
-    first = (issue.get("evidence") or [""])[0].split(":")[0].strip()
+    ref = (issue.get("evidence") or [""])[0]
+    first = ref.get("path", "") if isinstance(ref, dict) else ref.split(":")[0].strip()
     key = f"{project_id}|{issue['item_id']}|{first}|{issue['title'].strip()}"
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
 

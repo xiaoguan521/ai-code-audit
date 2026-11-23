@@ -29,12 +29,29 @@ def esc(s) -> str:
     return str(s or "").replace("|", "\\|").replace("\n", " ")
 
 
+def evidence_text(refs: list) -> str:
+    """新结果使用结构化引用，历史结果仍可能是旧格式的字符串。"""
+    rendered = []
+    for ref in refs:
+        if isinstance(ref, dict):
+            start = ref.get("start_line", "?")
+            end = ref.get("end_line", start)
+            rendered.append(f"{ref.get('path', '?')}:{start}" + (f"-{end}" if end != start else ""))
+        else:
+            rendered.append(str(ref))
+    return "; ".join(rendered)
+
+
 def load_day(outdir: Path, date: str) -> dict[str, dict]:
     d = outdir / "results" / date
     if not d.is_dir():
         return {}
+    runlog = d / "_run.json"
+    failed = {r["project_id"] for r in json.loads(runlog.read_text(encoding="utf-8")).get("projects", [])
+              if r.get("status") == "error"} if runlog.exists() else set()
     return {f.stem: json.loads(f.read_text(encoding="utf-8"))
-            for f in sorted(d.glob("*.json")) if not f.name.startswith("_")}
+            for f in sorted(d.glob("*.json")) if not f.name.startswith("_") and f.stem not in failed
+            and not (d / f"{f.stem}.error.txt").exists()}
 
 
 def previous_dates(outdir: Path, date: str) -> list[str]:
@@ -103,7 +120,7 @@ def project_report(data: dict, checklist: dict) -> str:
     for n, i in enumerate(issues, 1):
         i["_id"] = f"Q{n:03d}"
         L.append(f"| {i['_id']} | {dim_names[i['item_id'].split('.')[0]]} {i['item_id']} | {i['level']} | {esc(i['title'])} | "
-                 f"{esc('; '.join(i.get('evidence', [])))} | {esc(i['impact'])} | 建议：{esc(i['suggestion'])} | {i['effort']} |")
+                 f"{esc(evidence_text(i.get('evidence', [])))} | {esc(i['impact'])} | 建议：{esc(i['suggestion'])} | {i['effort']} |")
     if not issues:
         L.append("| — | — | — | 本次未发现 WARN / FAIL 问题 | — | — | — | — |")
     L.append("")
@@ -123,7 +140,7 @@ def project_report(data: dict, checklist: dict) -> str:
                 ni = r["need_info"]
                 extra = f"（缺：{ni.get('missing', '')}；因此无法判定：{ni.get('blocked_conclusion', '')}）"
             mark = r.get("result", "缺失") + ("·条件" if r.get("conditional") else "") + ("·沿用" if r.get("carried_over") else "")
-            L.append(f"| {it['id']} | {it['name']} | {mark} | {esc('; '.join(r.get('evidence', [])))} | {esc(r.get('conclusion', ''))}{esc(extra)} |")
+            L.append(f"| {it['id']} | {it['name']} | {mark} | {esc(evidence_text(r.get('evidence', [])))} | {esc(r.get('conclusion', ''))}{esc(extra)} |")
         if notes.get(did, {}).get("key_analysis"):
             L.append(f"\n**重点问题分析**：{notes[did]['key_analysis']}")
         L.append("")
@@ -157,7 +174,11 @@ def project_report(data: dict, checklist: dict) -> str:
     L.append(f"- {'✅' if not probs else '❌'} 程序校验（64 项齐全、WARN/FAIL 均有证据且在问题清单中）" + ("" if not probs else "：" + "；".join(probs[:5])))
     if data.get("prompt_injection_suspects"):
         L.append(f"- ⚠ 仓库中发现疑似针对 AI 的指令文本，已忽略：{'; '.join(data['prompt_injection_suspects'])}")
-    L.append("- 声明：所有证据均来自实际读取的代码或项目提供的补充材料；评分由程序按固定规则计算。\n")
+    if meta.get("evidence_verified"):
+        L.append("- 程序已核验引用的路径、行号及所提供的片段；这不代表结论或风险定级已经人工核实。")
+    else:
+        L.append("- 历史结果未经过当前版本的源码引用核验，结论和风险定级需要人工核实。")
+    L.append("- 评分由程序按固定规则计算。\n")
 
     L.append("## 附录 A：检查项完整索引\n")
     L.append("| 编号 | 维度 | 检查项 | 结果 | 风险 |\n|---|---|---|---|---|")
@@ -207,7 +228,7 @@ def render_all(outdir: Path, date: str, projects_csv: Path, settings: dict) -> N
         rows.append(row)
         details[pid] = {
             "dims": [{"id": d["id"], "name": d["name"], "score": d["score"], "coverage": d["coverage"]} for d in data["score"]["dimensions"].values()],
-            "issues": [{"level": i["level"], "item": i["item_id"], "title": i["title"], "evidence": "; ".join(i.get("evidence", [])[:2]),
+            "issues": [{"level": i["level"], "item": i["item_id"], "title": i["title"], "evidence": evidence_text(i.get("evidence", [])[:2]),
                         "new": i in new_issues} for i in sorted(data.get("issues", []), key=lambda x: x["level"])[:30]],
             "need_info": [x["missing"] for x in data.get("need_info_list", [])][:8],
         }

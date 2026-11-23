@@ -36,8 +36,11 @@
         "required": ["id", "result", "evidence", "risk", "conclusion", "carried_over"],
         "properties": {
           "id": {"type": "string", "pattern": "^[1-8]\\.(10|[1-9])$"},
-          "result": {"enum": ["PASS", "WARN", "FAIL", "N/A", "NEED_INFO-运行数据", "NEED_INFO-补充材料"]},
-          "evidence": {"type": "array", "items": {"type": "string"}, "description": "相对路径:行号 或 关键片段；无则写 静态未见相关实现"},
+          "result": {"enum": ["PASS", "WARN", "FAIL", "N/A", "NEED_INFO-运行数据", "NEED_INFO-补充材料", "NEED_INFO-证据不足"]},
+          "evidence": {"type": "array", "items": {"type": "object", "required": ["path", "start_line"], "properties": {
+            "path": {"type": "string", "minLength": 1}, "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1}, "snippet": {"type": "string", "minLength": 1, "maxLength": 4000}
+          }}, "description": "仓库内相对路径和行号；可选原文片段，缺乏证据时留空并如实说明"},
           "risk": {"enum": ["P0", "P1", "P2", "P3", "none"]},
           "conclusion": {"type": "string"},
           "audience": {"enum": ["用户", "开发者", "运维", "-"]},
@@ -60,7 +63,10 @@
           "item_id": {"type": "string"},
           "level": {"enum": ["P0", "P1", "P2", "P3"]},
           "title": {"type": "string"},
-          "evidence": {"type": "array", "items": {"type": "string"}},
+          "evidence": {"type": "array", "items": {"type": "object", "required": ["path", "start_line"], "properties": {
+            "path": {"type": "string", "minLength": 1}, "start_line": {"type": "integer", "minimum": 1},
+            "end_line": {"type": "integer", "minimum": 1}, "snippet": {"type": "string", "minLength": 1, "maxLength": 4000}
+          }}},
           "impact": {"type": "string"},
           "suggestion": {"type": "string"},
           "effort": {"enum": ["S", "M", "L"]},

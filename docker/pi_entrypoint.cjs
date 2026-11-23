@@ -3,6 +3,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { PiEventCollector, PiOutputError } = require('./pi_events.cjs');
+const { optionalSamplingParams } = require('./pi_config.cjs');
 
 function positiveInteger(name, fallback) {
   const raw = process.env[name] || String(fallback);
@@ -21,14 +22,17 @@ async function main() {
   const schema = fs.readFileSync('/opt/audit/result.schema.json', 'utf8');
   const maxTurns = positiveInteger('MAX_SESSION_TURNS', 300);
   const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-audit-pi-'));
+  let collector = null;
   try {
     const systemPath = path.join(agentDir, 'system.md');
     fs.writeFileSync(systemPath, `${skill}\n\n## 输出格式（批量模式强制）\n完成审查后，最终回复只输出一个符合下列 JSON Schema 的 JSON 对象，不要输出解释或 Markdown。\n${schema}`, { mode: 0o600 });
+    const samplingParams = optionalSamplingParams(process.env);
     const models = { providers: { 'audit-internal': {
       baseUrl,
       api: 'openai-completions',
       apiKey: '$OPENAI_API_KEY',
-      models: [{ id: model, contextWindow: positiveInteger('PI_CONTEXT_WINDOW', 128000), maxTokens: positiveInteger('PI_MAX_OUTPUT_TOKENS', 16384) }],
+      models: [{ id: model, contextWindow: positiveInteger('PI_CONTEXT_WINDOW', 128000), maxTokens: positiveInteger('PI_MAX_OUTPUT_TOKENS', 16384),
+        ...(samplingParams ? { samplingParams } : {}) }],
     } } };
     fs.writeFileSync(path.join(agentDir, 'models.json'), JSON.stringify(models), { mode: 0o600 });
     const args = [
@@ -42,7 +46,7 @@ async function main() {
       env: { ...process.env, OPENAI_API_KEY: process.env.OPENAI_API_KEY || 'none', PI_CODING_AGENT_DIR: agentDir },
       stdio: ['pipe', 'pipe', 'inherit'],
     });
-    const collector = new PiEventCollector(maxTurns, () => child.kill('SIGTERM'));
+    collector = new PiEventCollector(maxTurns, () => child.kill('SIGTERM'));
     let parseError = null;
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
@@ -69,6 +73,8 @@ async function main() {
     // 等待 stdout 实际写完，避免大 JSON 在管道中被截断。
     await new Promise((resolve, reject) => process.stdout.write(`${JSON.stringify([result])}\n`, (error) => error ? reject(error) : resolve()));
   } finally {
+    // 失败时也返回已观察到的统计；不包含提示词或源码。
+    if (collector) process.stderr.write(`AI_AUDIT_STATS:${JSON.stringify(collector.stats())}\n`);
     fs.rmSync(agentDir, { recursive: true, force: true });
   }
 }

@@ -40,3 +40,31 @@ test('轮次上限阻止继续调用工具，最后一轮正常完成允许通�
   complete.push(encode({ type: 'turn_start' }, assistant('ok'), { type: 'turn_end', message: { stopReason: 'stop' } }, { type: 'agent_settled' }));
   assert.equal(complete.finish().result, 'ok');
 });
+
+test('按每条助手消息累计 token 和工具调用，失败前统计也可获取', () => {
+  const collector = new PiEventCollector(5, () => {});
+  const first = assistant('调用工具', 'toolUse');
+  first.message.usage = { input: 100, output: 12, cacheRead: 30 };
+  const second = assistant('最终结果');
+  second.message.usage = { input: 120, output: 24, cacheRead: 40 };
+  collector.push(encode({ type: 'turn_start' }, first, { type: 'tool_execution_start', toolName: 'read' },
+    { type: 'tool_execution_end', toolName: 'read', durationMs: 250 },
+    { type: 'tool_execution_start', toolName: 'grep' }, { type: 'tool_execution_end', toolName: 'grep', durationMs: 150 },
+    { type: 'turn_start' }, second, { type: 'agent_settled' }));
+  const stats = collector.finish().stats;
+  assert.equal(stats.turns, 2);
+  assert.equal(stats.tool_calls, 2);
+  assert.deepEqual(stats.tool_calls_by_name, { read: 1, grep: 1 });
+  assert.equal(stats.tool_seconds_sum, 0.4);
+  assert.equal(stats.assistant_messages, 2);
+  assert.equal(stats.messages_with_usage, 2);
+  assert.deepEqual(stats.usage_total, { input: 220, output: 36, cacheRead: 70 });
+  assert.deepEqual(collector.finish().usage, second.message.usage);
+
+  const failed = new PiEventCollector(1, () => {});
+  failed.push(encode({ type: 'turn_start' }, first, { type: 'tool_execution_start' },
+    { type: 'turn_end', message: { stopReason: 'toolUse' } }));
+  assert.throws(() => failed.finish(), /超过/);
+  assert.equal(failed.stats().tool_calls, 1);
+  assert.equal(failed.stats().usage_total.input, 100);
+});

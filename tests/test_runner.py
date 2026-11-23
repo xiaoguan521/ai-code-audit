@@ -22,7 +22,7 @@ def valid_result() -> dict:
     return {
         "inventory": {"languages": ["Python"], "frameworks": [], "build_tools": [], "file_count": 1, "loc_estimate": 10,
                       "modules": [], "checked_scope": "全部", "unchecked": []},
-        "items": [{"id": it["id"], "result": "PASS", "evidence": ["a.py:1"], "risk": "none",
+        "items": [{"id": it["id"], "result": "PASS", "evidence": [{"path": "a.py", "start_line": 1}], "risk": "none",
                    "conclusion": "ok", "carried_over": False} for it in CK["items"]],
         "issues": [],
         "need_info_list": [],
@@ -63,7 +63,7 @@ class SchemaTest(unittest.TestCase):
     def test_issue_missing_title(self):
         r = valid_result()
         r["items"][0].update(result="WARN", risk="P2")
-        r["issues"].append({"item_id": "1.1", "level": "P2", "evidence": ["a.py:1"], "impact": "-", "suggestion": "-", "effort": "S"})
+        r["issues"].append({"item_id": "1.1", "level": "P2", "evidence": [{"path": "a.py", "start_line": 1}], "impact": "-", "suggestion": "-", "effort": "S"})
         errs = scoring.schema_errors(r)
         self.assertTrue(any("$.issues[0]" in e and "title" in e for e in errs), errs)
 
@@ -93,11 +93,19 @@ class CheckOutputTest(unittest.TestCase):
         problems = run_daily.check_output(with_semantic_problem(), CK)
         self.assertTrue(any("1.1" in p for p in problems), problems)
 
+    def test_undetermined_items_and_dimensions_must_be_represented(self):
+        result = valid_result()
+        result["items"][0].update(result="NEED_INFO-证据不足", evidence=[])
+        result["dimension_notes"][0]["dimension"] = "2"
+        problems = run_daily.check_output(result, CK)
+        self.assertTrue(any("1.1" in p and "待补充" in p for p in problems))
+        self.assertTrue(any("维度结论" in p for p in problems))
+
 
 class ExtractJsonTest(unittest.TestCase):
     def setUp(self):
         self.obj = valid_result()
-        self.obj["items"][0]["evidence"] = ["```python\nprint('x')\n```", "a.py:1"]
+        self.obj["items"][0]["evidence"] = [{"path": "a.py", "start_line": 1, "snippet": "```python\nprint('x')\n```"}]
         self.js = json.dumps(self.obj, ensure_ascii=False, indent=1)
 
     def test_plain(self):
@@ -138,6 +146,9 @@ class RetryTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         settings = {"workdir": f"{tmp.name}/work", "output_dir": f"{tmp.name}/out", "prescan_tools": [],
                     "agent": {"type": "claude"}}
+        repo = Path(settings["workdir"]) / "p1" / "repo"
+        repo.mkdir(parents=True)
+        (repo / "a.py").write_text("pass\n", encoding="utf-8")
         project = {"project_id": "p1", "project_name": "测试项目"}
         args = types.SimpleNamespace(force_full=True, dry_run=False)
         calls = iter(outputs)
@@ -163,6 +174,9 @@ class RetryTest(unittest.TestCase):
                                  {"result": valid_result(), "cost_usd": None, "session_id": "s"}]
             tmp = tempfile.TemporaryDirectory()
             self.addCleanup(tmp.cleanup)
+            repo = Path(tmp.name) / "w" / "p1" / "repo"
+            repo.mkdir(parents=True)
+            (repo / "a.py").write_text("pass\n", encoding="utf-8")
             with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40):
                 run_daily.scan_project({"project_id": "p1", "project_name": "x"},
                                        {"workdir": f"{tmp.name}/w", "output_dir": f"{tmp.name}/o", "agent": {"type": "claude"}},
@@ -176,10 +190,10 @@ class RetryTest(unittest.TestCase):
         self.assertEqual((rec["status"], n), ("error", 2))
         self.assertIn("JSON Schema", rec["error"])
 
-    def test_semantic_then_structural_keeps_first(self):
+    def test_semantic_then_structural_does_not_score(self):
         rec, n = self.run_scan([with_semantic_problem(), with_structural_problem()])
-        self.assertEqual((rec["status"], n), ("ok", 2))
-        self.assertGreater(rec["validation_problems"], 0)
+        self.assertEqual((rec["status"], n), ("error", 2))
+        self.assertIn("不评分", rec["error"])
 
     def test_unparseable_then_good(self):
         rec, n = self.run_scan([run_daily.AgentOutputError("最终回复中没有 JSON 对象"), valid_result()])
@@ -286,6 +300,21 @@ class SyncRepoTest(unittest.TestCase):
         (up / "a.txt").write_text("2")
         git("commit", "-qam", "2")
         self.assertEqual(run_daily.sync_repo(p, repo, 10), git("rev-parse", "HEAD"))
+
+    def test_changed_files_preserves_non_ascii_paths(self):
+        base = Path(self.tmp.name) / "unicode-repo"
+        base.mkdir()
+        def git(*args):
+            return subprocess.run(["git", "-C", str(base), "-c", "user.email=t@t", "-c", "user.name=t", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+        git("init", "-q", "-b", "main")
+        (base / "中文文件.py").write_text("first\n", encoding="utf-8")
+        git("add", ".")
+        git("commit", "-qm", "first")
+        old = git("rev-parse", "HEAD")
+        (base / "中文文件.py").write_text("second\n", encoding="utf-8")
+        git("commit", "-qam", "second")
+        self.assertEqual(run_daily.changed_files(base, old, git("rev-parse", "HEAD")), ["中文文件.py"])
 
 
 if __name__ == "__main__":

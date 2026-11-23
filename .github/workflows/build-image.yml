@@ -47,7 +47,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m unittest discover -s tests
-      - run: node --test tests/test_pi_events.cjs
+      - run: node --test tests/test_pi_events.cjs tests/test_pi_config.cjs
       - run: python tests/check_consistency.py
       - run: python tools/gen_checklist.py && git diff --exit-code -- config/checklist.json
       - run: python tests/make_samples.py /tmp/out

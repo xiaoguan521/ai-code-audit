@@ -15,7 +15,7 @@ RUN apt-get update \
 
 COPY skill/eight-quality-audit/SKILL.md /opt/audit/skills/eight-quality-code-audit/SKILL.md
 COPY config/result.schema.json /opt/audit/result.schema.json
-COPY docker/entrypoint.sh docker/pi_entrypoint.cjs docker/pi_events.cjs docker/pi_guard.mjs /opt/audit/
+COPY docker/entrypoint.sh docker/pi_entrypoint.cjs docker/pi_events.cjs docker/pi_config.cjs docker/pi_guard.mjs /opt/audit/
 COPY docker/pi_rg.cjs /opt/audit/bin/rg
 RUN chmod 0555 /opt/audit/entrypoint.sh /opt/audit/bin/rg && chmod -R a+rX /opt/audit
 

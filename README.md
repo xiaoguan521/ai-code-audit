@@ -32,12 +32,15 @@ config/projects.csv                  项目 Git 地址清单（张玲维护，�
 config/settings.json                 运行参数（目录、并发、预算、全量扫描日、模型后端 agent 等）
 docker/                              Pi 扫描镜像：Dockerfile、入口脚本、构建与冒烟测试脚本
 runner/run_daily.py                  每日扫描入口
+runner/evidence.py                   核验引用的仓库路径、行号及可选片段
+runner/code_map.py                   生成有界的 Git 跟踪文件地图
 runner/scoring.py                    校验与评分（确定性计算）
 runner/render.py                     报告、CSV、看板渲染
 runner/dashboard_template.html       看板模板（单文件，无外部依赖）
 tests/make_samples.py                用模拟数据验证评分与渲染：python3 tests/make_samples.py /tmp/out
 tests/check_consistency.py           SKILL / checklist / schema / 配置一致性检查（CI 必跑）
 tests/test_runner.py                 单元测试：输出 Schema 校验、JSON 提取、重试、网络、git 同步（python3 -m unittest discover -s tests）
+quality/                             固定提交的合成质量回归样例与评估脚本
 tools/gen_checklist.py               从 SKILL.md 重新生成 checklist.json
 .github/workflows/                   CI 与镜像构建流水线
 docker/PI_VERSION                    镜像内 Pi 版本（单一来源）
@@ -47,11 +50,21 @@ docker/PI_VERSION                    镜像内 Pi 版本（单一来源）
 
 | 情况 | 扫描类型 | 说明 |
 |---|---|---|
-| 首次扫描、每周全量日（默认周六）、上次结果丢失 | full | 64 项全部重新判定 |
-| 有新提交或补充材料变化 | incremental | 只重判受变更影响的检查项，其余沿用上次结论并标注“沿用” |
-| 无新提交、材料没变、距上次全量不满 7 天 | reuse | 直接复用上次结果，不调用模型 |
+| 首次扫描、到全量日或超过全量间隔、上次结果丢失、规则或范围变化 | full | 64 项全部重新判定 |
+| 有新提交或补充材料变化 | incremental | 模型重判受影响项，其他项可沿用；runner 核对沿用内容和已知影响，不能保证识别全部跨模块影响 |
+| 文件内容、材料和规则没变，且未到全量日 | reuse | 核验证据后复用上次结果，不调用模型；仅改变提交而无文件差异时也适用 |
 
 评分不由模型给出：模型只输出每项 PASS/WARN/FAIL/N/A/NEED_INFO 和证据，`scoring.py` 按 SKILL.md 第 6 节固定规则计算，同样的结论永远得同样的分。
+
+证据使用结构化相对路径、起止行号及可选原文片段。runner 在评分前核验文件、行号和所提供的片段，并在 `meta.evidence_check` 和每次尝试的统计中记录引用数及无效数；该核验不能证明结论正确，也不能证明某类问题不存在。结构或引用不合格时最多重试一次，第二次仍失败则不评分，结构合格但未通过核验的候选结果存入 `output/unverified/<日期>/<项目ID>.json`（文件权限 600）。Pi 达到轮次或输出长度硬上限时不会以相同配置原样重跑。
+
+升级注意：证据输出格式与旧版不同，**必须同时更新调度程序和 Pi 扫描镜像**。旧报告仍可查看；规则、证据格式、范围或模型配置指纹变化时，下一次扫描自动全量。若模型服务的同名模型替换了权重，请更新设置中的 `audit_revision` 触发全量复审。
+
+调度默认仍在周六全量；设置 `full_scan_strategy` 为 `staggered` 可按项目稳定错峰，`full_scan_interval_days` 控制最大间隔，错过计划会补扫。旧配置中的 `reuse_if_unchanged_days` 在没有新间隔配置时作为兼容默认值。每个项目完成后 `_run.json` 即更新，并记录同步、预扫描、模型调用、核验等耗时及可用的轮次、工具和 token 统计；`--dry-run` 的日志单独保存。同一工作目录或输出目录只允许一个批次运行。
+
+项目清单中的 `project_id` 必须唯一，只能使用字母、数字、点、横线和下划线，不能以 `_` 开头或使用 `.`、`..`，以免与结果文件冲突或越出工作目录。
+
+代码地图仅根据 `git ls-files` 记录有界路径清单，不读取源码，候选路径不能代替审查；锁文件保留名称供依赖审查。预扫描状态区分成功、跳过、失败和无报告；`prescan_parallelism` 默认 1，可按机器负载调大，实际并发还会叠加项目并发。各工具尚未统一应用 `default_scope_out`，需配置其自身排除规则。Compose 默认调度镜像未预装这些可选工具，需自行安装到调度镜像；semgrep 还需要离线规则目录。固定合成样例的用法见 [`quality/README.md`](quality/README.md)。
 
 ## 纯内网部署：Pi + Docker（推荐）
 
@@ -61,7 +74,7 @@ run_daily.py ──git fetch（只读凭据，只在宿主机）     Pi + 八性
      │  写入 work/<项目>/context/prompt.md            │  /workspace/repo     ← 代码，只读挂载
      └─ docker run ─────────────────────────────────▶ │  /workspace/context  ← 提示词/预扫描/上次结果，只读挂载
                                                       └─ 仅能访问内网千问 OPENAI_BASE_URL，输出 JSON 到 stdout
-     ◀── 解析 JSON → 校验（不合格重试一次）→ 程序评分 → 报告 / 看板
+     ◀── 解析 JSON → 结构、证据与沿用校验 → 程序评分 → 报告 / 看板
 ```
 
 安全要点：容器里没有 Git 凭据；代码以 `:ro` 挂载；容器以非 root 运行，`--read-only`、`--cap-drop ALL`、`no-new-privileges` 并限制资源。Pi 只启用 read、grep、find、ls；工具路径限制在仓库和扫描上下文，直接读取和搜索时排除 `.env`、`.env.*`；不加载仓库里的扩展和指令，也不自动联网更新。其他文件仍可能含敏感信息，模型服务的网络范围仍需通过防火墙限制。
@@ -73,7 +86,7 @@ run_daily.py ──git fetch（只读凭据，只在宿主机）     Pi + 八性
 5. **冒烟测试**：`AUDIT_MODEL_NETWORK=ai-audit-net sh docker/smoke_test.sh ai-code-audit:1.0 /etc/ai-audit/model.env`，确认 Pi 能连接模型并返回完整结果。
 6. **试扫一个项目**：`python3 runner/run_daily.py --only <项目ID> --force-full`，人工核对报告证据；再按下面第 8 步配置定时任务。
 
-模型说明：Pi 使用 OpenAI 兼容的 Chat Completions 接口，模型需支持流式输出和工具调用；可继续使用内网千问模型。镜像入口将 Schema 附在系统提示中，runner 解析、逐字段校验并在结果不合格时重试。Pi 默认按 128000 token 上下文、16384 token 最大输出配置模型，可在 `model.env` 中用 `PI_CONTEXT_WINDOW` 和 `PI_MAX_OUTPUT_TOKENS` 按实际模型调整。超出轮次时可调整 `agent.max_session_turns`。旧配置中的 `qwen-docker` 名称暂时保留兼容，应使用新的 Pi 扫描镜像。
+模型说明：Pi 使用 OpenAI 兼容的 Chat Completions 接口，模型需支持流式输出和工具调用；可继续使用内网千问模型。镜像入口将 Schema 附在系统提示中，runner 解析并校验结果。Pi 默认按 128000 token 上下文、16384 token 最大输出配置模型，可在 `model.env` 中用 `PI_CONTEXT_WINDOW` 和 `PI_MAX_OUTPUT_TOKENS` 按实际模型调整。服务支持时可配置 `PI_TEMPERATURE=0` 降低随机性，但不能保证结论完全可复现；未配置时保持服务默认值。超出轮次时可调整 `agent.max_session_turns`。旧配置中的 `qwen-docker` 名称暂时保留兼容，应使用新的 Pi 扫描镜像。
 
 ## Docker Compose 批量扫描
 
@@ -138,6 +151,8 @@ Compose 会创建 `AUDIT_MODEL_NETWORK` 指定的 Docker 网络。该网络本�
 
 ```
 output_dir/results/<日期>/<项目ID>.json   原始结构化结果（含逐项、问题、评分、元数据）
+output_dir/results/<日期>/_run.json       批次进度、耗时、每次模型尝试及预扫描状态
+output_dir/unverified/<日期>/<项目ID>.json 待核实结果（不参与评分）
 output_dir/reports/<日期>/<项目ID>.md     单项目完整报告（按模板第六节格式）
 output_dir/reports/<日期>/_summary.md     每日汇总报告
 output_dir/scores_latest.csv               最新评分（Excel 直接打开）

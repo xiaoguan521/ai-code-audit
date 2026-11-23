@@ -93,12 +93,15 @@ class ComposeRunnerTest(unittest.TestCase):
         fake_docker.chmod(0o755)
         data_dir = self.root / "host-data"
         data_dir.mkdir()
+        output = valid_result()
+        for item in output["items"]:
+            item["evidence"] = [{"path": "app.py", "start_line": 1}]
         env = dict(os.environ, PATH=f"{bin_dir}:{os.environ.get('PATH', '')}",
                    AUDIT_DATA_DIR=str(data_dir), AUDIT_MODEL_NETWORK="test-model-net",
                    AUDIT_SCANNER_IMAGE="example.test/scanner:test", AUDIT_MODEL_ENV_PATH=str(model_file),
                    AUDIT_SETTINGS_FILE=str(settings_file), AUDIT_PROJECTS_FILE=str(projects),
                    FAKE_DOCKER_LOG=str(log_file),
-                   FAKE_DOCKER_EVENTS=json.dumps([{"result": json.dumps(valid_result(), ensure_ascii=False)}],
+                   FAKE_DOCKER_EVENTS=json.dumps([{"result": json.dumps(output, ensure_ascii=False)}],
                                                 ensure_ascii=False))
         result = subprocess.run([sys.executable, str(ROOT / "docker/compose_entrypoint.py"),
                                  "--date", "2026-11-21", "--force-full"],

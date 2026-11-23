@@ -17,6 +17,13 @@ class PiEventCollector {
     this.settled = false;
     this.aborted = false;
     this.limitReached = false;
+    this.toolCalls = 0;
+    this.toolCallsByName = {};
+    this.toolDurationMs = 0;
+    this.timedToolCalls = 0;
+    this.assistantMessages = 0;
+    this.messagesWithUsage = 0;
+    this.usageTotal = {};
   }
 
   limit() {
@@ -41,8 +48,27 @@ class PiEventCollector {
       }
       if (event.type === 'session') this.sessionId = event.id || null;
       if (event.type === 'turn_start' && ++this.turns > this.maxTurns) this.limit();
+      if (event.type === 'tool_execution_start') {
+        this.toolCalls++;
+        const name = typeof event.toolName === 'string' ? event.toolName : 'unknown';
+        this.toolCallsByName[name] = (this.toolCallsByName[name] || 0) + 1;
+      }
+      if (event.type === 'tool_execution_end' && Number.isFinite(event.durationMs) && event.durationMs >= 0) {
+        this.toolDurationMs += event.durationMs;
+        this.timedToolCalls++;
+      }
       if (event.type === 'message_end' && event.message?.role === 'assistant') {
         this.lastMessage = event.message;
+        this.assistantMessages++;
+        const usage = event.message.usage;
+        if (usage && typeof usage === 'object') {
+          this.messagesWithUsage++;
+          for (const [key, value] of Object.entries(usage)) {
+            if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+              this.usageTotal[key] = (this.usageTotal[key] || 0) + value;
+            }
+          }
+        }
       }
       if (event.type === 'turn_end' && this.turns >= this.maxTurns && event.message?.stopReason === 'toolUse') {
         this.limit();
@@ -52,6 +78,13 @@ class PiEventCollector {
         this.aborted = Boolean(event.aborted);
       }
     }
+  }
+
+  stats() {
+    return { turns: this.turns, tool_calls: this.toolCalls, tool_calls_by_name: this.toolCallsByName,
+      tool_seconds_sum: this.timedToolCalls ? this.toolDurationMs / 1000 : null, timed_tool_calls: this.timedToolCalls,
+      assistant_messages: this.assistantMessages,
+      messages_with_usage: this.messagesWithUsage, usage_total: this.messagesWithUsage ? this.usageTotal : null };
   }
 
   finish() {
@@ -67,7 +100,7 @@ class PiEventCollector {
     }
     const text = (msg.content || []).filter((part) => part.type === 'text').map((part) => part.text).join('\n');
     if (!text) throw new PiOutputError('Pi 没有返回最终文本');
-    return { type: 'result', result: text, session_id: this.sessionId, usage: msg.usage || null };
+    return { type: 'result', result: text, session_id: this.sessionId, usage: msg.usage || null, stats: this.stats() };
   }
 }
 

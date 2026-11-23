@@ -7,8 +7,11 @@
   "per_project_timeout_sec": 3600,
   "per_project_budget_usd": 15,
   "full_scan_weekday": 6,
-  "reuse_if_unchanged_days": 7,
+  "full_scan_strategy": "weekday",
+  "full_scan_interval_days": 7,
   "clone_depth": 200,
+  "code_map_enabled": true,
+  "code_map_max_entries": 120,
   "default_scope_out": [
     "vendor/",
     "node_modules/",
@@ -26,6 +29,7 @@
     "semgrep",
     "lizard"
   ],
+  "prescan_parallelism": 1,
   "alert": {
     "score_drop_threshold": 1.0,
     "new_p0": true

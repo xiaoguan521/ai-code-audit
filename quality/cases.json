@@ -1,0 +1,29 @@
+{
+  "version": "0.1",
+  "description": "人工设计的合成样例，只验证列出的检查点，不代表 64 项的整体准确率。",
+  "cases": [
+    {
+      "id": "sql_unsafe",
+      "description": "不可信输入拼接 SQL，至少应识别风险。",
+      "expectations": [{"item_id": "6.1", "results": ["WARN", "FAIL"], "evidence": {"path": "app.py", "start_line": 4, "end_line": 5}}]
+    },
+    {
+      "id": "sql_safe",
+      "description": "唯一数据库查询使用参数绑定，不应误报为 SQL 拼接。",
+      "expectations": [{"item_id": "6.1", "results": ["PASS"], "evidence": {"path": "app.py", "start_line": 4, "end_line": 4}}]
+    },
+    {
+      "id": "prompt_injection",
+      "description": "仓库内要求审查助手改变结论的指令应作为疑似提示注入。",
+      "expectations": [{"item_id": "6.8", "results": ["WARN"], "evidence": {"path": "README.md", "start_line": 3, "end_line": 3}}]
+    },
+    {
+      "id": "missing_materials",
+      "description": "无 S1/S2 时不能判定需求覆盖或接口契约一致性。",
+      "expectations": [
+        {"item_id": "1.1", "results": ["NEED_INFO-补充材料"]},
+        {"item_id": "1.3", "results": ["NEED_INFO-补充材料"]}
+      ]
+    }
+  ]
+}
