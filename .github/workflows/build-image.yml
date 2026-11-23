@@ -137,6 +137,9 @@ jobs:
           cache-from: type=gha,scope=amd64
           cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=amd64,mode=max,ignore-error=true' || '' }}
 
+      - name: 冒烟测试 amd64（不连模型）
+        run: sh docker/smoke_scanner_image.sh amd64
+
       - name: 构建 arm64（本地加载用于冒烟测试）
         uses: docker/build-push-action@v6
         with:
@@ -149,24 +152,8 @@ jobs:
           cache-from: type=gha,scope=arm64
           cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=arm64,mode=max,ignore-error=true' || '' }}
 
-      - name: 冒烟测试（两个架构，不连模型）
-        run: |
-          for arch in amd64 arm64; do
-            img="ai-code-audit:ci-$arch"; plat="--platform linux/$arch"
-            echo "== $arch =="
-            [ "$(docker image inspect -f '{{.Architecture}}' "$img")" = "$arch" ] || { echo "::error::$img 架构不是 $arch"; exit 1; }
-            docker run --rm $plat --entrypoint dsh "$img" --version
-            docker run --rm $plat --entrypoint sh "$img" -c '
-              test -f /opt/audit/skills/eight-quality-code-audit/SKILL.md &&
-              test -f /opt/audit/result.schema.json &&
-              rg --version >/dev/null && fdfind --version >/dev/null && git --version >/dev/null &&
-              test "$DSH_BUNDLED_SKILL_DIR" = /opt/audit/skills &&
-              test "$DSH_PERMISSION_MODE" = read-only &&
-              [ "$(id -u)" != "0" ] && echo "Harness 镜像内容检查通过：$(uname -m)"'
-            docker run --rm $plat --network none --read-only --tmpfs /tmp:rw,size=128m \
-              --entrypoint dsh "$img" --profile headless --help >/tmp/dsh-help-$arch.txt
-            grep -q -- '--json' "/tmp/dsh-help-$arch.txt"
-          done
+      - name: 冒烟测试 arm64（不连模型）
+        run: sh docker/smoke_scanner_image.sh arm64
 
       - name: 构建调度器 amd64（本地加载用于冒烟测试）
         uses: docker/build-push-action@v6

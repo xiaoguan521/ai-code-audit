@@ -20,10 +20,12 @@ COPY config/result.schema.json /opt/audit/result.schema.json
 RUN chmod -R a+rX /opt/audit
 
 USER node
+# 扫描容器的 /tmp 为 noexec；原生加载器须直接从镜像加载预编译库。
 ENV HOME=/tmp/home \
     DSH_HOME=/tmp/dsh \
     DSH_BUNDLED_SKILL_DIR=/opt/audit/skills \
     DSH_PERMISSION_MODE=read-only \
+    NARB_DISABLE_NATIVE_CACHE=1 \
     DSH_TELEMETRY_MODE=DISABLED \
     DSH_TELEMETRY_DISABLED=1 \
     PATH=/opt/audit/bin:$PATH
