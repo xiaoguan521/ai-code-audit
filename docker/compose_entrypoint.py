@@ -44,7 +44,7 @@ def configure_settings(settings: dict, env: dict) -> dict:
     settings["workdir"] = str(Path(data_dir) / "work")
     settings["output_dir"] = str(Path(data_dir) / "output")
     agent = settings.setdefault("agent", {})
-    agent_type = (env.get("AUDIT_AGENT_TYPE") or agent.get("type") or "pi-docker").strip()
+    agent_type = (env.get("AUDIT_AGENT_TYPE") or agent.get("type") or "deepseek-harness").strip()
     if agent_type not in {"pi-docker", "qwen-docker", "deepseek-harness"}:
         raise ValueError("AUDIT_AGENT_TYPE 必须为 pi-docker、qwen-docker 或 deepseek-harness")
     image = env.get("AUDIT_SCANNER_IMAGE") or agent.get("image") or "ghcr.io/xiaoguan521/ai-code-audit:main"

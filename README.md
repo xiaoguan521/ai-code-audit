@@ -10,7 +10,8 @@
 |---|---|---|
 | 修改检查规则 | 改 `skill/eight-quality-audit/SKILL.md`；增删检查项后运行 `python3 tools/gen_checklist.py` | CI 校验 64 项与 checklist / schema 一致；合并后重新构建镜像 |
 | 调整权重、评分档位 | 改 `config/checklist.json` | CI 校验权重合计 100 |
-| 升级 Pi | 改 `docker/PI_VERSION` | 构建镜像并冒烟测试（版本号、Skill、非 root、真实入口及大输出） |
+| 升级 DeepSeek Harness | 改 `docker/DSH_VERSION` | 构建 Harness 扫描镜像并冒烟测试（dsh、headless Profile、Skill、非 root） |
+| 回滚 Pi | 使用 `docker/Dockerfile.pi` 和 `docker/PI_VERSION` 构建旧镜像，并将 `AUDIT_AGENT_TYPE` 改为 `pi-docker` | 保留旧 JSON 扫描链路 |
 | 发布给内网 | 打 tag：`git tag v1.0.0 && git push origin v1.0.0` | 扫描镜像 `ghcr.io/<owner>/<repo>:1.0.0` 和调度镜像 `ghcr.io/<owner>/<repo>-runner:1.0.0` 均为 amd64 + arm64；GitHub Release 为两种镜像的每个架构分别附离线包及 sha256 |
 
 工作流文件：`.github/workflows/ci.yml`（每次 PR / push 跑测试）、`.github/workflows/build-image.yml`（构建、测试、推送镜像，tag 时出离线包）。Dependabot 每月提醒升级 Actions 与基础镜像。
@@ -30,7 +31,7 @@ config/checklist.json                64 项检查项与权重、评分参数（�
 config/result.schema.json            模型输出的 JSON Schema（约束结构，保证可自动出分）
 config/projects.csv                  项目 Git 地址清单（张玲维护，示例行上线前删除）
 config/settings.json                 运行参数（目录、并发、预算、全量扫描日、模型后端 agent 等）
-docker/                              Pi 扫描镜像：Dockerfile、入口脚本、构建与冒烟测试脚本
+docker/                              DeepSeek Harness 扫描镜像：Dockerfile、版本、构建与冒烟测试脚本；Dockerfile.pi 为 Pi 回滚镜像
 runner/run_daily.py                  每日扫描入口
 runner/adapters/harness.py           完整 DeepSeek Harness Headless Docker Adapter
 runner/adapters/summary.py           只读审查结果的独立 AI 总结 Adapter（含确定性降级）
@@ -46,7 +47,7 @@ tests/test_runner.py                 单元测试：输出 Schema 校验、JSON 
 quality/                             固定提交的合成质量回归样例与评估脚本
 tools/gen_checklist.py               从 SKILL.md 重新生成 checklist.json
 .github/workflows/                   CI 与镜像构建流水线
-docker/PI_VERSION                    镜像内 Pi 版本（单一来源）
+docker/DSH_VERSION                   镜像内 DeepSeek Harness 版本（单一来源）
 ```
 
 ## 运行机制
@@ -61,13 +62,13 @@ docker/PI_VERSION                    镜像内 Pi 版本（单一来源）
 
 证据使用结构化相对路径、起止行号及可选原文片段。runner 在评分前核验文件、行号和所提供的片段，并在 `meta.evidence_check` 和每次尝试的统计中记录引用数及无效数；该核验不能证明结论正确，也不能证明某类问题不存在。结构不合格时最多重试一次，第二次仍失败则不评分；无法安全自动修复的残余语义问题才会写入 `output/unverified/<日期>/<项目ID>.json`（文件权限 600）。Pi 达到轮次或输出长度硬上限时不会以相同配置原样重跑。
 
-Pi 默认把 Schema 放在系统提示中；若内网 OpenAI 兼容网关支持 Structured Outputs，可在模型环境文件启用 `PI_RESPONSE_FORMAT=json_schema`，由请求层直接约束最终 JSON（不支持的网关保持关闭）。
+Harness 默认读取八性 Skill，并按 Markdown 契约输出审查事实；`config/result.schema.json` 仍保留给 Pi 回滚链路，不参与 Harness 的第一阶段输出格式约束。
 
 结构错误（Schema、缺项、重复项）才会触发模型重试；无效证据、孤立问题和增量沿用抄写错误由 runner 自动清理或降级为 `NEED_INFO-证据不足`，并在 `meta.evidence_check` 记录修复数量。runner 同时生成 `context/facts.json`：inventory、代码地图和预扫描摘要由确定性工具提供，模型只需对需要语义判断的部分回源码核验。
 
-升级注意：证据输出格式与旧版不同，**必须同时更新调度程序和 Pi 扫描镜像**。旧报告仍可查看；规则、证据格式、范围或模型配置指纹变化时，下一次扫描自动全量。若模型服务的同名模型替换了权重，请更新设置中的 `audit_revision` 触发全量复审。
+升级注意：证据输出格式与旧版不同，**必须同时更新调度程序和 Harness 扫描镜像**。旧报告仍可查看；规则、证据格式、范围或模型配置指纹变化时，下一次扫描自动全量。若模型服务的同名模型替换了权重，请更新设置中的 `audit_revision` 触发全量复审。
 
-默认 `agent.strategy` 为 `dimensions`：按八个维度建立独立会话，每次只输出本维度的检查项；每段分别核验结构、问题清单和源码证据，失败时只重试该维度，全部通过后才合并、评分和生成原格式报告。某段未通过时整次审查不评分。`agent.dimension_parallelism` 限制单个项目同时运行的维度数，`max_parallel` 限制项目数，`max_model_concurrency` 限制同一调度进程中所有项目共享的模型调用总数。并发应按模型服务容量调整；模型的输出 token 上限仍作用于每个分段。将 `agent.strategy` 设为 `single` 可使用旧的完整单会话流程；旧配置未设置该字段时也按 `single` 兼容运行。
+默认后端是 `deepseek-harness`，`agent.strategy` 固定为 `single`：Runner 只发送一个顶层任务，DeepSeek Harness 自己规划审查步骤、工具调用、多轮推理和子任务；Runner 只负责进程、事件、Markdown 解析、证据校验、评分与归档。`agent.dimension_parallelism` 只对 Pi/其他兼容后端的旧分维度链路生效。Harness 输出不完整或证据不成立时整次审查标记为 `unverified`，不进入有效评分。
 
 调度默认仍在周六全量；设置 `full_scan_strategy` 为 `staggered` 可按项目稳定错峰，`full_scan_interval_days` 控制最大间隔，错过计划会补扫。旧配置中的 `reuse_if_unchanged_days` 在没有新间隔配置时作为兼容默认值。每个项目完成后 `_run.json` 即更新，并记录同步、预扫描、模型调用、核验等耗时及可用的轮次、工具和 token 统计；`--dry-run` 的日志单独保存。同一工作目录或输出目录只允许一个批次运行。
 
@@ -75,33 +76,33 @@ Pi 默认把 Schema 放在系统提示中；若内网 OpenAI 兼容网关支持 
 
 代码地图仅根据 `git ls-files` 记录有界路径清单，不读取源码，候选路径不能代替审查；锁文件保留名称供依赖审查。预扫描状态区分成功、跳过、失败和无报告；默认并行运行 2 个工具（可按机器负载调小或调大），增量模式只扫描未排除的变更文件，确定性事实也只读取变更文件，inventory 的总行数沿用上次全量基线，实际并发还会叠加项目并发。发布的 Compose 调度镜像固定预装 cloc 2.02、gitleaks 8.30.1、semgrep 1.186.0 和 lizard 1.26.1，构建冒烟测试会检查四个命令；semgrep 仍需要 `semgrep_rules_dir` 指向随部署提供的离线规则目录，否则会明确跳过（不会联网拉规则）。如自建调度镜像，请保留同样的版本和命令检查。固定合成样例的用法见 [`quality/README.md`](quality/README.md)。
 
-## 纯内网部署：Pi + Docker（推荐）
+## 纯内网部署：DeepSeek Harness + Docker（默认）
 
 ```
 运行机（宿主机）                                   一次性容器 ai-code-audit（每个项目一个）
-run_daily.py ──git fetch（只读凭据，只在宿主机）     Pi + 八性 Skill + 只读工具
+run_daily.py ──git fetch（只读凭据，只在宿主机）     DeepSeek Harness + 八性 Skill + 只读工具
      │  写入 work/<项目>/context/prompt.md            │  /workspace/repo     ← 代码，只读挂载
      └─ docker run ─────────────────────────────────▶ │  /workspace/context  ← 提示词/预扫描/上次结果，只读挂载
-                                                      └─ 仅能访问内网千问 OPENAI_BASE_URL，输出 JSON 到 stdout
-     ◀── 解析 JSON → 结构、证据与沿用校验 → 程序评分 → 报告 / 看板
+                                                      └─ 仅能访问模型服务，输出 JSON 事件流中的 Markdown 到 stdout
+     ◀── 解析 Markdown → 结构、证据与沿用校验 → 程序评分 → 报告 / 看板
 ```
 
-安全要点：容器里没有 Git 凭据；代码以 `:ro` 挂载；容器以非 root 运行，`--read-only`、`--cap-drop ALL`、`no-new-privileges` 并限制资源。Pi 只启用 read、grep、find、ls；工具路径限制在仓库和扫描上下文，直接读取和搜索时排除 `.env`、`.env.*`；不加载仓库里的扩展和指令，也不自动联网更新。其他文件仍可能含敏感信息，模型服务的网络范围仍需通过防火墙限制。
+安全要点：容器里没有 Git 凭据；代码以 `:ro` 挂载；容器以非 root 运行，`--read-only`、`--cap-drop ALL`、`no-new-privileges` 并限制资源。Harness 使用 `read-only` 权限预设，Skill 从镜像内置目录发现；Runner 不介入 Harness 的内部规划。其他文件仍可能含敏感信息，模型服务的网络范围仍需通过防火墙限制。
 
-1. **构建镜像（在能上网的构建机）**：`sh docker/build.sh 1.0`，得到本机架构的 `ai-code-audit_1.0_<amd64|arm64>.tar.gz` 及 sha256；覆盖版本可设置 `PI_VERSION`。给 ARM 服务器构建加 `PLATFORM=linux/arm64`，反之加 `PLATFORM=linux/amd64`。如需从内网镜像仓库拉基础镜像，加 `BASE_IMAGE=harbor.xxx/library/node:22-bookworm-slim`（Node.js 须不低于 22.19，镜像须包含目标架构）。纯内网优先导入 GitHub Release 的离线镜像包。
+1. **构建镜像（推荐由 GitHub Actions 完成）**：推送到 `main` 或版本 tag 后，工作流会构建并发布内置官方 `@deepseek-ai/dsh` 的 amd64/arm64 Harness 扫描镜像和 Runner 镜像。若必须手工构建，在能上网的构建机执行 `sh docker/build.sh 1.0`；覆盖 Harness 版本可设置 `DSH_VERSION`。给 ARM 服务器构建加 `PLATFORM=linux/arm64`，反之加 `PLATFORM=linux/amd64`。如需从内网镜像仓库拉基础镜像，加 `BASE_IMAGE=harbor.xxx/library/node:24.22.3-bookworm-slim`（Node.js 须满足 Harness 版本要求，镜像须包含目标架构）。纯内网优先导入 GitHub Release 的离线镜像包。
 2. **导入内网**：`sha256sum -c ai-code-audit_1.0_amd64.tar.gz.sha256 && docker load < ai-code-audit_1.0_amd64.tar.gz`（ARM 运行机换成 `_arm64`）。
-3. **配置模型地址**：`cp docker/model.env.example /etc/ai-audit/model.env && chmod 600 /etc/ai-audit/model.env`，填内网千问的 `OPENAI_BASE_URL`（OpenAI 兼容接口，一般以 /v1 结尾）、`OPENAI_MODEL`、`OPENAI_API_KEY`。
+3. **配置模型地址**：`cp docker/model.env.example /etc/ai-audit/model.env && chmod 600 /etc/ai-audit/model.env`，填 Harness 使用的 `DEEPSEEK_BASE_URL`（可选）、`DEEPSEEK_MODEL` 和 `DEEPSEEK_API_KEY`。
 4. **网络隔离（必填）**：建一个专用 Docker 网络（如 `docker network create --subnet 172.30.0.0/24 ai-audit-net`），在宿主机防火墙上只放行该网段到千问服务的地址和端口，填到 settings.json 的 `agent.network`。被审查的代码是不可信输入，`agent.network` 留空时 runner 拒绝启动（`--dry-run` 只告警）；确需使用 Docker 默认网桥（可访问任意外网），须显式填写 `"bridge"`。
-5. **冒烟测试**：`AUDIT_MODEL_NETWORK=ai-audit-net sh docker/smoke_test.sh ai-code-audit:1.0 /etc/ai-audit/model.env`，确认 Pi 能连接模型并返回完整结果。
+5. **冒烟测试**：`AUDIT_MODEL_NETWORK=ai-audit-net sh docker/smoke_test.sh ai-code-audit:1.0 /etc/ai-audit/model.env`，确认 DeepSeek Harness headless 能连接模型并返回 `final.reason.kind=completed` 的事件流。
 6. **试扫一个项目**：`python3 runner/run_daily.py --only <项目ID> --force-full`，人工核对报告证据；再按下面第 8 步配置定时任务。
 
-模型说明：Pi 使用 OpenAI 兼容的 Chat Completions 接口，模型需支持流式输出和工具调用；可继续使用内网千问模型。镜像入口将 Schema 附在系统提示中，runner 解析并校验结果。Pi 默认按 128000 token 上下文、16384 token 最大输出配置模型，可在 `model.env` 中用 `PI_CONTEXT_WINDOW` 和 `PI_MAX_OUTPUT_TOKENS` 按实际模型调整。服务支持时可配置 `PI_TEMPERATURE=0` 降低随机性，但不能保证结论完全可复现；未配置时保持服务默认值。超出轮次时可调整 `agent.max_session_turns`。旧配置中的 `qwen-docker` 名称暂时保留兼容，应使用新的 Pi 扫描镜像。
+模型说明：Harness 默认使用 DeepSeek Messages 接口，`model.env` 使用 `DEEPSEEK_API_KEY`、可选 `DEEPSEEK_BASE_URL` 和 `DEEPSEEK_MODEL`；内网网关必须兼容 Harness 所需的 Messages 协议。Pi 回滚镜像仍使用 `OPENAI_BASE_URL`、`OPENAI_MODEL` 和 `OPENAI_API_KEY`，详见 `docker/model.env.example`。
 
 ## DeepSeek Harness Headless + Docker
 
 deepseek-harness 后端只启动一个完整的 Headless Agent 任务。Runner 不按八性维度拆分任务，也不介入 Harness 的规划、工具调用、多轮推理或子 Agent；它只负责启动容器、传入顶层任务、检查进程退出码与最终事件、保存脱敏事件，并解析最终 Markdown。该后端必须使用 strategy: single。
 
-Harness 镜像应预装 dsh、八性 Skill 和所需 Profile；源码与扫描上下文以只读方式挂载。示例配置：
+本仓库的 `docker/Dockerfile` 已直接安装官方 `@deepseek-ai/dsh`，预装八性 Skill，并通过 `DSH_BUNDLED_SKILL_DIR` 接入 headless Profile；源码与扫描上下文以只读方式挂载。GitHub Actions 构建完成后，默认 `ghcr.io/<owner>/<repo>:main` 就是 Harness 扫描镜像。示例配置：
 
 ~~~json
 {
@@ -120,6 +121,8 @@ Harness 镜像应预装 dsh、八性 Skill 和所需 Profile；源码与扫描�
 
 Harness 的 `--json` 是运行事件流，不是要求模型输出 JSON。Adapter 默认把顶层任务作为 argv 传给 `dsh`，并强制使用只读权限和 `--approval-policy never`；如某个固定版本只从 stdin 读取，可配置 `prompt_mode: "stdin"`。Adapter 只从最终事件提取 Markdown；退出码为 0 但缺少 `final.reason.kind`、最终状态失败或 Markdown 不完整时，审查仍标记为 unverified，不进入评分。若需要调整事件成功状态，可配置 `success_reason_kinds`，但不要修改 Harness 的内部任务流程。
 
+从旧 Pi 配置迁移到 Harness 的逐步操作见[迁移配置说明](docs/Pi迁移到DeepSeek-Harness配置说明.md)。
+
 ### 独立 AI 综合总结
 
 `summary.enabled` 默认关闭。Compose 部署可用 `AUDIT_SUMMARY_ENABLED=true` 开启；Harness 模式默认复用扫描镜像、网络和模型环境，但会启动独立的 Summary Agent 进程/会话。该会话只读 `audit.json` 与 `audit.md`，不挂载源码，也不能修改逐项结论、证据或评分。它只负责管理层摘要、重复问题聚合和整改优先级，并通过 `summary-theme` 的 `source_issue_ids` 引用已存在的问题。未配置凭证、启动失败或输出引用无效时，自动生成确定性摘要，审查结果仍保持有效。
@@ -128,7 +131,7 @@ Harness 的 `--json` 是运行事件流，不是要求模型输出 JSON。Adapte
 
 内网部署、离线镜像导入与运维排障详见[内网部署运维手册](docs/内网部署运维手册.md)。
 
-Compose 中 `scanner-image` 可以指向 Pi 回滚镜像，也可以指向包含完整 DeepSeek Harness 的扫描镜像；`AUDIT_AGENT_TYPE` 决定实际后端。`audit` 使用调度镜像，负责拉取仓库、管理扫描状态和生成报告；调度器通过本机 Docker 为每个项目启动一个扫描镜像的独立容器。扫描完成后调度容器退出；再次运行会使用保存的状态，按原有规则选择全量、增量或复用。
+Compose 默认指向本仓库发布的 DeepSeek Harness 扫描镜像，`AUDIT_AGENT_TYPE=deepseek-harness`。如需回滚，才切换到 `docker/Dockerfile.pi` 构建的 Pi 镜像并设置 `AUDIT_AGENT_TYPE=pi-docker`。`audit` 使用调度镜像，负责拉取仓库、管理扫描状态和生成报告；调度器通过本机 Docker 为每个项目启动一个扫描镜像的独立容器。扫描完成后调度容器退出；再次运行会使用保存的状态，按原有规则选择全量、增量或复用。
 
 1. 在有 Docker Engine 和 Compose 的运行机上，从项目目录准备配置：
    ```sh
@@ -143,9 +146,9 @@ Compose 中 `scanner-image` 可以指向 Pi 回滚镜像，也可以指向包含
 2. 编辑 `config/projects.local.csv`：每行填写一个 `git_url` 和 `branch`。示例包含两个仓库，其中一个扫描 `main` 和 `develop` 两个分支；每一行的 `project_id` 必须唯一，`status` 为 `在研` 才会被扫描。不要把令牌或密码写进仓库 URL，因为 URL 会进入扫描结果。更换项目的仓库地址时请使用新的 `project_id`，以免复用旧仓库的本地副本。
 3. 编辑 `model.env`，填入能从扫描容器访问到的 OpenAI 兼容服务地址、模型名和 API Key：
    ```text
-   OPENAI_BASE_URL=http://model.internal.example.com:8000/v1
-   OPENAI_MODEL=qwen3-coder
-   OPENAI_API_KEY=替换为实际密钥
+   DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic
+   DEEPSEEK_MODEL=deepseek-flash
+   DEEPSEEK_API_KEY=替换为实际密钥
    ```
    此文件按 Docker `--env-file` 格式填写，值直接写在等号后，不要额外加引号。容器中的 `127.0.0.1` 指向容器自身；模型部署在其他机器或宿主机时应填写容器能够访问的实际地址。
 4. 配置私有 Git 仓库的只读凭据，任选一种方式：

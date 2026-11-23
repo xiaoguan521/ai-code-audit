@@ -27,8 +27,8 @@ on:
       - ".github/workflows/build-image.yml"
   workflow_dispatch:
     inputs:
-      pi_version:
-        description: "覆盖 Pi 版本（留空用 docker/PI_VERSION）"
+      dsh_version:
+        description: "覆盖 DeepSeek Harness 版本（留空用 docker/DSH_VERSION）"
         required: false
 
 permissions:
@@ -65,14 +65,14 @@ jobs:
       - name: 准备变量
         id: vars
         env:
-          INPUT_VERSION: ${{ inputs.pi_version }}
+          INPUT_VERSION: ${{ inputs.dsh_version }}
         run: |
           v="$INPUT_VERSION"
-          if [ -n "$v" ] && ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::Pi 版本号格式不对：$v"; exit 1
+          if [ -n "$v" ] && ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::DeepSeek Harness 版本号格式不对：$v"; exit 1
           fi
-          [ -z "$v" ] && v="$(tr -d '[:space:]' < docker/PI_VERSION)"
-          echo "pi_version=$v" >> "$GITHUB_OUTPUT"
+          [ -z "$v" ] && v="$(tr -d '[:space:]' < docker/DSH_VERSION)"
+          echo "dsh_version=$v" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
           echo "runner_image=ghcr.io/${GITHUB_REPOSITORY,,}-runner" >> "$GITHUB_OUTPUT"
 
@@ -103,8 +103,8 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=ai-code-audit
-            org.opencontainers.image.description=八性 AI 代码检查（Pi + Skill）
-            io.pi.version=${{ steps.vars.outputs.pi_version }}
+            org.opencontainers.image.description=八性 AI 代码检查（DeepSeek Harness + Skill）
+            io.deepseek.harness.version=${{ steps.vars.outputs.dsh_version }}
 
       - name: 生成调度镜像标签
         id: runner_meta
@@ -123,7 +123,8 @@ jobs:
             org.opencontainers.image.description=八性 AI 代码检查批量调度器
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
-      # 每个架构各构建一份并本地加载，分别做冒烟测试；arm64 在 x86 runner 上经 QEMU 模拟运行（较慢，靠缓存加速）
+      # 每个架构各构建一份并本地加载，分别验证 dsh、headless Profile 和八性 Skill；
+      # arm64 在 x86 runner 上经 QEMU 模拟运行（较慢，靠缓存加速）。
       - name: 构建 amd64（本地加载用于冒烟测试）
         uses: docker/build-push-action@v6
         with:
@@ -132,7 +133,7 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: ai-code-audit:ci-amd64
-          build-args: PI_VERSION=${{ steps.vars.outputs.pi_version }}
+          build-args: DSH_VERSION=${{ steps.vars.outputs.dsh_version }}
           cache-from: type=gha,scope=amd64
           cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=amd64,mode=max,ignore-error=true' || '' }}
 
@@ -144,94 +145,28 @@ jobs:
           platforms: linux/arm64
           load: true
           tags: ai-code-audit:ci-arm64
-          build-args: PI_VERSION=${{ steps.vars.outputs.pi_version }}
+          build-args: DSH_VERSION=${{ steps.vars.outputs.dsh_version }}
           cache-from: type=gha,scope=arm64
           cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=arm64,mode=max,ignore-error=true' || '' }}
 
       - name: 冒烟测试（两个架构，不连模型）
         run: |
-          mkdir -p /tmp/ctx && echo test > /tmp/ctx/prompt.md
           for arch in amd64 arm64; do
             img="ai-code-audit:ci-$arch"; plat="--platform linux/$arch"
             echo "== $arch =="
             [ "$(docker image inspect -f '{{.Architecture}}' "$img")" = "$arch" ] || { echo "::error::$img 架构不是 $arch"; exit 1; }
-            docker run --rm $plat --entrypoint pi "$img" --version
+            docker run --rm $plat --entrypoint dsh "$img" --version
             docker run --rm $plat --entrypoint sh "$img" -c '
               test -f /opt/audit/skills/eight-quality-code-audit/SKILL.md &&
               test -f /opt/audit/result.schema.json &&
-              test -f /opt/audit/pi_entrypoint.cjs &&
               rg --version >/dev/null && fdfind --version >/dev/null && git --version >/dev/null &&
-              [ "$(id -u)" != "0" ] && echo "镜像内容检查通过：$(uname -m)"'
-            # 未配置模型地址时入口脚本应拒绝启动
-            if docker run --rm $plat -v /tmp/ctx:/workspace/context:ro "$img"; then echo "::error::$arch 入口脚本未校验环境变量"; exit 1; fi
+              test "$DSH_BUNDLED_SKILL_DIR" = /opt/audit/skills &&
+              test "$DSH_PERMISSION_MODE" = read-only &&
+              [ "$(id -u)" != "0" ] && echo "Harness 镜像内容检查通过：$(uname -m)"'
+            docker run --rm $plat --network none --read-only --tmpfs /tmp:rw,size=128m \
+              --entrypoint dsh "$img" --profile headless --help >/tmp/dsh-help-$arch.txt
+            grep -q -- '--json' "/tmp/dsh-help-$arch.txt"
           done
-
-      - name: 真实入口测试（两个架构，本地模拟模型）
-        run: |
-          mkdir -p /tmp/pi-entrypoint-test/context /tmp/pi-entrypoint-test/repo /tmp/pi-entrypoint-test/results
-          chmod 0777 /tmp/pi-entrypoint-test/results
-          printf '%s\n' '---' 'AUDIT_ENTRYPOINT_TEST' > /tmp/pi-entrypoint-test/context/prompt.md
-          printf '%s\n' 'AUDIT_MOCK_READ_CONTENT' > /tmp/pi-entrypoint-test/repo/fixture.txt
-          printf '%s\n' 'PRIVATE_TOKEN=DONT_SEND_THIS_VALUE' > /tmp/pi-entrypoint-test/repo/.env
-          cp tests/pi_entrypoint_smoke.cjs /tmp/pi-entrypoint-test/context/
-          cp config/checklist.json /tmp/pi-entrypoint-test/context/
-          for arch in amd64 arm64; do
-            docker run --rm --network none --platform "linux/$arch" \
-              --read-only --tmpfs /tmp:rw,size=512m --tmpfs /home/node:rw,size=256m,uid=1000,gid=1000 \
-              -e CI=1 -e AUDIT_TEST_ARCH="$arch" -v /tmp/pi-entrypoint-test/context:/workspace/context:ro \
-              -v /tmp/pi-entrypoint-test/repo:/workspace/repo:ro \
-              -v /tmp/pi-entrypoint-test/results:/workspace/test-results \
-              --entrypoint node "ai-code-audit:ci-$arch" /workspace/context/pi_entrypoint_smoke.cjs
-          done
-          python3 - <<'PY'
-          import json, sys
-          from pathlib import Path
-          sys.path.insert(0, 'runner')
-          import run_daily, scoring
-          for arch in ('amd64', 'arm64'):
-              events = json.loads(Path(f'/tmp/pi-entrypoint-test/results/{arch}.json').read_text())
-              result = run_daily.extract_json(events[-1]['result'])
-              problems = run_daily.check_output(result, scoring.load_checklist())
-              assert not problems, problems
-              print(f'{arch}: 完整 64 项结果通过调度器结构和语义校验')
-          PY
-          python3 - <<'PY'
-          import json, sys
-          from pathlib import Path
-          sys.path.insert(0, 'runner')
-          import scoring, segments
-          ck = scoring.load_checklist()
-          ctx = Path('/tmp/pi-entrypoint-test/context')
-          schema = segments.schema_for_dimension(ck, scoring.load_schema(), '6')
-          (ctx / 'dimension.schema.json').write_text(json.dumps(schema, ensure_ascii=False))
-          skill = Path('skill/eight-quality-audit/SKILL.md').read_text()
-          (ctx / 'dimension.skill.md').write_text(segments.skill_for_dimension(skill, ck, '6'))
-          PY
-          for arch in amd64 arm64; do
-            docker run --rm --network none --platform "linux/$arch" \
-              --read-only --tmpfs /tmp:rw,size=512m --tmpfs /home/node:rw,size=256m,uid=1000,gid=1000 \
-              -e CI=1 -e AUDIT_TEST_ARCH="$arch" -e AUDIT_TEST_DIMENSION=6 \
-              -v /tmp/pi-entrypoint-test/context:/workspace/context:ro \
-              -v /tmp/pi-entrypoint-test/repo:/workspace/repo:ro \
-              -v /tmp/pi-entrypoint-test/results:/workspace/test-results \
-              --entrypoint node "ai-code-audit:ci-$arch" /workspace/context/pi_entrypoint_smoke.cjs
-          done
-          python3 - <<'PY'
-          import json, sys
-          from pathlib import Path
-          sys.path.insert(0, 'runner')
-          import run_daily, scoring
-          ck = scoring.load_checklist()
-          part = dict(ck, dimensions=[d for d in ck['dimensions'] if d['id'] == '6'],
-                      items=[i for i in ck['items'] if i['dimension'] == '6'])
-          schema = json.loads(Path('/tmp/pi-entrypoint-test/context/dimension.schema.json').read_text())
-          for arch in ('amd64', 'arm64'):
-              events = json.loads(Path(f'/tmp/pi-entrypoint-test/results/{arch}-dimension-6.json').read_text())
-              result = run_daily.extract_json(events[-1]['result'], schema['required'])
-              problems = run_daily.check_output(result, part, Path('/tmp/pi-entrypoint-test/repo'), schema=schema)
-              assert not problems, problems
-              print(f'{arch}: 安全维度的 9 项结果和源码证据校验通过')
-          PY
 
       - name: 构建调度器 amd64（本地加载用于冒烟测试）
         uses: docker/build-push-action@v6
@@ -284,7 +219,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: PI_VERSION=${{ steps.vars.outputs.pi_version }}
+          build-args: DSH_VERSION=${{ steps.vars.outputs.dsh_version }}
           cache-from: |
             type=gha,scope=amd64
             type=gha,scope=arm64

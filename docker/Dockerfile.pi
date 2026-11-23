@@ -1,0 +1,24 @@
+# 八性 AI 代码检查 · Pi 扫描镜像（兼容回滚）
+# 旧 Pi 链路保留为显式回滚镜像；默认 docker/Dockerfile 已切换到 DeepSeek Harness。
+FROM node:22-bookworm-slim
+
+ARG PI_VERSION=1.6.0
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates ripgrep fd-find tini \
+ && rm -rf /var/lib/apt/lists/* \
+ && git config --system safe.directory '*' \
+ && git config --system core.fsmonitor false \
+ && npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+ && npm cache clean --force \
+ && pi --version
+
+COPY skill/eight-quality-audit/ /opt/audit/skills/eight-quality-code-audit/
+COPY config/result.schema.json /opt/audit/result.schema.json
+COPY docker/entrypoint.sh docker/pi_entrypoint.cjs docker/pi_events.cjs docker/pi_config.cjs docker/pi_guard.mjs /opt/audit/
+COPY docker/pi_rg.cjs /opt/audit/bin/rg
+RUN chmod 0555 /opt/audit/entrypoint.sh /opt/audit/bin/rg && chmod -R a+rX /opt/audit
+
+USER node
+ENV HOME=/home/node PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PATH=/opt/audit/bin:$PATH
+WORKDIR /workspace/repo
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/audit/entrypoint.sh"]

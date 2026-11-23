@@ -8,7 +8,7 @@ set -eu
 cd "$(dirname "$0")/.."
 VER="${1:-latest}"
 TAG="ai-code-audit:${VER}"
-PI_VERSION="${PI_VERSION:-$(tr -d '[:space:]' < docker/PI_VERSION)}"
+DSH_VERSION="${DSH_VERSION:-$(tr -d '[:space:]' < docker/DSH_VERSION)}"
 if [ -z "${PLATFORM:-}" ]; then
   case "$(uname -m)" in
     x86_64|amd64) PLATFORM=linux/amd64 ;;
@@ -24,7 +24,7 @@ esac
 # 注意：BASE_IMAGE 指向的内网镜像也必须包含目标架构（多架构镜像或对应架构的单架构镜像）
 FROM_IMAGE="$(sed -n 's/^FROM[[:space:]]\{1,\}\([^[:space:]]*\).*/\1/p' docker/Dockerfile | head -n 1)"
 docker build --platform "$PLATFORM" -f docker/Dockerfile -t "$TAG" \
-  --build-arg "PI_VERSION=$PI_VERSION" \
+  --build-arg "DSH_VERSION=$DSH_VERSION" \
   ${BASE_IMAGE:+--build-context "$FROM_IMAGE=docker-image://$BASE_IMAGE"} .
 GOT="$(docker image inspect -f '{{.Architecture}}' "$TAG")"
 [ "$GOT" = "$ARCH" ] || { echo "构建结果架构为 $GOT，与目标 $ARCH 不符" >&2; exit 1; }

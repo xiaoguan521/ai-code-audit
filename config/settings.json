@@ -51,15 +51,17 @@
     "_说明": "enabled=true 时启动独立 Summary Agent；它只读取 audit.md/audit.json，不读取源码；未配置凭证、启动失败或输出无效时自动使用确定性摘要，不影响审查评分"
   },
   "agent": {
-    "type": "pi-docker",
-    "strategy": "dimensions",
-    "dimension_parallelism": 4,
-    "image": "ai-code-audit:1.0",
+    "type": "deepseek-harness",
+    "strategy": "single",
+    "launcher": "docker",
+    "image": "ghcr.io/xiaoguan521/ai-code-audit:main",
     "env_file": "/etc/ai-audit/model.env",
-    "network": "",
+    "network": "ai-audit-model-net",
+    "bin": "dsh",
+    "args": ["headless", "--json", "--permission-mode", "read-only", "--approval-policy", "never"],
     "memory": "6g",
     "cpus": 2,
     "max_session_turns": 300,
-    "_说明": "type 可选 pi-docker（内网 OpenAI 兼容模型）、claude 或 deepseek-harness；deepseek-harness 必须 strategy=single，由完整 Harness Agent Loop 自己拆分任务，并配置 launcher=docker、image、network；pi-docker 必须填 network，留空拒绝启动，确需默认网桥显式填 bridge。旧的 qwen-docker 名称保留兼容，应使用 Pi 扫描镜像"
+    "_说明": "默认使用 DeepSeek Harness；Harness 必须 strategy=single，由完整 Harness Agent Loop 自己拆分任务，不由 Runner 按维度拆分。Pi 可通过 AUDIT_AGENT_TYPE=pi-docker 回滚；旧的 qwen-docker 名称保留兼容"
   }
 }

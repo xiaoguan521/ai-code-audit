@@ -157,7 +157,7 @@ def audit_fingerprint(p: dict, settings: dict) -> str:
     env_file = ag.get("env_file")
     if env_file:
         try:
-            names = {"OPENAI_BASE_URL", "OPENAI_MODEL", "DEEPSEEK_MODEL", "DSH_HOME",
+            names = {"OPENAI_BASE_URL", "OPENAI_MODEL", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "DSH_HOME",
                      "PI_CONTEXT_WINDOW", "PI_MAX_OUTPUT_TOKENS", "PI_TEMPERATURE"}
             selected = {}
             for line in Path(env_file).read_text(encoding="utf-8").splitlines():
@@ -810,7 +810,7 @@ def call_pi_docker(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: 
     ]
     cmd += ["--network", ag["network"].strip()]
     if ag.get("env_file"):
-        cmd += ["--env-file", ag["env_file"]]      # OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL
+        cmd += ["--env-file", ag["env_file"]]      # Harness: DEEPSEEK_BASE_URL / DEEPSEEK_API_KEY / DEEPSEEK_MODEL
     cmd += [ag.get("image", "ai-code-audit:latest")]
     try:
         r = run(cmd, timeout=timeout)
