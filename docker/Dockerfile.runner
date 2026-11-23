@@ -1,7 +1,27 @@
 # 调度容器只负责拉取仓库、启动扫描容器和生成报告；Pi 镜像单独发布。
 FROM docker:27-cli
 
-RUN apk add --no-cache python3 git openssh-client ca-certificates tzdata \
+# 预扫描是 runner 的确定性主干，不再依赖运行机临时安装工具。版本固定，
+# 并在构建时验证命令可执行；gitleaks 使用官方发布包并校验 sha256。
+ARG TARGETARCH
+
+RUN apk add --no-cache \
+      python3 git openssh-client ca-certificates tzdata \
+      cloc py3-pip gcompat libstdc++ wget tar gzip \
+ && python3 -m pip install --no-cache-dir --disable-pip-version-check \
+      --break-system-packages \
+      "lizard==1.26.1" "semgrep==1.186.0" \
+ && case "${TARGETARCH}" in \
+      amd64) GITLEAKS_ARCH=x64; GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb ;; \
+      arm64) GITLEAKS_ARCH=arm64; GITLEAKS_SHA256=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080 ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && GITLEAKS_TARBALL="gitleaks_8.30.1_linux_${GITLEAKS_ARCH}.tar.gz" \
+ && wget -q -O "/tmp/${GITLEAKS_TARBALL}" \
+      "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/${GITLEAKS_TARBALL}" \
+ && printf '%s  /tmp/%s\n' "${GITLEAKS_SHA256}" "${GITLEAKS_TARBALL}" | sha256sum -c - \
+ && tar -xzf "/tmp/${GITLEAKS_TARBALL}" -C /usr/local/bin gitleaks \
+ && rm -f "/tmp/${GITLEAKS_TARBALL}" \
  && git config --system credential.useHttpPath true \
  && git config --system credential.helper /opt/ai-code-audit/docker/git-credential-readonly.sh
 
@@ -12,6 +32,12 @@ COPY skill/eight-quality-audit/SKILL.md skill/eight-quality-audit/SKILL.md
 COPY docker/compose_entrypoint.py docker/compose_entrypoint.py
 COPY docker/git-credential-readonly.sh docker/git-credential-readonly.sh
 RUN chmod 0555 docker/git-credential-readonly.sh
+
+# Keep the image contract explicit: these commands are consumed by runner/run_daily.py.
+RUN cloc --version \
+ && gitleaks version \
+ && semgrep --version \
+ && lizard --version
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 ENTRYPOINT ["python3", "/opt/ai-code-audit/docker/compose_entrypoint.py"]

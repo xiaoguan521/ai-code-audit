@@ -262,6 +262,8 @@ jobs:
             [ "$(docker image inspect -f '{{.Architecture}}' "$img")" = "$arch" ] || { echo "::error::$img 架构不是 $arch"; exit 1; }
             docker run --rm --network none --platform "linux/$arch" --entrypoint sh "$img" -c '
               python3 --version && git --version && docker --version && ssh -V 2>&1 &&
+              cloc --version >/dev/null && gitleaks version >/dev/null &&
+              semgrep --version >/dev/null && lizard --version >/dev/null &&
               test -x /opt/ai-code-audit/docker/git-credential-readonly.sh &&
               test "$(git config --system --get credential.useHttpPath)" = true &&
               test "$(git config --system --get credential.helper)" = /opt/ai-code-audit/docker/git-credential-readonly.sh &&

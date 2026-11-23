@@ -66,7 +66,7 @@ docker/PI_VERSION                    镜像内 Pi 版本（单一来源）
 
 项目清单中的 `project_id` 必须唯一，只能使用字母、数字、点、横线和下划线，不能以 `_` 开头或使用 `.`、`..`，以免与结果文件冲突或越出工作目录。
 
-代码地图仅根据 `git ls-files` 记录有界路径清单，不读取源码，候选路径不能代替审查；锁文件保留名称供依赖审查。预扫描状态区分成功、跳过、失败和无报告；`prescan_parallelism` 默认 1，可按机器负载调大，实际并发还会叠加项目并发。各工具尚未统一应用 `default_scope_out`，需配置其自身排除规则。Compose 默认调度镜像未预装这些可选工具，需自行安装到调度镜像；semgrep 还需要离线规则目录。固定合成样例的用法见 [`quality/README.md`](quality/README.md)。
+代码地图仅根据 `git ls-files` 记录有界路径清单，不读取源码，候选路径不能代替审查；锁文件保留名称供依赖审查。预扫描状态区分成功、跳过、失败和无报告；`prescan_parallelism` 默认 1，可按机器负载调大，实际并发还会叠加项目并发。发布的 Compose 调度镜像固定预装 cloc 2.02、gitleaks 8.30.1、semgrep 1.186.0 和 lizard 1.26.1，构建冒烟测试会检查四个命令；semgrep 仍需要 `semgrep_rules_dir` 指向随部署提供的离线规则目录，否则会明确跳过（不会联网拉规则）。如自建调度镜像，请保留同样的版本和命令检查。固定合成样例的用法见 [`quality/README.md`](quality/README.md)。
 
 ## 纯内网部署：Pi + Docker（推荐）
 
@@ -139,7 +139,7 @@ Compose 会创建 `AUDIT_MODEL_NETWORK` 指定的 Docker 网络。该网络本�
 2. **模型凭据**：设置 `ANTHROPIC_API_KEY`（Claude Console 创建，单独一个工作区便于计费与限额），或按公司要求改用 Amazon Bedrock / Google Vertex / 公司模型网关（Claude Code 支持对应环境变量）。凭据放在运行账号的环境文件中，权限 600。
 3. **代码访问**：为扫描账号在 GitLab/GitHub 开只读权限（Reporter / read_repository 级别的 deploy token 或 deploy key），预先配置在运行机的 git 凭据中；脚本只做 clone/fetch，不推送。
 4. **网络**：运行机出站只放行 Git 服务器与模型 API 域名。
-5. **可选预扫描工具**：cloc、gitleaks、lizard 装上即自动使用；semgrep 需在 settings.json 配置离线规则目录 `semgrep_rules_dir`，否则跳过（避免联网拉规则）。
+5. **预扫描工具**：发布的调度镜像已预装 cloc、gitleaks、semgrep、lizard；semgrep 需在 settings.json 配置离线规则目录 `semgrep_rules_dir`，否则跳过（避免联网拉规则）。如需完全关闭预扫描，可将 `prescan_tools` 设为空数组。
 6. **配置**：编辑 `config/settings.json` 的 `workdir`、`output_dir`，导入 `config/projects.csv`。
 7. **试跑**：`python3 runner/run_daily.py --dry-run` 看计划，再 `python3 runner/run_daily.py --only <一个项目ID> --force-full` 试扫一个项目，人工核对报告证据。
 8. **定时**：crontab（运行账号）：
