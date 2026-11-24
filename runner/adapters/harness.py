@@ -153,7 +153,7 @@ def _sanitize(event: dict) -> dict:
     """Keep event telemetry while excluding prompts, source, and tool output."""
     result = {}
     for key in ("type", "event", "turn", "duration_ms", "durationMs", "tool_name", "toolName",
-                "session_id", "sessionId"):
+                "tool", "callId", "status", "session_id", "sessionId"):
         value = event.get(key)
         if isinstance(value, (str, int, float, bool)):
             result[key] = value
@@ -173,6 +173,8 @@ def _stats(events: list[dict]) -> dict:
     tools = {}
     for event in events:
         name = event.get("tool_name") or event.get("toolName")
+        if not name and event.get("type") == "tool_call":
+            name = event.get("tool")
         if isinstance(name, str):
             tools[name] = tools.get(name, 0) + 1
     return {
@@ -181,6 +183,35 @@ def _stats(events: list[dict]) -> dict:
         "tool_calls_by_name": tools,
         "final_events": sum(1 for event in events if _is_final(event)),
     }
+
+
+def _configured_model(agent: dict, launcher: str, env: dict) -> str | None:
+    """读取实际传给扫描容器的模型名；不读取、记录或散列 API Key。"""
+    names = {"OPENAI_BASE_URL", "OPENAI_MODEL"}
+    selected = {}
+    if launcher == "local":
+        selected.update({key: env[key] for key in names if key in env})
+    elif agent.get("env_file"):
+        try:
+            with open(agent["env_file"], encoding="utf-8") as source:
+                for line in source:
+                    line = line.strip("\r\n").lstrip()
+                    if not line or line.startswith("#"):
+                        continue
+                    key, separator, value = line.partition("=")
+                    if key in names:
+                        if separator:
+                            selected[key] = value
+                        elif key in env:
+                            selected[key] = env[key]
+        except (OSError, UnicodeError):
+            pass  # Docker 会报告缺失或无法读取的 env 文件。
+    configured = agent.get("env")
+    if isinstance(configured, dict):
+        selected.update({key: str(value) for key, value in configured.items() if key in names})
+    if selected.get("OPENAI_BASE_URL") and selected.get("OPENAI_MODEL"):
+        return selected["OPENAI_MODEL"]
+    return agent.get("model") or None
 
 
 def run(prompt: str, repo, ctx, settings: dict, timeout: int) -> dict:
@@ -250,7 +281,7 @@ def run(prompt: str, repo, ctx, settings: dict, timeout: int) -> dict:
     if not answer:
         raise HarnessError("Harness 最终事件没有 Markdown 答案", "failed", stats)
     session_id = final.get("session_id") or final.get("sessionId")
-    model = agent.get("model") or env.get("DEEPSEEK_MODEL") or env.get("OPENAI_MODEL")
+    model = _configured_model(agent, launcher, env)
     return {
         "raw_text": answer,
         "event_log": [_sanitize(event) for event in events],

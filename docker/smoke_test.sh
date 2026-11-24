@@ -7,23 +7,26 @@ ENVF="${2:-/etc/ai-audit/model.env}"
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/repo" "$T/ctx"
-printf '%s\n' 'print("hello")' > "$T/repo/a.py"
-printf '%s\n' '请读取 a.py，并使用 eight-quality-code-audit Skill 完成一次最小八性审查；按系统提示输出完整 Markdown 结果。' > "$T/ctx/prompt.md"
+printf '%s\n' 'print("HARNESS_SMOKE_READ_OK")' > "$T/repo/a.py"
 chmod -R a+rX "$T"
 docker run --rm --network "$AUDIT_MODEL_NETWORK" --read-only \
   --tmpfs /tmp:rw,size=512m \
   --env-file "$ENVF" -v "$T/repo:/workspace/repo:ro" -v "$T/ctx:/workspace/context:ro" \
-  "$IMG" dsh headless --permission-mode read-only --approval-policy never --json - < "$T/ctx/prompt.md" > "$T/events.jsonl"
+  -w /workspace/repo "$IMG" dsh headless --permission-mode read-only --approval-policy never --json \
+  '请调用 read 工具读取 a.py，并根据文件内容给出简短回答。' > "$T/events.jsonl"
 docker run --rm --network none -i --entrypoint node "$IMG" -e '
   let s=""; process.stdin.setEncoding("utf8"); process.stdin.on("data", c => s += c);
   process.stdin.on("end", () => {
     const events = s.trim().split(/\n+/).filter(Boolean).map(line => JSON.parse(line));
     const final = events.at(-1);
-    if (events[0]?.type !== "session" || final?.type !== "final" ||
+    const reads = events.filter(e => e.type === "tool_call" && e.tool === "read");
+    const readSucceeded = reads.some(call => events.some(e => e.type === "tool_result" &&
+      e.callId === call.callId && e.status === "completed" && e.result?.includes("HARNESS_SMOKE_READ_OK")));
+    if (events[0]?.type !== "session" || final?.type !== "final" || !readSucceeded ||
         final?.reason?.kind !== "completed" || typeof final?.text !== "string" || !final.text.trim()) {
-      console.error(JSON.stringify({ first: events[0], final }));
+      console.error("Harness 未完成读取工具调用或未正常结束，请检查模型服务和工具调用配置。");
       process.exitCode = 1;
     }
   });
 ' < "$T/events.jsonl"
-echo "通过：DeepSeek Harness headless Agent 已完成真实模型调用并返回 final 事件；请在正式试扫中检查 64 项输出。"
+echo "通过：DeepSeek Harness 已使用模型调用 read 工具并正常结束；请在正式试扫中检查 64 项输出。"

@@ -154,11 +154,12 @@ def audit_fingerprint(p: dict, settings: dict) -> str:
         "audit_revision": settings.get("audit_revision", ""),
     }
     # 仅读取影响推理口径的非敏感配置；密钥轮换不应触发全量扫描。
+    names = {"OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_CONTEXT_WINDOW", "OPENAI_MAX_OUTPUT_TOKENS",
+             "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "DSH_HOME", "PI_CONTEXT_WINDOW",
+             "PI_MAX_OUTPUT_TOKENS", "PI_TEMPERATURE"}
     env_file = ag.get("env_file")
     if env_file:
         try:
-            names = {"OPENAI_BASE_URL", "OPENAI_MODEL", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "DSH_HOME",
-                     "PI_CONTEXT_WINDOW", "PI_MAX_OUTPUT_TOKENS", "PI_TEMPERATURE"}
             selected = {}
             for line in Path(env_file).read_text(encoding="utf-8").splitlines():
                 key, sep, value = line.strip().partition("=")
@@ -167,6 +168,11 @@ def audit_fingerprint(p: dict, settings: dict) -> str:
             inputs["model_configuration"] = selected
         except (OSError, UnicodeError):
             inputs["model_configuration"] = "unavailable"
+    configured_env = ag.get("env")
+    if isinstance(configured_env, dict):
+        inputs["agent_environment"] = {key: str(value) for key, value in configured_env.items() if key in names}
+    if ag.get("launcher") == "local":
+        inputs["local_environment"] = {key: os.environ[key] for key in names if key in os.environ}
     h = hashlib.sha256(json.dumps(inputs, sort_keys=True, ensure_ascii=False).encode("utf-8"))
     for file in (SKILL_FILE, SCHEMA_FILE, ROOT / "config" / "checklist.json",
                  ROOT / "runner" / "evidence.py", ROOT / "runner" / "code_map.py", ROOT / "runner" / "scoring.py",
@@ -810,7 +816,7 @@ def call_pi_docker(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: 
     ]
     cmd += ["--network", ag["network"].strip()]
     if ag.get("env_file"):
-        cmd += ["--env-file", ag["env_file"]]      # Harness: DEEPSEEK_BASE_URL / DEEPSEEK_API_KEY / DEEPSEEK_MODEL
+        cmd += ["--env-file", ag["env_file"]]      # 模型地址、模型名和凭据由 env 文件传入容器
     cmd += [ag.get("image", "ai-code-audit:latest")]
     try:
         r = run(cmd, timeout=timeout)

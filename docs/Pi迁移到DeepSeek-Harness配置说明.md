@@ -2,6 +2,8 @@
 
 本文用于把原来的 **Pi + JSON + Runner 分维度调度** 配置，迁移到现在的 **DeepSeek Harness Headless + Markdown + 程序校验** 配置。
 
+最新的镜像标签、两种部署目录、模型选择限制和验收命令见[新镜像配置与迁移说明](DeepSeek-Harness新镜像配置与迁移说明.md)。
+
 适用场景：本仓库的默认扫描镜像已经改为官方 DeepSeek Harness，内网使用 Docker Compose 批量扫描。
 
 ## 0. 先区分两个镜像
@@ -13,7 +15,7 @@
 | Runner 镜像 | 拉取 Git、调度任务、启动扫描容器、解析 Markdown、校验证据、评分和生成报表 | 必须使用包含 Harness Adapter 的新版本 |
 | Scanner 扫描镜像 | 真正运行 `dsh headless`，执行代码审查 | 必须是包含 `dsh`、八性 Skill 和 Profile 的 Harness 镜像 |
 
-本仓库的 `docker/Dockerfile` 现在直接安装官方 `@deepseek-ai/dsh`，并把八性 Skill 放到 Harness 的 `DSH_BUNDLED_SKILL_DIR`。`docker/Dockerfile.pi` 仅作为回滚镜像保留。推送到 GitHub 后由 `.github/workflows/build-image.yml` 构建 amd64/arm64 镜像；内网只需把发布的扫描镜像同步到 Harbor。
+本仓库的 `docker/Dockerfile` 现在直接安装官方 `@deepseek-ai/dsh`，并把八性 Skill 放到 Harness 的 `DSH_BUNDLED_SKILL_DIR`。`docker/Dockerfile.pi` 仅作为回滚镜像保留。推送到 GitHub 后由 `.github/workflows/build-image.yml` 构建 amd64/arm64 镜像；内网需要同步扫描和调度两个新镜像到 Harbor。
 
 在内网导入或同步后，先用下面的命令确认扫描镜像确实是 DeepSeek Harness：
 
@@ -98,17 +100,17 @@ Harness 模式下，Summary Agent 默认复用扫描镜像、网络和模型环�
 
 ## 四、`model.env` 是否需要修改
 
-先保留原来的模型环境文件，并确认其中的变量符合 Harness 镜像内 Profile 的要求。
-
-官方 DeepSeek Harness 默认使用 Messages API，建议改成：
+接入自部署 OpenAI 兼容模型时，原 Pi 环境文件中的地址、模型名和密钥可以沿用，确认模型 ID 与服务实际暴露的 ID 一致，并按服务限制设置令牌数：
 
 ```dotenv
-DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic
-DEEPSEEK_MODEL=deepseek-flash
-DEEPSEEK_API_KEY=<实际密钥>
+OPENAI_BASE_URL=http://模型服务地址:8000/v1
+OPENAI_MODEL=服务实际提供的模型ID
+OPENAI_API_KEY=<实际密钥或EMPTY>
+OPENAI_CONTEXT_WINDOW=131072
+OPENAI_MAX_OUTPUT_TOKENS=8192
 ```
 
-如果内网网关只提供兼容接口，必须确认它兼容 Harness 所需的 Messages 协议，再把 `DEEPSEEK_BASE_URL` 指向该网关。Pi 回滚链路才使用 `OPENAI_BASE_URL`、`OPENAI_MODEL` 和 `OPENAI_API_KEY`。不要把密钥写入 `.env`、`projects.csv` 或 Git URL；`model.env` 保持 `600` 权限。
+扫描镜像会自动启用 OpenAI 兼容模型路由；模型服务必须支持流式输出和工具调用。若改用 DeepSeek 官方 Messages API，则注释 `OPENAI_*`，改填 `DEEPSEEK_BASE_URL` 与 `DEEPSEEK_API_KEY`。当前官方默认模型为 `deepseek-flash`，仅设置 `DEEPSEEK_MODEL` 不能保证切换模型。不要把密钥写入 `.env`、`projects.csv` 或 Git URL；`model.env` 保持 `600` 权限。
 
 ```bash
 chmod 600 model.env

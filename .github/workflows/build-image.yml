@@ -196,6 +196,12 @@ jobs:
               "$img" --help | grep -q -- '--dry-run'
           done
 
+      - name: 验证两个镜像与 OpenAI 兼容模型的 Harness 工具调用
+        run: |
+          for arch in amd64 arm64; do
+            python3 tests/harness_openai_smoke.py "ai-code-audit:ci-$arch" "ai-code-audit-runner:ci-$arch"
+          done
+
       - name: 推送扫描镜像
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6

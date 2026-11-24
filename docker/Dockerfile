@@ -17,7 +17,9 @@ RUN apt-get update \
 
 COPY skill/eight-quality-audit/ /opt/audit/skills/eight-quality-code-audit/
 COPY config/result.schema.json /opt/audit/result.schema.json
-RUN chmod -R a+rX /opt/audit
+COPY docker/dsh.sh /opt/audit/bin/dsh
+COPY docker/openai-model.patch.yml /opt/audit/openai-model.patch.yml
+RUN chmod -R a+rX /opt/audit && chmod 0555 /opt/audit/bin/dsh
 
 USER node
 # 扫描容器的 /tmp 为 noexec；原生加载器须直接从镜像加载预编译库。

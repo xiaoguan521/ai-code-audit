@@ -1,0 +1,23 @@
+# 只配置 Harness 模型路由和默认模型，不改变 Agent、工具或权限。
+# 环境变量只作为表达式的值读取，不将密钥写入配置或命令行。
+- id: llm-pi-ai
+  config:
+    providers:
+      audit-openai:
+        displayName: Self-hosted OpenAI-compatible
+        api: openai-completions
+        baseURL: !!js process.env.OPENAI_BASE_URL
+        apiKeyEnv: OPENAI_API_KEY
+        compat:
+          supportsStore: false
+          supportsDeveloperRole: false
+          maxTokensField: max_tokens
+        models:
+          - id: !!js process.env.OPENAI_MODEL
+            contextWindow: !!js Number(process.env.OPENAI_CONTEXT_WINDOW || '131072')
+            maxTokens: !!js Number(process.env.OPENAI_MAX_OUTPUT_TOKENS || '8192')
+
+- id: agent-default-model
+  config:
+    provider: audit-openai
+    model: !!js process.env.OPENAI_MODEL

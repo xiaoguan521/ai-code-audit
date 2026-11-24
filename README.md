@@ -91,12 +91,12 @@ run_daily.py ──git fetch（只读凭据，只在宿主机）     DeepSeek Ha
 
 1. **构建镜像（推荐由 GitHub Actions 完成）**：推送到 `main` 或版本 tag 后，工作流会构建并发布内置官方 `@deepseek-ai/dsh` 的 amd64/arm64 Harness 扫描镜像和 Runner 镜像。若必须手工构建，在能上网的构建机执行 `sh docker/build.sh 1.0`；覆盖 Harness 版本可设置 `DSH_VERSION`。给 ARM 服务器构建加 `PLATFORM=linux/arm64`，反之加 `PLATFORM=linux/amd64`。如需从内网镜像仓库拉基础镜像，加 `BASE_IMAGE=harbor.xxx/library/node:24.22.3-bookworm-slim`（Node.js 须满足 Harness 版本要求，镜像须包含目标架构）。纯内网优先导入 GitHub Release 的离线镜像包。
 2. **导入内网**：`sha256sum -c ai-code-audit_1.0_amd64.tar.gz.sha256 && docker load < ai-code-audit_1.0_amd64.tar.gz`（ARM 运行机换成 `_arm64`）。
-3. **配置模型地址**：`cp docker/model.env.example /etc/ai-audit/model.env && chmod 600 /etc/ai-audit/model.env`，填 Harness 使用的 `DEEPSEEK_BASE_URL`（可选）、`DEEPSEEK_MODEL` 和 `DEEPSEEK_API_KEY`。
+3. **配置模型地址**：`cp docker/model.env.example /etc/ai-audit/model.env && chmod 600 /etc/ai-audit/model.env`，填写自部署模型的 `OPENAI_BASE_URL`、`OPENAI_MODEL` 和 `OPENAI_API_KEY`。
 4. **网络隔离（必填）**：建一个专用 Docker 网络（如 `docker network create --subnet 172.30.0.0/24 ai-audit-net`），在宿主机防火墙上只放行该网段到千问服务的地址和端口，填到 settings.json 的 `agent.network`。被审查的代码是不可信输入，`agent.network` 留空时 runner 拒绝启动（`--dry-run` 只告警）；确需使用 Docker 默认网桥（可访问任意外网），须显式填写 `"bridge"`。
-5. **冒烟测试**：`AUDIT_MODEL_NETWORK=ai-audit-net sh docker/smoke_test.sh ai-code-audit:1.0 /etc/ai-audit/model.env`，确认 DeepSeek Harness headless 能连接模型并返回 `final.reason.kind=completed` 的事件流。
+5. **冒烟测试**：按[新镜像配置与迁移说明](docs/DeepSeek-Harness新镜像配置与迁移说明.md)中的模型连接验证命令，确认 DeepSeek Harness headless 能连接模型并返回 `final.reason.kind=completed` 的事件流。宿主机运行时将命令中的 `model.env` 换成 `/etc/ai-audit/model.env`。
 6. **试扫一个项目**：`python3 runner/run_daily.py --only <项目ID> --force-full`，人工核对报告证据；再按下面第 8 步配置定时任务。
 
-模型说明：Harness 默认使用 DeepSeek Messages 接口，`model.env` 使用 `DEEPSEEK_API_KEY`、可选 `DEEPSEEK_BASE_URL` 和 `DEEPSEEK_MODEL`；内网网关必须兼容 Harness 所需的 Messages 协议。Pi 回滚镜像仍使用 `OPENAI_BASE_URL`、`OPENAI_MODEL` 和 `OPENAI_API_KEY`，详见 `docker/model.env.example`。
+模型说明：自部署千问等模型可通过 OpenAI Chat Completions 兼容接口接入，填写 `OPENAI_BASE_URL`、`OPENAI_MODEL` 和 `OPENAI_API_KEY`，服务还须支持流式输出和工具调用。Harness 自动启用内置的模型路由配置。未配置 OpenAI 模型时，可使用 DeepSeek Messages 接口和 `DEEPSEEK_API_KEY`；官方默认模型是 `deepseek-flash`，`DEEPSEEK_MODEL` 不能保证切换模型。详见 [新镜像配置与迁移说明](docs/DeepSeek-Harness新镜像配置与迁移说明.md)。
 
 ## DeepSeek Harness Headless + Docker
 
@@ -121,7 +121,7 @@ deepseek-harness 后端只启动一个完整的 Headless Agent 任务。Runner �
 
 Harness 的 `--json` 是运行事件流，不是要求模型输出 JSON。Adapter 默认把顶层任务作为 argv 传给 `dsh`，并强制使用只读权限和 `--approval-policy never`；如某个固定版本只从 stdin 读取，可配置 `prompt_mode: "stdin"`。Adapter 只从最终事件提取 Markdown；退出码为 0 但缺少 `final.reason.kind`、最终状态失败或 Markdown 不完整时，审查仍标记为 unverified，不进入评分。若需要调整事件成功状态，可配置 `success_reason_kinds`，但不要修改 Harness 的内部任务流程。
 
-从旧 Pi 配置迁移到 Harness 的逐步操作见[迁移配置说明](docs/Pi迁移到DeepSeek-Harness配置说明.md)。
+从旧 Pi 配置迁移到 Harness 的逐步操作见[新镜像配置与迁移说明](docs/DeepSeek-Harness新镜像配置与迁移说明.md)。
 
 ### 独立 AI 综合总结
 
@@ -144,13 +144,15 @@ Compose 默认指向本仓库发布的 DeepSeek Harness 扫描镜像，`AUDIT_AG
    chmod 600 model.env secrets/git-credentials
    ```
 2. 编辑 `config/projects.local.csv`：每行填写一个 `git_url` 和 `branch`。示例包含两个仓库，其中一个扫描 `main` 和 `develop` 两个分支；每一行的 `project_id` 必须唯一，`status` 为 `在研` 才会被扫描。不要把令牌或密码写进仓库 URL，因为 URL 会进入扫描结果。更换项目的仓库地址时请使用新的 `project_id`，以免复用旧仓库的本地副本。
-3. 编辑 `model.env`，填入能从扫描容器访问到的 OpenAI 兼容服务地址、模型名和 API Key：
+3. 编辑 `model.env`，填入能从扫描容器访问到的自部署模型地址、模型名和密钥：
    ```text
-   DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic
-   DEEPSEEK_MODEL=deepseek-flash
-   DEEPSEEK_API_KEY=替换为实际密钥
+   OPENAI_BASE_URL=http://模型服务地址:8000/v1
+   OPENAI_MODEL=服务实际提供的模型ID
+   OPENAI_API_KEY=替换为实际密钥
+   OPENAI_CONTEXT_WINDOW=131072
+   OPENAI_MAX_OUTPUT_TOKENS=8192
    ```
-   此文件按 Docker `--env-file` 格式填写，值直接写在等号后，不要额外加引号。容器中的 `127.0.0.1` 指向容器自身；模型部署在其他机器或宿主机时应填写容器能够访问的实际地址。
+   地址只填写到 `/v1`；模型名要与服务暴露的 ID 完全一致，两个令牌限制按服务实际能力设置。无需鉴权时可填 `OPENAI_API_KEY=EMPTY`。此文件按 Docker `--env-file` 格式填写，值直接写在等号后，不要额外加引号。容器中的 `127.0.0.1` 指向容器自身；模型部署在其他机器或宿主机时应填写容器能够访问的实际地址。
 4. 配置私有 Git 仓库的只读凭据，任选一种方式：
    - **HTTPS 用户名与密码 / 访问令牌**：编辑 `secrets/git-credentials`，每个仓库一行，如 `https://用户名:令牌@git.example.com/trade/order-service.git`。地址路径须与项目清单里的 HTTPS 仓库地址一致；同一仓库的不同分支共用一行。用户名或令牌中的 `@`、`:`、`/`、`%` 等特殊字符须先做 URL 编码。Git 服务要求访问令牌时填写只读令牌。
    - **SSH deploy key**：将私钥及经过验证的 `known_hosts` 放到 `secrets/ssh/`，私钥权限设为 `600`，并将对应项目的 `git_url` 改为 SSH 地址。多个 Git 服务器可在该目录放 `config`，为各主机指定不同的 `IdentityFile`。

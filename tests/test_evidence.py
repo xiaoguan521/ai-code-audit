@@ -136,6 +136,14 @@ class TrustBoundaryTest(unittest.TestCase):
         self.assertEqual(first, run_daily.audit_fingerprint(self.project, settings))
         env.write_text("OPENAI_MODEL=second\nOPENAI_API_KEY=new\n", encoding="utf-8")
         self.assertNotEqual(first, run_daily.audit_fingerprint(self.project, settings))
+        env.write_text("OPENAI_MODEL=first\nOPENAI_CONTEXT_WINDOW=65536\n", encoding="utf-8")
+        self.assertNotEqual(first, run_daily.audit_fingerprint(self.project, settings))
+        env.write_text("OPENAI_MODEL=first\nOPENAI_API_KEY=old\n", encoding="utf-8")
+        settings["agent"]["env"] = {"OPENAI_MODEL": "override", "OPENAI_API_KEY": "new"}
+        self.assertNotEqual(first, run_daily.audit_fingerprint(self.project, settings))
+        changed = run_daily.audit_fingerprint(self.project, settings)
+        settings["agent"]["env"]["OPENAI_API_KEY"] = "rotated"
+        self.assertEqual(changed, run_daily.audit_fingerprint(self.project, settings))
 
     def test_new_commit_with_identical_files_reuses_and_records_new_commit(self):
         output = {"result": valid_result(), "cost_usd": None, "session_id": "s"}

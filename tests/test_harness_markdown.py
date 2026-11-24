@@ -122,6 +122,14 @@ class HarnessAdapterTest(unittest.TestCase):
             }, 30)
         self.assertEqual(result["raw_text"], "ok")
 
+    def test_counts_official_harness_tool_events_without_tool_output(self):
+        events = [{"type": "tool_call", "tool": "read", "callId": "1", "input": {"file_path": "a.py"}},
+                  {"type": "tool_result", "callId": "1", "status": "completed", "result": "source code"}]
+        self.assertEqual(harness._stats(events)["tool_calls_by_name"], {"read": 1})
+        self.assertEqual(harness._sanitize(events[0])["tool"], "read")
+        self.assertNotIn("input", harness._sanitize(events[0]))
+        self.assertNotIn("result", harness._sanitize(events[1]))
+
     def test_supports_stdin_prompt_for_older_cli_variants(self):
         completed = subprocess.CompletedProcess(
             [], 0, stdout=json.dumps({"type": "final", "reason": {"kind": "completed"}, "answer": "ok"}), stderr=""
@@ -166,6 +174,33 @@ class HarnessAdapterTest(unittest.TestCase):
         self.assertEqual(command[image_index + 1:-1], ["dsh", "headless", "--json",
                                                         "--permission-mode", "read-only"])
         self.assertEqual(command[-1], "p")
+
+    def test_records_model_from_container_environment_without_recording_key(self):
+        with tempfile.TemporaryDirectory() as temp:
+            env_file = Path(temp) / "model.env"
+            env_file.write_text("OPENAI_BASE_URL=http://model:8000/v1\n"
+                                "OPENAI_MODEL=Qwen/Qwen3-8B\nOPENAI_API_KEY=private-value\n",
+                                encoding="utf-8")
+            completed = subprocess.CompletedProcess(
+                [], 0, stdout=json.dumps({"type": "final", "reason": {"kind": "completed"}, "text": "ok"}),
+                stderr="",
+            )
+            with mock.patch.object(harness.subprocess, "run", return_value=completed):
+                result = harness.run("p", Path("/repo"), Path("/ctx"), {
+                    "agent": {"launcher": "docker", "image": "harness:test", "network": "model-net",
+                              "env_file": str(env_file)},
+                }, 30)
+            self.assertEqual(result["agent_model"], "Qwen/Qwen3-8B")
+            self.assertNotIn("private-value", json.dumps(result))
+
+    def test_container_environment_overrides_model_env_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            env_file = Path(temp) / "model.env"
+            env_file.write_text("OPENAI_BASE_URL=http://model/v1\nOPENAI_MODEL=old\n", encoding="utf-8")
+            self.assertEqual(harness._configured_model({"env_file": str(env_file), "env": {
+                "OPENAI_MODEL": "new", "OPENAI_API_KEY": "secret"}}, "docker", {}), "new")
+            self.assertIsNone(harness._configured_model({}, "docker", {
+                "OPENAI_BASE_URL": "http://not-passed/v1", "OPENAI_MODEL": "not-passed"}))
 
 
 class IntegrationContractTest(unittest.TestCase):
