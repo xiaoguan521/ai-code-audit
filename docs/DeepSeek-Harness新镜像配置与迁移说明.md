@@ -48,6 +48,7 @@ AUDIT_MAX_PARALLEL=2
 AUDIT_MAX_MODEL_CONCURRENCY=2
 AUDIT_PER_PROJECT_TIMEOUT_SEC=3600
 AUDIT_FAST_MODE=false
+AUDIT_SNAPSHOT_AT=
 AUDIT_SUMMARY_ENABLED=true
 AUDIT_SEMGREP_RULES_DIR=
 ```
@@ -57,6 +58,8 @@ AUDIT_SEMGREP_RULES_DIR=
 `AUDIT_PER_PROJECT_TIMEOUT_SEC` 默认为 3600 秒，只限制 Harness 进程运行时间，不包含预扫描或等待模型名额。超时会结束该进程，不会自动保留未输出的完整报告；可以按仓库规模和模型服务速度调整，改动只影响之后启动的任务。
 
 `AUDIT_FAST_MODE=true` 可让每天的任务默认使用快速巡检：输出 64 项结果、分数和整改建议，但不生成逐项证据、文件路径行号或代码片段；大型仓库可抽查非核心模块，无法判断的项标为 NEED_INFO。默认 `false` 是标准审查。两种模式均由 Harness 自主规划；快速模式减少证据整理和复核，完成时间仍取决于实际仓库和模型吞吐。
+
+`AUDIT_SNAPSHOT_AT` 可固定本批次使用的 Git 快照时间，例如 `2026-11-24T00:00:00+08:00`。Runner 会在所有项目之间串行执行 Git 拉取，并在每个项目的目标分支上选择该时间点之前最近的 first-parent 提交；完成后仍按 `AUDIT_MAX_PARALLEL` 并行启动 Harness 审查。留空时使用本批次启动时间，实际时间会写入 `_run.json`、项目状态和审查提示。建议每日任务显式设置时间，保证不同项目使用同一批次口径。
 
 已有 `.env` 如果包含 `AUDIT_SUMMARY_ENABLED=false`，升级后要改为 `true` 才会启动 AI 汇总；关闭时只生成项目报告索引。汇总会话默认复用扫描镜像、网络和模型凭据，仍为独立会话。
 
@@ -99,6 +102,10 @@ docker compose run --rm --pull never -T audit --only project-a project-b
 # 快速巡检全部在研项目
 docker compose run --rm --pull never -T audit --fast
 
+# 固定时间点扫描：各项目按该时间点的分支代码，Harness 审查仍可并发
+docker compose run --rm --pull never -T audit \
+  --snapshot-at 2026-11-24T00:00:00+08:00 --fast
+
 # 环境变量默认开启快速模式时，此次切回标准模式
 docker compose run --rm --pull never -T audit --no-fast --only project-a
 
@@ -110,6 +117,8 @@ docker compose run --rm --pull never -T audit --only project-a project-b --summa
 ```
 
 正常扫描会向 Harness 提供可用的上次 Markdown 和 Git 变更作为参考，由 Harness 自主决定需要复核的内容；仍须交付覆盖 64 项的完整新报告。`--force-full` 不提供历史报告。旧版本仅有 JSON 结果时不会被当成新 Markdown 自动沿用，第一次扫描会直接审查。
+
+Git 拉取阶段使用共享锁，多个项目不会同时向 Git 服务拉取更新。快照时间按提交的 committer 时间和 first-parent 历史确定；如果目标分支在指定时间之前没有可用提交，项目会失败，不会回退到当前分支头。
 
 日志显示运行编号和结果路径：
 

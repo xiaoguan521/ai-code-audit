@@ -60,6 +60,9 @@ def configure_settings(settings: dict, env: dict) -> dict:
     if not isinstance(fast_mode, bool):
         raise ValueError("fast_mode 必须是 true/false")
     settings["fast_mode"] = _env_bool(env, "AUDIT_FAST_MODE", fast_mode)
+    snapshot_at = env.get("AUDIT_SNAPSHOT_AT", "").strip()
+    if snapshot_at:
+        settings["snapshot_at"] = snapshot_at
     semgrep_rules = env.get("AUDIT_SEMGREP_RULES_DIR", "").strip()
     if semgrep_rules:
         if not Path(semgrep_rules).is_absolute():

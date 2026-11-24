@@ -6,6 +6,7 @@
   "max_model_concurrency": 2,
   "per_project_timeout_sec": 3600,
   "fast_mode": false,
+  "snapshot_at": "",
   "clone_depth": 200,
   "default_scope_out": [
     "vendor/",

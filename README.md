@@ -36,6 +36,8 @@ docker compose run --rm --pull never -T audit --only project-a project-b --summa
 
 要让每天的批量任务默认使用快速模式，可在 `.env` 设置 `AUDIT_FAST_MODE=true`；运行命令时加 `--no-fast` 可临时切回标准模式。默认值为 `false`，也可只在需要时添加 `--fast`。模式只影响新启动的项目扫描。
 
+批量扫描可用 `--snapshot-at 2026-11-24T00:00:00+08:00` 固定 Git 代码时间点；Runner 会串行拉取各项目并选择目标分支该时间点之前最近的提交，全部项目的 Harness 审查仍按并发配置运行。未指定时使用本批次启动时间，也可以在 `.env` 设置 `AUDIT_SNAPSHOT_AT`。
+
 不同项目可通过多条命令同时扫描；同一项目的并发任务会互斥。`AUDIT_MAX_PARALLEL` 控制每个 Runner 批次的项目数；共享数据目录的所有 Runner 使用 `AUDIT_MAX_MODEL_CONCURRENCY` 限制并发模型会话，请保持这些 Runner 的配置一致。模型服务承载能力不足时，应降低并发。
 
 扫描时日志显示预扫描、等待模型名额、Harness 步骤以及每步耗时和可用的 Token 数；步骤数不是完成百分比。`AUDIT_PER_PROJECT_TIMEOUT_SEC` 默认 3600 秒，只计一次 Harness 进程运行，不包含预扫描或排队；可按实际需求调整，修改只对新任务生效。项目级会话并发上限不限制 Harness 自行创建的子代理请求，模型服务的实际并发能力也会影响耗时。

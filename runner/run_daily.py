@@ -35,6 +35,7 @@ from adapters import harness as harness_adapter  # noqa: E402
 from adapters import summary as summary_adapter  # noqa: E402
 
 TZ = dt.timezone(dt.timedelta(hours=8))
+SNAPSHOT_METHOD = "first-parent-committer-time"
 
 
 def now() -> dt.datetime:
@@ -72,22 +73,94 @@ def git_env() -> dict:
     return env
 
 
-def sync_repo(p: dict, repo: Path, depth: int) -> str:
-    """维护一份扫描专用的本地副本（只拉取，不推送）。凭据由运行机上的只读 deploy key / token 提供。"""
+def parse_snapshot_at(value: str | None, fallback: dt.datetime | None = None) -> dt.datetime:
+    """解析批次 Git 快照时间；无时区的输入按 Asia/Shanghai 解释。"""
+    raw = str(value or "").strip()
+    if not raw:
+        result = fallback or now()
+    else:
+        try:
+            result = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("snapshot_at 必须是 ISO-8601 时间，例如 2026-11-24T00:00:00+08:00") from exc
+        if result.tzinfo is None:
+            result = result.replace(tzinfo=TZ)
+    return result.astimezone(TZ)
+
+
+def snapshot_text(value: dt.datetime) -> str:
+    return value.astimezone(TZ).isoformat(timespec="seconds")
+
+
+@contextmanager
+def git_sync_lock(settings: dict):
+    """Serialize Git network updates across all projects and Runner processes."""
+    root = Path(settings["workdir"])
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / ".git-sync.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _snapshot_commit(repo: Path, branch: str, ref: str, snapshot_at: dt.datetime,
+                     depth: int, env: dict) -> str:
+    """Find the branch's first-parent tip at or before the fixed cutoff.
+
+    A shallow clone is deepened only when its history does not reach the cutoff.
+    The first-parent walk prevents a merge that happened after the cutoff from
+    making an old side-branch commit appear to have been on the branch earlier.
+    """
+    git_date = snapshot_at.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S %z")
+    current_ref = ref
+    step = max(1, int(depth))
+    for _ in range(32):
+        result = run(["git", "rev-list", "--first-parent", "--max-count=1",
+                      f"--before={git_date}", current_ref], cwd=repo)
+        if result.returncode:
+            raise RuntimeError(f"无法按时间解析分支 {branch}：{result.stderr.strip()[-500:]}")
+        commit = result.stdout.strip()
+        if commit:
+            return commit
+        shallow = run(["git", "rev-parse", "--is-shallow-repository"], cwd=repo)
+        if shallow.returncode or shallow.stdout.strip().lower() != "true":
+            break
+        result = run(["git", "fetch", "--no-tags", "--deepen", str(step), "origin", branch],
+                     cwd=repo, timeout=1800, env=env)
+        if result.returncode:
+            raise RuntimeError(f"为查找 {snapshot_text(snapshot_at)} 加深分支历史失败：{result.stderr.strip()[-500:]}")
+        current_ref = "FETCH_HEAD"
+    raise RuntimeError(f"分支 {branch} 在 {snapshot_text(snapshot_at)} 之前没有可用提交")
+
+
+def sync_repo(p: dict, repo: Path, depth: int, snapshot_at: dt.datetime | None = None) -> str:
+    """维护扫描副本并固定到统一时间点的分支提交；只拉取，不推送。"""
     branch = p.get("branch") or "main"
     env = git_env()
+    created = False
     if not (repo / ".git").exists():
         repo.parent.mkdir(parents=True, exist_ok=True)
         r = run(["git", "clone", "--no-tags", "--depth", str(depth), "--branch", branch,
                  "--single-branch", p["git_url"], str(repo)], timeout=1800, env=env)
         if r.returncode:
             raise RuntimeError(f"clone 失败: {r.stderr.strip()[-500:]}")
+        created = True
     else:
         r = run(["git", "fetch", "--no-tags", "--depth", str(depth), "origin", branch], cwd=repo, timeout=1800, env=env)
         if r.returncode:
             raise RuntimeError(f"fetch 失败: {r.stderr.strip()[-500:]}")
-        # 任何一步失败都必须报错：否则 HEAD 还停在旧提交，会被误判为“无变更 → 沿用”，静默地扫旧代码
-        for cmd in (["git", "reset", "-q", "--hard", "FETCH_HEAD"], ["git", "clean", "-qffdx"]):
+    if snapshot_at is not None:
+        ref = "HEAD" if created else "FETCH_HEAD"
+        commit = _snapshot_commit(repo, branch, ref, snapshot_at, depth, env)
+        reset_target = commit
+    else:
+        commit = ""
+        reset_target = None if created else "FETCH_HEAD"
+    # 任何一步失败都必须报错：否则 HEAD 还停在旧提交，会被误判为“无变更 → 沿用”，静默地扫旧代码。
+    if reset_target:
+        for cmd in (["git", "reset", "-q", "--hard", reset_target], ["git", "clean", "-qffdx"]):
             r = run(cmd, cwd=repo, env=env)
             if r.returncode:
                 raise RuntimeError(f"{' '.join(cmd[:2])} 失败: {r.stderr.strip()[-500:]}")
@@ -281,7 +354,8 @@ def prescan(repo: Path, out: Path, tools: list[str], settings: dict,
 
 def build_prompt(p: dict, commit: str, settings: dict, scan_type: str,
                  prescan_dir: str | None = None, prev_file: str | None = None,
-                 changes_file: str | None = None, previous_report_mode: str | None = None) -> str:
+                 changes_file: str | None = None, previous_report_mode: str | None = None,
+                 snapshot_at: dt.datetime | None = None) -> str:
     """Build the Harness prompt. The Harness owns the full audit workflow;
     this prompt only passes project metadata and scan parameters."""
     scope = [s.strip() for s in (p.get("scope_out") or "").replace("；", ";").split(";") if s.strip()]
@@ -298,6 +372,12 @@ def build_prompt(p: dict, commit: str, settings: dict, scan_type: str,
         f"scan_type: {scan_type}",
         f"report_mode: {'fast' if fast else 'standard'}",
     ]
+    if snapshot_at is not None:
+        lines.extend([
+            f"snapshot_at: {snapshot_text(snapshot_at)}",
+            f"snapshot_method: {SNAPSHOT_METHOD}",
+            "当前代码已固定到该提交，审查期间不得更新仓库或切换分支。",
+        ])
     for key, field in [("tech_stack", "tech_stack"), ("project_type", "project_type"),
                        ("core_flows", "core_flows"), ("materials_dir", "materials_dir"),
                        ("weights", "weights")]:
@@ -456,7 +536,8 @@ def write_text_atomic(path: Path, value: str, mode: int = 0o644) -> None:
             pass
 
 
-def scan_project(p: dict, settings: dict, run_date: str, args) -> dict:
+def scan_project(p: dict, settings: dict, run_date: str, args,
+                 snapshot_at: dt.datetime | None = None) -> dict:
     """One isolated project session. The Markdown answer is the deliverable."""
     started = time.perf_counter()
     pid = p["project_id"]
@@ -470,11 +551,14 @@ def scan_project(p: dict, settings: dict, run_date: str, args) -> dict:
     report_mode = "fast" if settings.get("fast_mode", False) else "standard"
     rec = {"project_id": pid, "project_name": p.get("project_name", pid),
            "date": run_date, "run_id": run_id, "report_mode": report_mode, "status": "ok", "metrics": metrics}
+    if snapshot_at is not None:
+        rec["snapshot_at"] = snapshot_text(snapshot_at)
     try:
         with project_lock(settings, pid):
             repo = work / "repo"
-            with measure(metrics["stages_seconds"], "git_sync"):
-                commit = sync_repo(p, repo, int(settings.get("clone_depth", 200)))
+            with git_sync_lock(settings):
+                with measure(metrics["stages_seconds"], "git_sync"):
+                    commit = sync_repo(p, repo, int(settings.get("clone_depth", 200)), snapshot_at)
             rec["commit"] = commit
             log(f"{pid}: {commit[:10]} → Harness 自主审查")
             if args.dry_run:
@@ -523,6 +607,7 @@ def scan_project(p: dict, settings: dict, run_date: str, args) -> dict:
                 prev_file=previous,
                 changes_file=f"{view}/changed_files.json" if (ctx / "changed_files.json").is_file() else None,
                 previous_report_mode=previous_report_mode,
+                snapshot_at=snapshot_at,
             )
             log(f"{pid}: scan_type={scan_type}，report_mode={report_mode}")
             log(f"{pid}: 等待模型并发名额")
@@ -544,8 +629,12 @@ def scan_project(p: dict, settings: dict, run_date: str, args) -> dict:
             rec.update({"agent_status": out.get("agent_status", "completed"),
                         "report_path": str(report_path), "report_sha256": sha256_file(report_path),
                         "scan_type": scan_type})
-            write_json_atomic(state_file, {"last_commit": commit, "last_report": str(report_path),
-                                           "last_scan_date": run_date, "report_mode": report_mode}, mode=0o600)
+            state = {"last_commit": commit, "last_report": str(report_path),
+                     "last_scan_date": run_date, "report_mode": report_mode}
+            if snapshot_at is not None:
+                state.update({"snapshot_at": snapshot_text(snapshot_at),
+                              "snapshot_method": SNAPSHOT_METHOD})
+            write_json_atomic(state_file, state, mode=0o600)
     except Exception as exc:
         rec.update({"status": "error", "error": str(exc)[:800],
                     "agent_status": getattr(exc, "agent_status", "failed")})
@@ -563,6 +652,7 @@ def main() -> int:
     ap.add_argument("--fast", action=argparse.BooleanOptionalAction, default=None,
                     help="快速巡检：不生成详细证据；--no-fast 使用标准模式")
     ap.add_argument("--force-full", action="store_true", help="不提供上次审查报告作为参考")
+    ap.add_argument("--snapshot-at", help="固定 Git 快照时间 ISO-8601；未指定时取本批启动时间")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--summary-only", action="store_true", help="仅汇总所选项目最近一次 Markdown 报告")
     ap.add_argument("--date", help="覆盖运行日期 YYYY-MM-DD（补跑用）")
@@ -575,6 +665,11 @@ def main() -> int:
         settings["fast_mode"] = args.fast
     if not isinstance(settings.get("fast_mode", False), bool):
         log("拒绝启动：fast_mode 必须为 true/false")
+        return 2
+    try:
+        snapshot_at = parse_snapshot_at(args.snapshot_at or settings.get("snapshot_at"))
+    except ValueError as exc:
+        log(f"拒绝启动：{exc}")
         return 2
     problem = backend_problem(settings) or network_problem(settings)
     if problem and not args.dry_run:
@@ -615,9 +710,11 @@ def main() -> int:
     runlog = outdir / "results" / run_date / args.run_id / "_run.json"
     report_mode = "fast" if settings.get("fast_mode", False) else "standard"
     mode_label = "汇总已有报告" if args.summary_only else f"报告模式 {report_mode}"
-    log(f"开始 {run_date}：{len(projects)} 个项目，并发 {parallel}，{mode_label}，运行编号 {args.run_id}")
+    log(f"开始 {run_date}：{len(projects)} 个项目，并发 {parallel}，{mode_label}，"
+        f"Git 快照 {snapshot_text(snapshot_at)}，运行编号 {args.run_id}")
     progress = {"date": run_date, "run_id": args.run_id, "started_at": now().isoformat(),
-                "status": "running", "finished_at": None, "projects": [], "pending_projects": ids.copy()}
+                "status": "running", "finished_at": None, "projects": [], "pending_projects": ids.copy(),
+                "snapshot_at": snapshot_text(snapshot_at), "snapshot_method": SNAPSHOT_METHOD}
     if not args.summary_only:
         progress["report_mode"] = report_mode
     write_json_atomic(runlog, progress, mode=0o600)
@@ -646,7 +743,7 @@ def main() -> int:
         write_json_atomic(runlog, progress, mode=0o600)
     else:
         with cf.ThreadPoolExecutor(max_workers=parallel) as executor:
-            jobs = {executor.submit(scan_project, p, settings, run_date, args): p for p in projects}
+            jobs = {executor.submit(scan_project, p, settings, run_date, args, snapshot_at): p for p in projects}
             for job in cf.as_completed(jobs):
                 p = jobs[job]
                 try:

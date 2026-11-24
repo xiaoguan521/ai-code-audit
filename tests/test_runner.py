@@ -1,6 +1,8 @@
 """runner 的单元测试（不调用模型、不需要 Docker）：python3 -m unittest discover -s tests -v"""
 import copy
+import datetime as dt
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -163,6 +165,39 @@ class SyncRepoTest(unittest.TestCase):
         (up / "a.txt").write_text("2")
         git("commit", "-qam", "2")
         self.assertEqual(run_daily.sync_repo(p, repo, 10), git("rev-parse", "HEAD"))
+
+    def test_snapshot_selects_branch_commit_at_cutoff(self):
+        """A fixed cutoff selects an older first-parent commit, not current HEAD."""
+        base = Path(self.tmp.name)
+        up = base / "snapshot-upstream"
+        up.mkdir()
+
+        def git(*args, env=None):
+            merged_env = dict(os.environ)
+            if env:
+                merged_env.update(env)
+            return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+                                  cwd=up, check=True, capture_output=True, text=True, env=merged_env).stdout.strip()
+
+        git("init", "-q", "-b", "release")
+        (up / "a.txt").write_text("before\n")
+        git("add", ".")
+        git("commit", "-qm", "before", env={
+            "GIT_AUTHOR_DATE": "2026-11-23T01:00:00+08:00",
+            "GIT_COMMITTER_DATE": "2026-11-23T01:00:00+08:00",
+        })
+        before = git("rev-parse", "HEAD")
+        (up / "a.txt").write_text("after\n")
+        git("commit", "-qam", "after", env={
+            "GIT_AUTHOR_DATE": "2026-11-24T01:00:00+08:00",
+            "GIT_COMMITTER_DATE": "2026-11-24T01:00:00+08:00",
+        })
+
+        repo = base / "snapshot-copy"
+        snapshot_at = dt.datetime.fromisoformat("2026-11-23T23:00:00+08:00")
+        selected = run_daily.sync_repo({"git_url": up.as_uri(), "branch": "release"}, repo, 1, snapshot_at)
+        self.assertEqual(selected, before)
+        self.assertEqual((repo / "a.txt").read_text(), "before\n")
 
     def test_changed_files_preserves_non_ascii_paths(self):
         base = Path(self.tmp.name) / "unicode-repo"
