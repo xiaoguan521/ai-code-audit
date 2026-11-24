@@ -28,7 +28,9 @@ class FactsTest(unittest.TestCase):
         ids = {finding["item_id"] for finding in result["findings"]}
         self.assertIn("1.5", ids)
         self.assertIn("3.1", ids)
-        self.assertIn("8.3", ids)
+        # 关键词/文件名信号不能证明达标：collect() 不再产生任何 PASS finding。
+        self.assertNotIn("8.3", ids)
+        self.assertFalse(any(finding["result"] == "PASS" for finding in result["findings"]))
         self.assertEqual(result["inventory"]["unchecked"], [{"path": "dist/", "reason": "配置的排除范围"}])
 
     def test_prompt_injection_is_detected_before_model(self):
@@ -87,6 +89,20 @@ class FactsTest(unittest.TestCase):
         self.assertEqual(result["items"][1]["result"], "PASS")
         self.assertEqual(result["need_info_list"], [])
         self.assertEqual(len(result["issues"]), 1)
+
+    def test_apply_findings_never_writes_pass(self):
+        result = {"items": [
+            {"id": "8.3", "result": "NEED_INFO-证据不足", "risk": "none", "evidence": [], "conclusion": "",
+             "conditional": True, "carried_over": True},
+        ], "issues": [], "need_info_list": [{"items": ["8.3"], "missing": "证据", "why": "缺失",
+                                                "form": "源码", "unlocks": "结论", "priority": "中"}]}
+        finding = {"item_id": "8.3", "result": "PASS", "risk": "none", "title": "风格配置",
+                   "conclusion": "发现 lint 配置", "evidence": [{"path": ".pylintrc", "start_line": 1}]}
+        self.assertEqual(facts.apply_findings(result, [finding]), 0)
+        self.assertEqual(result["items"][0]["result"], "NEED_INFO-证据不足")
+        self.assertTrue(result["items"][0]["conditional"])
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(len(result["need_info_list"]), 1)
 
 
 if __name__ == "__main__":
