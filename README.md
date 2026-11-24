@@ -70,3 +70,7 @@ python3 tests/check_consistency.py
 ```
 
 镜像构建和多架构冒烟测试见 [GitHub Actions](https://github.com/xiaoguan521/ai-code-audit/actions/workflows/build-image.yml)。真实自部署模型、Git 凭据和现场网络仍需在部署环境中测试。
+
+## 开源协议
+
+本项目采用 [MIT 许可证](LICENSE)。
