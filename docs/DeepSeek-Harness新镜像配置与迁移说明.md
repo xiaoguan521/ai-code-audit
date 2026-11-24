@@ -86,6 +86,8 @@ AUDIT_RUNNER_IMAGE=ghcr.io/xiaoguan521/ai-code-audit-runner:main
 AUDIT_HARNESS_LAUNCHER=docker
 AUDIT_HARNESS_BIN=dsh
 AUDIT_HARNESS_ARGS=["headless","--json","--permission-mode","read-only","--approval-policy","never"]
+AUDIT_MAX_PARALLEL=2
+AUDIT_MAX_MODEL_CONCURRENCY=2
 AUDIT_SUMMARY_ENABLED=false
 ```
 
@@ -109,6 +111,8 @@ services:
       AUDIT_HARNESS_LAUNCHER: ${AUDIT_HARNESS_LAUNCHER:-docker}
       AUDIT_HARNESS_BIN: ${AUDIT_HARNESS_BIN:-dsh}
       AUDIT_HARNESS_ARGS: '${AUDIT_HARNESS_ARGS:-["headless","--json","--permission-mode","read-only","--approval-policy","never"]}'
+      AUDIT_MAX_PARALLEL: ${AUDIT_MAX_PARALLEL:-2}
+      AUDIT_MAX_MODEL_CONCURRENCY: ${AUDIT_MAX_MODEL_CONCURRENCY:-2}
       AUDIT_SUMMARY_ENABLED: ${AUDIT_SUMMARY_ENABLED:-false}
       TZ: Asia/Shanghai
     volumes:
@@ -193,6 +197,16 @@ docker compose run --rm --pull never audit --dry-run
 
 `--dry-run` 不调用模型，但会连接 Git，并克隆或更新扫描专用副本。确认项目数、仓库地址和分支正确。Compose 会按配置创建网络；如已有同名网络但不归当前 Compose 项目管理，需要按实际环境处理。
 
+### 同时扫描多个项目
+
+一个批次内可以并行扫描多个项目，默认最多同时处理 2 个项目、运行 2 个模型会话：
+
+```bash
+docker compose run --rm --pull never -T audit --only 项目A 项目B --force-full
+```
+
+在 `.env` 设置 `AUDIT_MAX_PARALLEL` 控制项目并发，`AUDIT_MAX_MODEL_CONCURRENCY` 控制实际模型会话并发；应按千问服务的吞吐能力设置。独立部署的 `compose.yaml` 也必须把这两个变量传进 `audit`，如上面的示例。两个独立批次不能同时使用相同的数据目录；出现“另一扫描任务正在使用”时，可用 `docker ps` 检查当前任务，等待其结束后重试。锁由进程持有，不要删除锁文件。
+
 ### 5.3 验证真实模型连接
 
 以下命令会发起一次简短模型调用；先确保上一步已创建网络，且 `model.env`、镜像名和网络名均已配置。输出是 Harness 事件流，不是正式的 64 项审查报告：
@@ -272,4 +286,4 @@ PY
 
 ## 7. 回滚
 
-保留旧镜像和备份配置。确需回滚时，将 Agent 类型、扫描镜像和模型凭据一并恢复到原 Pi 配置，并保留兼容 Pi 的 Runner；再用单个项目 `--force-full` 验证。历史数据不需要为切换或回滚而删除。
+本版调度器只支持 DeepSeek Harness。若需恢复旧系统，必须同时恢复旧版调度镜像、扫描镜像和配置；不能在新调度镜像中切换旧 Agent。历史数据不需要为升级而删除。

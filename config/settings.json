@@ -1,12 +1,10 @@
 {
   "workdir": "/data/ai-audit/work",
   "output_dir": "/data/ai-audit/output",
-  "claude_bin": "claude",
   "model": "",
   "max_parallel": 2,
   "max_model_concurrency": 2,
   "per_project_timeout_sec": 3600,
-  "per_project_budget_usd": 15,
   "full_scan_weekday": 6,
   "full_scan_strategy": "weekday",
   "full_scan_interval_days": 7,
@@ -61,7 +59,6 @@
     "args": ["headless", "--json", "--permission-mode", "read-only", "--approval-policy", "never"],
     "memory": "6g",
     "cpus": 2,
-    "max_session_turns": 300,
-    "_说明": "默认使用 DeepSeek Harness；Harness 必须 strategy=single，由完整 Harness Agent Loop 自己拆分任务，不由 Runner 按维度拆分。Pi 可通过 AUDIT_AGENT_TYPE=pi-docker 回滚；旧的 qwen-docker 名称保留兼容"
+    "_说明": "只支持 DeepSeek Harness；必须 strategy=single，由完整 Harness Agent Loop 自己拆分任务，不由 Runner 按维度拆分"
   }
 }

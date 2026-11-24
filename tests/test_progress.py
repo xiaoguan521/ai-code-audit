@@ -22,7 +22,7 @@ class ProgressTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.settings = self.root / "settings.json"
         self.settings.write_text(json.dumps({"workdir": str(self.root / "work"), "output_dir": str(self.root / "out"),
-                                             "max_parallel": 2, "agent": {"type": "claude"}}), encoding="utf-8")
+                                             "max_parallel": 2, "agent": {"type": "deepseek-harness", "launcher": "local"}}), encoding="utf-8")
         self.projects = self.root / "projects.csv"
         with self.projects.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=["project_id", "project_name", "status"])

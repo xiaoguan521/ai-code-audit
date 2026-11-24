@@ -1,5 +1,7 @@
-# 调度容器只负责拉取仓库、启动扫描容器和生成报告；Pi 镜像单独发布。
-FROM docker:27-cli
+# 调度器只需 Docker 客户端，无需在镜像内携带 buildx 和 Compose 插件。
+FROM docker:27-cli AS docker-client
+FROM alpine:3.21.3
+COPY --from=docker-client /usr/local/bin/docker /usr/local/bin/docker
 
 # 预扫描是 runner 的确定性主干，不再依赖运行机临时安装工具。版本固定，
 # 并在构建时验证命令可执行；gitleaks 使用官方发布包并校验 sha256。

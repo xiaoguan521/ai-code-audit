@@ -41,12 +41,24 @@ def configure_settings(settings: dict, env: dict) -> dict:
     if not network:
         raise ValueError("AUDIT_MODEL_NETWORK 不能为空")
 
+    for variable, setting in (("AUDIT_MAX_PARALLEL", "max_parallel"),
+                              ("AUDIT_MAX_MODEL_CONCURRENCY", "max_model_concurrency")):
+        raw = env.get(variable, "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"{variable} 必须是正整数") from exc
+            if value < 1:
+                raise ValueError(f"{variable} 必须是正整数")
+            settings[setting] = value
+
     settings["workdir"] = str(Path(data_dir) / "work")
     settings["output_dir"] = str(Path(data_dir) / "output")
     agent = settings.setdefault("agent", {})
     agent_type = (env.get("AUDIT_AGENT_TYPE") or agent.get("type") or "deepseek-harness").strip()
-    if agent_type not in {"pi-docker", "qwen-docker", "deepseek-harness"}:
-        raise ValueError("AUDIT_AGENT_TYPE 必须为 pi-docker、qwen-docker 或 deepseek-harness")
+    if agent_type != "deepseek-harness":
+        raise ValueError("AUDIT_AGENT_TYPE 必须为 deepseek-harness")
     image = env.get("AUDIT_SCANNER_IMAGE") or agent.get("image") or "ghcr.io/xiaoguan521/ai-code-audit:main"
     env_file = env.get("AUDIT_MODEL_ENV_PATH") or agent.get("env_file") or "/run/secrets/model.env"
     agent.update({"type": agent_type, "image": image, "env_file": env_file, "network": network})

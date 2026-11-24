@@ -35,7 +35,7 @@ _TYPES = {
 
 def schema_errors(value, schema: dict | None = None, path: str = "$") -> list[str]:
     """按 result.schema.json 校验结构（支持其中用到的 type / required / properties / items /
-    enum / pattern / minimum / minLength / maxLength / minItems / maxItems）。Pi 的结果在评分前必须先过这一关，
+    enum / pattern / minimum / minLength / maxLength / minItems / maxItems）。审查结果在评分前必须先过这一关，
     否则字段缺失或枚举值写错会在评分时直接崩溃。返回问题列表（空表示通过）。"""
     if schema is None:
         schema = load_schema()

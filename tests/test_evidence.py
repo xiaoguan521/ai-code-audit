@@ -90,7 +90,7 @@ class TrustBoundaryTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.settings = {"workdir": str(self.root / "work"), "output_dir": str(self.root / "out"),
-                         "prescan_tools": [], "agent": {"type": "claude"}}
+                         "prescan_tools": [], "agent": {"type": "deepseek-harness", "launcher": "local"}}
         self.project = {"project_id": "p1", "project_name": "示例"}
         self.args = types.SimpleNamespace(force_full=False, dry_run=False)
         repo = Path(self.settings["workdir"]) / "p1" / "repo"
@@ -178,12 +178,13 @@ class TrustBoundaryTest(unittest.TestCase):
         with run_daily.batch_lock(self.settings):
             pass
 
-    def test_misspelled_backend_never_falls_back_to_claude(self):
-        settings = {"agent": {"type": "pi-dockerr"}}
-        with mock.patch.object(run_daily, "call_claude") as claude:
-            with self.assertRaisesRegex(RuntimeError, "agent.type"):
-                run_daily.call_agent("", self.root, self.root, settings, 1)
-            claude.assert_not_called()
+    def test_other_backends_are_rejected(self):
+        for kind in ("pi-docker", "qwen-docker", "claude", "unknown"):
+            settings = {"agent": {"type": kind}}
+            with mock.patch.object(run_daily, "call_deepseek_harness") as harness:
+                with self.assertRaisesRegex(RuntimeError, "agent.type"):
+                    run_daily.call_agent("", self.root, self.root, settings, 1)
+                harness.assert_not_called()
 
     def test_metrics_keep_failed_and_successful_attempts(self):
         first = run_daily.AgentOutputError("输出截断", stats={"turns": 3, "tool_calls": 2})
@@ -224,11 +225,6 @@ class TrustBoundaryTest(unittest.TestCase):
         self.assertEqual(mocked.call_count, 1)
         stored = json.loads((self.root / "out/results/2026-11-22/p1.json").read_text(encoding="utf-8"))
         self.assertEqual(stored["items"][0]["result"], "NEED_INFO-证据不足")
-
-    def test_pi_failure_keeps_statistics_without_log_marker(self):
-        stats, clean = run_daily.pi_stderr_stats('error\nAI_AUDIT_STATS:{"turns":3,"tool_calls":2}\n')
-        self.assertEqual(stats, {"turns": 3, "tool_calls": 2})
-        self.assertEqual(clean, "error")
 
     def test_failed_rerun_does_not_render_old_same_day_result(self):
         day = self.root / "out/results/2026-11-22"

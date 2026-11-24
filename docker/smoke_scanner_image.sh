@@ -22,6 +22,8 @@ docker run --rm --platform "linux/$arch" --entrypoint sh "$img" -c '
   test "$DSH_BUNDLED_SKILL_DIR" = /opt/audit/skills &&
   test "$DSH_PERMISSION_MODE" = read-only &&
   test "$NARB_DISABLE_NATIVE_CACHE" = 1 &&
+  ! command -v pi >/dev/null && ! command -v claude >/dev/null &&
+  test ! -d /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@earendil-works/pi-coding-agent &&
   [ "$(id -u)" != "0" ] && echo "Harness 镜像内容检查通过：$(uname -m)"'
 
 help_output=$(docker run --rm --init --platform "linux/$arch" --network none --read-only \

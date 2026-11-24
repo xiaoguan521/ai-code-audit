@@ -1,6 +1,6 @@
 # 八性 AI 代码检查 · 部署包
 
-支持三种模型后端（config/settings.json 的 agent.type）：**pi-docker**（兼容旧链路，Pi + 内网 OpenAI 兼容模型，在一次性 Docker 容器中运行）、**deepseek-harness**（完整 DeepSeek Harness Headless Agent，在一次性 Docker 容器中运行）和 **claude**（Claude Code 直连）。基于智能体无界面模式，对全公司在研项目每天做一次只读静态审查，按“八性”64 项检查项出逐项结论，由程序按固定规则出分，生成单项目报告、每日汇总、评分表和静态看板。
+仅使用 **DeepSeek Harness Headless Agent** 在一次性 Docker 容器中自主规划和执行审查，可接入 DeepSeek 或自部署的 OpenAI 兼容模型。对在研项目每天做一次只读静态审查，按“八性”64 项检查项出逐项结论，由程序按固定规则出分，生成单项目报告、每日汇总、评分表和静态看板。
 
 ## 仓库维护（GitHub）
 
@@ -11,7 +11,6 @@
 | 修改检查规则 | 改 `skill/eight-quality-audit/SKILL.md`；增删检查项后运行 `python3 tools/gen_checklist.py` | CI 校验 64 项与 checklist / schema 一致；合并后重新构建镜像 |
 | 调整权重、评分档位 | 改 `config/checklist.json` | CI 校验权重合计 100 |
 | 升级 DeepSeek Harness | 改 `docker/DSH_VERSION` | 构建 Harness 扫描镜像并冒烟测试（dsh、headless Profile、Skill、非 root） |
-| 回滚 Pi | 使用 `docker/Dockerfile.pi` 和 `docker/PI_VERSION` 构建旧镜像，并将 `AUDIT_AGENT_TYPE` 改为 `pi-docker` | 保留旧 JSON 扫描链路 |
 | 发布给内网 | 打 tag：`git tag v1.0.0 && git push origin v1.0.0` | 扫描镜像 `ghcr.io/<owner>/<repo>:1.0.0` 和调度镜像 `ghcr.io/<owner>/<repo>-runner:1.0.0` 均为 amd64 + arm64；GitHub Release 为两种镜像的每个架构分别附离线包及 sha256 |
 
 工作流文件：`.github/workflows/ci.yml`（每次 PR / push 跑测试）、`.github/workflows/build-image.yml`（构建、测试、推送镜像，tag 时出离线包）。Dependabot 每月提醒升级 Actions 与基础镜像。
@@ -28,10 +27,10 @@
 ```
 skill/eight-quality-audit/SKILL.md   八性检查 Skill（规则本体，交互式审查和定时扫描共用）
 config/checklist.json                64 项检查项与权重、评分参数（程序读取）
-config/result.schema.json            模型输出的 JSON Schema（约束结构，保证可自动出分）
+config/result.schema.json            程序解析后的结果结构（保证可自动出分）
 config/projects.csv                  项目 Git 地址清单（张玲维护，示例行上线前删除）
-config/settings.json                 运行参数（目录、并发、预算、全量扫描日、模型后端 agent 等）
-docker/                              DeepSeek Harness 扫描镜像：Dockerfile、版本、构建与冒烟测试脚本；Dockerfile.pi 为 Pi 回滚镜像
+config/settings.json                 运行参数（目录、并发、全量扫描日和 Harness 等）
+docker/                              DeepSeek Harness 扫描镜像、调度镜像及构建与冒烟测试脚本
 runner/run_daily.py                  每日扫描入口
 runner/adapters/harness.py           完整 DeepSeek Harness Headless Docker Adapter
 runner/adapters/summary.py           只读审查结果的独立 AI 总结 Adapter（含确定性降级）
@@ -43,7 +42,7 @@ runner/render.py                     报告、CSV、看板渲染
 runner/dashboard_template.html       看板模板（单文件，无外部依赖）
 tests/make_samples.py                用模拟数据验证评分与渲染：python3 tests/make_samples.py /tmp/out
 tests/check_consistency.py           SKILL / checklist / schema / 配置一致性检查（CI 必跑）
-tests/test_runner.py                 单元测试：输出 Schema 校验、JSON 提取、重试、网络、git 同步（python3 -m unittest discover -s tests）
+tests/test_runner.py                 单元测试：输出校验、重试、网络、git 同步（python3 -m unittest discover -s tests）
 quality/                             固定提交的合成质量回归样例与评估脚本
 tools/gen_checklist.py               从 SKILL.md 重新生成 checklist.json
 .github/workflows/                   CI 与镜像构建流水线
@@ -55,20 +54,20 @@ docker/DSH_VERSION                   镜像内 DeepSeek Harness 版本（单一�
 | 情况 | 扫描类型 | 说明 |
 |---|---|---|
 | 首次扫描、到全量日或超过全量间隔、上次结果丢失、规则或范围变化 | full | 64 项全部重新判定 |
-| 有新提交或补充材料变化 | incremental | runner 先按变更路径、旧证据和材料变化计算受影响检查项；只启动受影响维度并只让模型输出这些项，其余检查项由 runner 原样沿用；影响面超过 60% 自动升级 full |
+| 有新提交或补充材料变化 | incremental | runner 按变更路径、旧证据和材料变化计算受影响检查项，将完整任务一次交给 Harness；其余结果经核验后沿用；影响面超过 60% 自动升级 full |
 | 文件内容、材料和规则没变，且未到全量日 | reuse | 核验证据后复用上次结果，不调用模型；仅改变提交而无文件差异时也适用 |
 
 评分不由模型给出：模型只输出每项 PASS/WARN/FAIL/N/A/NEED_INFO 和证据，`scoring.py` 按 SKILL.md 第 6 节固定规则计算，同样的结论永远得同样的分。
 
-证据使用结构化相对路径、起止行号及可选原文片段。runner 在评分前核验文件、行号和所提供的片段，并在 `meta.evidence_check` 和每次尝试的统计中记录引用数及无效数；该核验不能证明结论正确，也不能证明某类问题不存在。结构不合格时最多重试一次，第二次仍失败则不评分；无法安全自动修复的残余语义问题才会写入 `output/unverified/<日期>/<项目ID>.json`（文件权限 600）。Pi 达到轮次或输出长度硬上限时不会以相同配置原样重跑。
+证据使用结构化相对路径、起止行号及可选原文片段。runner 在评分前核验文件、行号和所提供的片段，并在 `meta.evidence_check` 和每次尝试的统计中记录引用数及无效数；该核验不能证明结论正确，也不能证明某类问题不存在。结构不合格时最多重试一次，第二次仍失败则不评分；无法安全自动修复的残余语义问题才会写入 `output/unverified/<日期>/<项目ID>.json`（文件权限 600）。
 
-Harness 默认读取八性 Skill，并按 Markdown 契约输出审查事实；`config/result.schema.json` 仍保留给 Pi 回滚链路，不参与 Harness 的第一阶段输出格式约束。
+Harness 默认读取八性 Skill，并按 Markdown 契约输出审查事实；`config/result.schema.json` 用于校验程序解析后的结果。
 
 结构错误（Schema、缺项、重复项）才会触发模型重试；无效证据、孤立问题和增量沿用抄写错误由 runner 自动清理或降级为 `NEED_INFO-证据不足`，并在 `meta.evidence_check` 记录修复数量。runner 同时生成 `context/facts.json`：inventory、代码地图和预扫描摘要由确定性工具提供，模型只需对需要语义判断的部分回源码核验。
 
 升级注意：证据输出格式与旧版不同，**必须同时更新调度程序和 Harness 扫描镜像**。旧报告仍可查看；规则、证据格式、范围或模型配置指纹变化时，下一次扫描自动全量。若模型服务的同名模型替换了权重，请更新设置中的 `audit_revision` 触发全量复审。
 
-默认后端是 `deepseek-harness`，`agent.strategy` 固定为 `single`：Runner 只发送一个顶层任务，DeepSeek Harness 自己规划审查步骤、工具调用、多轮推理和子任务；Runner 只负责进程、事件、Markdown 解析、证据校验、评分与归档。`agent.dimension_parallelism` 只对 Pi/其他兼容后端的旧分维度链路生效。Harness 输出不完整或证据不成立时整次审查标记为 `unverified`，不进入有效评分。
+唯一后端是 `deepseek-harness`，`agent.strategy` 固定为 `single`：Runner 只发送一个顶层任务，DeepSeek Harness 自己规划审查步骤、工具调用、多轮推理和子任务；Runner 只负责进程、事件、Markdown 解析、证据校验、评分与归档。Harness 输出不完整或证据不成立时整次审查标记为 `unverified`，不进入有效评分。
 
 调度默认仍在周六全量；设置 `full_scan_strategy` 为 `staggered` 可按项目稳定错峰，`full_scan_interval_days` 控制最大间隔，错过计划会补扫。旧配置中的 `reuse_if_unchanged_days` 在没有新间隔配置时作为兼容默认值。每个项目完成后 `_run.json` 即更新，并记录同步、预扫描、模型调用、核验等耗时及可用的轮次、工具和 token 统计；`--dry-run` 的日志单独保存。同一工作目录或输出目录只允许一个批次运行。
 
@@ -131,7 +130,7 @@ Harness 的 `--json` 是运行事件流，不是要求模型输出 JSON。Adapte
 
 内网部署、离线镜像导入与运维排障详见[内网部署运维手册](docs/内网部署运维手册.md)。
 
-Compose 默认指向本仓库发布的 DeepSeek Harness 扫描镜像，`AUDIT_AGENT_TYPE=deepseek-harness`。如需回滚，才切换到 `docker/Dockerfile.pi` 构建的 Pi 镜像并设置 `AUDIT_AGENT_TYPE=pi-docker`。`audit` 使用调度镜像，负责拉取仓库、管理扫描状态和生成报告；调度器通过本机 Docker 为每个项目启动一个扫描镜像的独立容器。扫描完成后调度容器退出；再次运行会使用保存的状态，按原有规则选择全量、增量或复用。
+Compose 使用 DeepSeek Harness 扫描镜像，`AUDIT_AGENT_TYPE=deepseek-harness`。`audit` 使用调度镜像，负责拉取仓库、管理扫描状态和生成报告；调度器通过本机 Docker 为每个项目启动一个扫描镜像的独立容器。扫描完成后调度容器退出；再次运行会使用保存的状态，按原有规则选择全量、增量或复用。
 
 1. 在有 Docker Engine 和 Compose 的运行机上，从项目目录准备配置：
    ```sh
@@ -158,7 +157,7 @@ Compose 默认指向本仓库发布的 DeepSeek Harness 扫描镜像，`AUDIT_AG
    - **SSH deploy key**：将私钥及经过验证的 `known_hosts` 放到 `secrets/ssh/`，私钥权限设为 `600`，并将对应项目的 `git_url` 改为 SSH 地址。多个 Git 服务器可在该目录放 `config`，为各主机指定不同的 `IdentityFile`。
 
    Git 凭据只挂载给调度容器；不使用 HTTPS 凭据时可以把 `secrets/git-credentials` 清空并保留文件。该文件和 `model.env` 都是明文，应保留 `600` 权限并使用只读凭据。`.env`、`model.env`、本地项目清单及 `secrets/` 都被 Git 忽略，也不会发给 Docker 构建器。
-5. 检查 `.env`。`AUDIT_DATA_DIR` 必须是运行机上的绝对路径，调度容器和宿主机使用同一路径，以便 Docker 挂载项目副本；默认是当前项目目录下的 `audit-data/`，更换路径时先创建该目录。`AUDIT_AGENT_TYPE=deepseek-harness` 时，`AUDIT_SCANNER_IMAGE` 必须是预装 dsh、Skill 和 Profile 的 Harness 镜像；`AUDIT_HARNESS_ARGS` 必须保持为 `["headless","--json","--permission-mode","read-only","--approval-policy","never"]` 这样的 JSON 数组。若暂时回滚 Pi，设置 `AUDIT_AGENT_TYPE=pi-docker` 并使用 Pi 扫描镜像。`AUDIT_RUNNER_IMAGE` 配置调度镜像；Docker socket 不在 `/var/run/docker.sock` 时，修改 `AUDIT_DOCKER_SOCKET`。
+5. 检查 `.env`。`AUDIT_DATA_DIR` 必须是运行机上的绝对路径，调度容器和宿主机使用同一路径，以便 Docker 挂载项目副本；默认是当前项目目录下的 `audit-data/`，更换路径时先创建该目录。`AUDIT_AGENT_TYPE` 固定为 `deepseek-harness`，`AUDIT_SCANNER_IMAGE` 必须是预装 dsh、Skill 和 Profile 的 Harness 镜像；`AUDIT_HARNESS_ARGS` 必须保持为 `["headless","--json","--permission-mode","read-only","--approval-policy","never"]` 这样的 JSON 数组。`AUDIT_RUNNER_IMAGE` 配置调度镜像；Docker socket 不在 `/var/run/docker.sock` 时，修改 `AUDIT_DOCKER_SOCKET`。
 6. 拉取两个镜像并试跑：
    ```sh
    docker compose --profile images pull scanner-image audit
@@ -172,21 +171,7 @@ Compose 会创建 `AUDIT_MODEL_NETWORK` 指定的 Docker 网络。该网络本�
 
 如需每天运行，可在运行机的 crontab 中进入项目目录后执行 `docker compose run --rm audit`；Compose 本身不会自动定时。
 
-## 部署步骤（Claude Code 后端，兴华 + 晓晨）
-
-1. **运行机**：内网 Linux 服务器或容器，Python ≥ 3.10、git、Node.js 18+；安装 Claude Code（`npm i -g @anthropic-ai/claude-code` 或官方安装脚本），固定版本，升级前先用测试项目回归。
-2. **模型凭据**：设置 `ANTHROPIC_API_KEY`（Claude Console 创建，单独一个工作区便于计费与限额），或按公司要求改用 Amazon Bedrock / Google Vertex / 公司模型网关（Claude Code 支持对应环境变量）。凭据放在运行账号的环境文件中，权限 600。
-3. **代码访问**：为扫描账号在 GitLab/GitHub 开只读权限（Reporter / read_repository 级别的 deploy token 或 deploy key），预先配置在运行机的 git 凭据中；脚本只做 clone/fetch，不推送。
-4. **网络**：运行机出站只放行 Git 服务器与模型 API 域名。
-5. **预扫描工具**：发布的调度镜像已预装 cloc、gitleaks、semgrep、lizard；semgrep 需在 settings.json 配置离线规则目录 `semgrep_rules_dir`，否则跳过（避免联网拉规则）。如需完全关闭预扫描，可将 `prescan_tools` 设为空数组。
-6. **配置**：编辑 `config/settings.json` 的 `workdir`、`output_dir`，导入 `config/projects.csv`。
-7. **试跑**：`python3 runner/run_daily.py --dry-run` 看计划，再 `python3 runner/run_daily.py --only <一个项目ID> --force-full` 试扫一个项目，人工核对报告证据。
-8. **定时**：crontab（运行账号）：
-   ```
-   CRON_TZ=Asia/Shanghai
-   30 1 * * * cd /opt/ai-code-audit && /usr/bin/python3 runner/run_daily.py >> /data/ai-audit/logs/$(date +\%F).log 2>&1
-   ```
-9. **看板发布**：把 `output_dir/dashboard/` 用内网 Nginx 静态托管（加公司 SSO 或 IP 白名单），`output_dir/reports/` 同目录发布供下载。
+一次批次可使用 `--only 项目A 项目B` 并行扫描多个项目。`.env` 中的 `AUDIT_MAX_PARALLEL` 控制项目并发数，`AUDIT_MAX_MODEL_CONCURRENCY` 控制模型会话并发数。相同数据目录不允许两个独立批次同时写入；如果提示已有任务占用，请先检查 `docker ps` 并等待它结束，不要删除锁文件。
 
 ## 输出
 

@@ -39,7 +39,9 @@ if not re.search(r"^name: [a-z0-9-]+$", skill, re.M):
     errors.append("SKILL.md frontmatter 缺少合法 name")
 
 dockerfile = (ROOT / "docker/Dockerfile").read_text(encoding="utf-8")
-for src in re.findall(r"^COPY (\S+)", dockerfile, re.M):
+for option, src in re.findall(r"^COPY\s+(?:(--\S+)\s+)?(\S+)", dockerfile, re.M):
+    if option.startswith("--from="):
+        continue  # 多阶段镜像的源来自构建阶段，不是本地文件。
     if not (ROOT / src).exists():
         errors.append(f"Dockerfile COPY 的源不存在：{src}")
 

@@ -47,7 +47,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m unittest discover -s tests
-      - run: node --test tests/test_pi_events.cjs tests/test_pi_config.cjs
       - run: python tests/check_consistency.py
       - run: python tools/gen_checklist.py && git diff --exit-code -- config/checklist.json
       - run: python tests/make_samples.py /tmp/out
@@ -194,6 +193,10 @@ jobs:
             docker run --rm --network none --platform "linux/$arch" \
               -e AUDIT_DATA_DIR=/tmp/audit -e AUDIT_MODEL_NETWORK=ci-model \
               "$img" --help | grep -q -- '--dry-run'
+            docker run --rm --network none --platform "linux/$arch" \
+              -e PYTHONPATH=/opt/ai-code-audit \
+              -v "$PWD/tests/runner_prescan_smoke.py:/test/prescan.py:ro" \
+              --entrypoint python3 "$img" /test/prescan.py
           done
 
       - name: 验证两个镜像与 OpenAI 兼容模型的 Harness 工具调用

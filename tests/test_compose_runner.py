@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT / "docker"))
 from test_runner import valid_result  # noqa: E402
+from audit_fixture import markdown_from_result  # noqa: E402
 import compose_entrypoint  # noqa: E402
 
 
@@ -30,7 +31,7 @@ class ComposeRunnerTest(unittest.TestCase):
         return result.stdout.strip()
 
     def test_compose_can_select_harness_without_dimension_split(self):
-        settings = {"agent": {"type": "pi-docker", "strategy": "dimensions"}}
+        settings = {"agent": {"type": "deepseek-harness", "strategy": "dimensions"}}
         configured = compose_entrypoint.configure_settings(settings, {
             "AUDIT_DATA_DIR": str(self.root / "data"),
             "AUDIT_MODEL_NETWORK": "harness-net",
@@ -48,7 +49,7 @@ class ComposeRunnerTest(unittest.TestCase):
         self.assertEqual(agent["args"], ["headless", "--json"])
 
         defaults = compose_entrypoint.configure_settings(
-            {"agent": {"type": "pi-docker", "strategy": "dimensions"}},
+            {"agent": {"type": "deepseek-harness", "strategy": "dimensions"}},
             {"AUDIT_DATA_DIR": str(self.root / "data"),
              "AUDIT_MODEL_NETWORK": "harness-net",
              "AUDIT_AGENT_TYPE": "deepseek-harness",
@@ -68,9 +69,32 @@ class ComposeRunnerTest(unittest.TestCase):
                  "AUDIT_HARNESS_ARGS": "dsh headless --json"},
             )
 
+    def test_compose_rejects_old_agent_backend(self):
+        with self.assertRaisesRegex(ValueError, "deepseek-harness"):
+            compose_entrypoint.configure_settings(
+                {"agent": {}},
+                {"AUDIT_DATA_DIR": str(self.root / "data"), "AUDIT_MODEL_NETWORK": "harness-net",
+                 "AUDIT_AGENT_TYPE": "pi-docker"},
+            )
+
+    def test_compose_configures_project_and_model_concurrency(self):
+        configured = compose_entrypoint.configure_settings(
+            {"agent": {"type": "deepseek-harness"}},
+            {"AUDIT_DATA_DIR": str(self.root / "data"), "AUDIT_MODEL_NETWORK": "harness-net",
+             "AUDIT_MAX_PARALLEL": "4", "AUDIT_MAX_MODEL_CONCURRENCY": "2"},
+        )
+        self.assertEqual(configured["max_parallel"], 4)
+        self.assertEqual(configured["max_model_concurrency"], 2)
+        with self.assertRaisesRegex(ValueError, "AUDIT_MAX_PARALLEL"):
+            compose_entrypoint.configure_settings(
+                {"agent": {"type": "deepseek-harness"}},
+                {"AUDIT_DATA_DIR": str(self.root / "data"), "AUDIT_MODEL_NETWORK": "harness-net",
+                 "AUDIT_MAX_PARALLEL": "0"},
+            )
+
     def test_compose_can_enable_isolated_summary_with_harness_defaults(self):
         configured = compose_entrypoint.configure_settings(
-            {"agent": {"type": "pi-docker"}, "summary": {"enabled": False}},
+            {"agent": {"type": "deepseek-harness"}, "summary": {"enabled": False}},
             {"AUDIT_DATA_DIR": str(self.root / "data"),
              "AUDIT_MODEL_NETWORK": "harness-net",
              "AUDIT_AGENT_TYPE": "deepseek-harness",
@@ -133,10 +157,7 @@ class ComposeRunnerTest(unittest.TestCase):
 
         settings = json.loads((ROOT / "config/settings.json").read_text(encoding="utf-8"))
         settings.update({"prescan_tools": [], "max_parallel": 1})
-        settings["agent"].update(
-            type="pi-docker",
-            strategy="single",
-        )  # 本测试专注于旧 Pi 单会话链路的宿主机挂载路径。
+        settings["agent"].update(type="deepseek-harness", strategy="single")
         settings_file = self.root / "settings.json"
         settings_file.write_text(json.dumps(settings), encoding="utf-8")
         model_file = self.root / "model.env"
@@ -164,8 +185,8 @@ class ComposeRunnerTest(unittest.TestCase):
                    AUDIT_SCANNER_IMAGE="example.test/scanner:test", AUDIT_MODEL_ENV_PATH=str(model_file),
                    AUDIT_SETTINGS_FILE=str(settings_file), AUDIT_PROJECTS_FILE=str(projects),
                    FAKE_DOCKER_LOG=str(log_file),
-                   FAKE_DOCKER_EVENTS=json.dumps([{"result": json.dumps(output, ensure_ascii=False)}],
-                                                ensure_ascii=False))
+                   FAKE_DOCKER_EVENTS=json.dumps({"type": "final", "reason": {"kind": "completed"},
+                                                 "text": markdown_from_result(output)}, ensure_ascii=False))
         result = subprocess.run([sys.executable, str(ROOT / "docker/compose_entrypoint.py"),
                                  "--date", "2026-11-21", "--force-full"],
                                 env=env, capture_output=True, text=True, timeout=60)
@@ -181,7 +202,9 @@ class ComposeRunnerTest(unittest.TestCase):
             self.assertIn(f"{data_dir}/work/{pid}/context:/workspace/context:ro", args)
             self.assertEqual(args[args.index("--network") + 1], "test-model-net")
             self.assertEqual(args[args.index("--env-file") + 1], str(model_file))
-            self.assertEqual(args[-1], "example.test/scanner:test")
+            image_index = args.index("example.test/scanner:test")
+            self.assertEqual(args[image_index + 1:image_index + 3], ["dsh", "headless"])
+            self.assertIn("OUTPUT_FORMAT: markdown", args[-1])
             self.assertNotIn("dummy-secret", " ".join(args))
 
     def test_git_credentials_are_selected_per_repository_and_never_rewritten(self):

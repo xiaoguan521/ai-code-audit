@@ -15,7 +15,7 @@
 | Runner 镜像 | 拉取 Git、调度任务、启动扫描容器、解析 Markdown、校验证据、评分和生成报表 | 必须使用包含 Harness Adapter 的新版本 |
 | Scanner 扫描镜像 | 真正运行 `dsh headless`，执行代码审查 | 必须是包含 `dsh`、八性 Skill 和 Profile 的 Harness 镜像 |
 
-本仓库的 `docker/Dockerfile` 现在直接安装官方 `@deepseek-ai/dsh`，并把八性 Skill 放到 Harness 的 `DSH_BUNDLED_SKILL_DIR`。`docker/Dockerfile.pi` 仅作为回滚镜像保留。推送到 GitHub 后由 `.github/workflows/build-image.yml` 构建 amd64/arm64 镜像；内网需要同步扫描和调度两个新镜像到 Harbor。
+本仓库的 `docker/Dockerfile` 直接安装官方 `@deepseek-ai/dsh`，并把八性 Skill 放到 Harness 的 `DSH_BUNDLED_SKILL_DIR`。本版已移除旧 Agent。推送到 GitHub 后由 `.github/workflows/build-image.yml` 构建 amd64/arm64 镜像；内网需要同步扫描和调度两个新镜像到 Harbor。
 
 在内网导入或同步后，先用下面的命令确认扫描镜像确实是 DeepSeek Harness：
 
@@ -233,25 +233,9 @@ data/output/artifacts/<日期>/<项目ID>/
 4. `reuse` 只会复用通过当前源码证据核验的旧结果；不会因为旧结果存在就跳过证据验证。
 5. 不要把旧 Pi 的 JSON 输出直接放入 `audit.md`。Harness 必须返回带 `audit-*` 机器字段块的完整 Markdown。
 
-## 八、回滚到 Pi
+## 八、版本兼容
 
-如果 Harness 镜像、Profile 或模型接口暂时不可用，可以只回滚 `.env` 中的 Agent 配置：
-
-```dotenv
-AUDIT_AGENT_TYPE=pi-docker
-AUDIT_SCANNER_IMAGE=<旧 Pi 扫描镜像>
-AUDIT_SUMMARY_ENABLED=false
-```
-
-Runner 仍支持 Pi 的兼容链路。回滚后先验证：
-
-```bash
-docker compose config --quiet
-docker compose run --rm --pull never audit \
-  --only <项目ID> --force-full
-```
-
-不要通过删除历史目录来“解决”切换问题；先查看 `data/output/results/<日期>/<项目ID>.error.txt` 和 `_run.json` 中的错误信息。
+当前 Runner 已移除旧 Agent，必须使用 DeepSeek Harness。旧系统如需恢复，必须同时恢复旧 Runner、旧扫描镜像及配置。
 
 ## 九、常见问题
 
@@ -273,5 +257,5 @@ docker compose run --rm --pull never audit \
 - `audit.md`、`audit.json`、`metrics.json` 和 `run-events.jsonl` 均已生成；
 - 报告、CSV 和看板能正常渲染；
 - 明确记录 `agent_status`、`audit_status` 和 `summary_status`；
-- 已保留 Pi 配置备份，并完成一次回滚演练；
+- 已保留升级前的配置备份；
 - 确认 Harness 容器没有源码写权限、没有 Git 凭据，也没有不受限制的外网访问权限。

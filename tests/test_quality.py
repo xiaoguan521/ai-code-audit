@@ -15,6 +15,7 @@ import evaluate  # noqa: E402
 import prepare  # noqa: E402
 from dataset import fixture_digest  # noqa: E402
 from test_runner import valid_result  # noqa: E402
+from audit_fixture import markdown_from_result  # noqa: E402
 
 
 class QualitySuiteTest(unittest.TestCase):
@@ -79,7 +80,7 @@ class QualitySuiteTest(unittest.TestCase):
 
     def test_prepare_creates_separate_committed_repositories(self):
         settings = self.root / "source-settings.json"
-        settings.write_text(json.dumps({"agent": {"type": "pi-docker", "env_file": "/tmp/model.env"}}), encoding="utf-8")
+        settings.write_text(json.dumps({"agent": {"type": "deepseek-harness", "env_file": "/tmp/model.env"}}), encoding="utf-8")
         dest = self.root / "suite"
         prepare.prepare(dest, settings)
         generated = json.loads((dest / "settings.json").read_text(encoding="utf-8"))
@@ -99,7 +100,10 @@ class QualitySuiteTest(unittest.TestCase):
         fake_results = self.write_results()
         config = json.loads((ROOT / "config/settings.json").read_text(encoding="utf-8"))
         config.update(max_parallel=2, prescan_tools=[])
-        config["agent"].update(type="pi-docker", network="test-network", env_file="/tmp/test-model.env")
+        config["agent"].update(type="deepseek-harness", network="test-network", env_file="/tmp/test-model.env")
+        for path in fake_results.glob("*.json"):
+            path.with_suffix(".md").write_text(markdown_from_result(json.loads(path.read_text(encoding="utf-8"))),
+                                               encoding="utf-8")
         config_path = self.root / "source-settings.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
         dest = self.root / "suite"
@@ -114,19 +118,8 @@ class QualitySuiteTest(unittest.TestCase):
             "from pathlib import Path\n"
             "mount = next(a for a in sys.argv if a.endswith(':/workspace/repo:ro'))\n"
             "pid = Path(mount[:-len(':/workspace/repo:ro')]).parent.name\n"
-            "payload = json.loads((Path(os.environ['FIXTURE_RESULTS']) / (pid + '.json')).read_text())\n"
-            "ctx = next(a for a in sys.argv if a.endswith(':/workspace/context:ro'))\n"
-            "schema_file = Path(ctx[:-len(':/workspace/context:ro')]) / 'dimension.schema.json'\n"
-            "if schema_file.exists():\n"
-            "    schema = json.loads(schema_file.read_text())\n"
-            "    ids = set(schema['properties']['items']['items']['properties']['id']['enum'])\n"
-            "    payload['items'] = [i for i in payload['items'] if i['id'] in ids]\n"
-            "    payload['issues'] = [i for i in payload['issues'] if i['item_id'] in ids]\n"
-            "    payload['dimension_notes'] = [d for d in payload['dimension_notes'] if d['dimension'] == next(iter(ids)).split('.')[0]]\n"
-            "    payload['need_info_list'] = [dict(g, items=[i for i in g['items'] if i in ids]) for g in payload['need_info_list']]\n"
-            "    payload['need_info_list'] = [g for g in payload['need_info_list'] if g['items']]\n"
-            "    payload = {k: v for k, v in payload.items() if k in schema['properties']}\n"
-            "print(json.dumps([{'result': json.dumps(payload), 'stats': {'turns': 1, 'tool_calls': 1}}]))\n",
+            "text = (Path(os.environ['FIXTURE_RESULTS']) / (pid + '.md')).read_text(encoding='utf-8')\n"
+            "print(json.dumps({'type': 'final', 'reason': {'kind': 'completed'}, 'text': text}))\n",
             encoding="utf-8",
         )
         docker.chmod(0o755)

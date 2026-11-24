@@ -111,42 +111,6 @@ class CheckOutputTest(unittest.TestCase):
         self.assertEqual(result["need_info_list"], [])
 
 
-class ExtractJsonTest(unittest.TestCase):
-    def setUp(self):
-        self.obj = valid_result()
-        self.obj["items"][0]["evidence"] = [{"path": "a.py", "start_line": 1, "snippet": "```python\nprint('x')\n```"}]
-        self.js = json.dumps(self.obj, ensure_ascii=False, indent=1)
-
-    def test_plain(self):
-        self.assertEqual(run_daily.extract_json(self.js), self.obj)
-
-    def test_fenced_with_inner_fence(self):
-        text = f"审查完成。\n```json\n{self.js}\n```\n以上。"
-        self.assertEqual(run_daily.extract_json(text), self.obj)
-
-    def test_prose_with_braces_before(self):
-        text = "注意配置里的 {timeout} 占位符，以及 {\"a\": 1}。\n" + self.js
-        self.assertEqual(run_daily.extract_json(text), self.obj)
-
-    def test_takes_last_complete_object(self):
-        first = copy.deepcopy(self.obj)
-        first["summary"]["undetermined"] = "草稿"
-        text = json.dumps(first, ensure_ascii=False) + "\n修正后：\n" + self.js
-        self.assertEqual(run_daily.extract_json(text), self.obj)
-
-    def test_missing_keys(self):
-        with self.assertRaisesRegex(run_daily.AgentOutputError, "缺少顶层字段"):
-            run_daily.extract_json('{"items": []}')
-
-    def test_truncated(self):
-        with self.assertRaisesRegex(run_daily.AgentOutputError, "解析失败"):
-            run_daily.extract_json(self.js[:-50])
-
-    def test_no_json(self):
-        with self.assertRaisesRegex(run_daily.AgentOutputError, "没有 JSON"):
-            run_daily.extract_json("抱歉，我无法完成。")
-
-
 class RetryTest(unittest.TestCase):
     """scan_project 的重试逻辑：结构不合格的输出绝不进入评分。"""
 
@@ -154,7 +118,7 @@ class RetryTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         settings = {"workdir": f"{tmp.name}/work", "output_dir": f"{tmp.name}/out", "prescan_tools": [],
-                    "agent": {"type": "claude"}}
+                    "agent": {"type": "deepseek-harness", "launcher": "local"}}
         repo = Path(settings["workdir"]) / "p1" / "repo"
         repo.mkdir(parents=True)
         (repo / "a.py").write_text("pass\n", encoding="utf-8")
@@ -188,7 +152,7 @@ class RetryTest(unittest.TestCase):
             (repo / "a.py").write_text("pass\n", encoding="utf-8")
             with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40):
                 run_daily.scan_project({"project_id": "p1", "project_name": "x"},
-                                       {"workdir": f"{tmp.name}/w", "output_dir": f"{tmp.name}/o", "agent": {"type": "claude"}},
+                                       {"workdir": f"{tmp.name}/w", "output_dir": f"{tmp.name}/o", "agent": {"type": "deepseek-harness", "launcher": "local"}},
                                        "2026-11-21", types.SimpleNamespace(force_full=True, dry_run=False), CK)
         second_prompt = agent.call_args_list[1].args[0]
         self.assertIn("上次输出校验未通过", second_prompt)
@@ -209,42 +173,24 @@ class RetryTest(unittest.TestCase):
 
 
 class NetworkTest(unittest.TestCase):
-    def test_container_backends_require_network(self):
-        for kind in ("pi-docker", "qwen-docker"):
-            self.assertIsNotNone(run_daily.network_problem({"agent": {"type": kind, "network": ""}}))
-            self.assertIsNotNone(run_daily.network_problem({"agent": {"type": kind}}))
-            self.assertIsNone(run_daily.network_problem({"agent": {"type": kind, "network": "audit-net"}}))
-            self.assertIsNone(run_daily.network_problem({"agent": {"type": kind, "network": "bridge"}}))
-        self.assertIsNone(run_daily.network_problem({"agent": {"type": "claude"}}))
+    def test_docker_harness_requires_explicit_network(self):
+        agent = {"type": "deepseek-harness", "image": "harness:test", "launcher": "docker"}
+        self.assertIsNotNone(run_daily.network_problem({"agent": agent}))
+        agent["network"] = "audit-net"
+        self.assertIsNone(run_daily.network_problem({"agent": agent}))
+        agent.update(launcher="local", network="")
+        self.assertIsNone(run_daily.network_problem({"agent": agent}))
 
-    def test_main_refuses_to_start(self):
+    def test_main_refuses_missing_network(self):
         with tempfile.TemporaryDirectory() as t:
             s = Path(t) / "settings.json"
-            s.write_text(json.dumps({"workdir": f"{t}/w", "output_dir": f"{t}/o", "agent": {"type": "pi-docker", "network": ""}}))
+            s.write_text(json.dumps({"workdir": f"{t}/w", "output_dir": f"{t}/o",
+                                     "agent": {"type": "deepseek-harness", "image": "harness:test"}}))
             with mock.patch.object(sys, "argv", ["run_daily.py", "--settings", str(s)]), \
                     mock.patch.object(run_daily, "scan_project") as scan:
                 self.assertEqual(run_daily.main(), 2)
             scan.assert_not_called()
             self.assertFalse((Path(t) / "o").exists())
-
-    def test_call_refuses_without_network(self):
-        with mock.patch.object(run_daily, "run") as run, tempfile.TemporaryDirectory() as t:
-            with self.assertRaisesRegex(RuntimeError, "agent.network"):
-                run_daily.call_pi_docker("p", Path(t), Path(t), {"agent": {"type": "pi-docker"}}, 10)
-            run.assert_not_called()
-
-    def test_network_passed_to_docker(self):
-        done = subprocess.CompletedProcess([], 0, stdout=json.dumps([{"result": json.dumps(valid_result())}]), stderr="")
-        with mock.patch.object(run_daily, "run", return_value=done) as run, tempfile.TemporaryDirectory() as t:
-            run_daily.call_pi_docker("p", Path(t), Path(t), {"agent": {"type": "pi-docker", "network": "audit-net"}}, 10)
-        cmd = run.call_args.args[0]
-        self.assertEqual(cmd[cmd.index("--network") + 1], "audit-net")
-
-    def test_nonzero_exit_is_reported(self):
-        done = subprocess.CompletedProcess([], 1, stdout="", stderr="模型服务不可用")
-        with mock.patch.object(run_daily, "run", return_value=done), tempfile.TemporaryDirectory() as t:
-            with self.assertRaisesRegex(RuntimeError, "模型服务不可用"):
-                run_daily.call_pi_docker("p", Path(t), Path(t), {"agent": {"type": "pi-docker", "network": "audit-net"}}, 10)
 
 
 class PromptTest(unittest.TestCase):
