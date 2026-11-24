@@ -199,20 +199,34 @@ def _parse_overview(text: str) -> tuple[dict[str, dict], list[str]]:
 
 
 def _parse_declaration(text: str, keywords: tuple[str, ...], formula_tail: bool = False) -> str | None:
-    """在全文搜索“关键词 + 数字/n/a/暂不评分”声明；找不到返回 None。
+    """找总分/安全分声明；找不到返回 None。
 
-    formula_tail 只用于总分：算式尾部形式“项目评分 = (...) / (...) = 6.6（基于 N/8 个维度）”。
+    先在“评分总览”小节内找（SKILL §11 要求总分算式写在总览表后）；
+    小节内找不到时，在全文里取最后一次出现——执行摘要里常先回顾上次
+    分数（“上次总评分 7.0，本次总评分 6.6”），取第一次会误读成上次分数。
+    formula_tail 只用于总分：算式尾部形式
+    “项目评分 = (...) / (...) = 6.6（基于 N/8 个维度）”。
     """
+    def pattern(keyword: str) -> str:
+        return rf"{re.escape(keyword)}\s*[=：:﹕]?\s*(\d+(?:\.\d+)?|n/a|暂不评分)"
+
+    overview_text = "\n".join(_find_section(text, "评分总览"))
     for keyword in keywords:
-        match = re.search(
-            rf"{re.escape(keyword)}\s*[=：:﹕]?\s*(\d+(?:\.\d+)?|n/a|暂不评分)",
-            text, re.IGNORECASE)
+        match = re.search(pattern(keyword), overview_text, re.IGNORECASE)
         if match:
             return match.group(1)
     if formula_tail:
-        match = re.search(r"=\s*(\d+(?:\.\d+)?)\s*（基于", text)
+        match = re.search(r"=\s*(\d+(?:\.\d+)?)\s*（基于", overview_text)
         if match:
             return match.group(1)
+    for keyword in keywords:
+        matches = list(re.finditer(pattern(keyword), text, re.IGNORECASE))
+        if matches:
+            return matches[-1].group(1)
+    if formula_tail:
+        matches = list(re.finditer(r"=\s*(\d+(?:\.\d+)?)\s*（基于", text))
+        if matches:
+            return matches[-1].group(1)
     return None
 
 
@@ -257,6 +271,28 @@ def validate_report(text: str, repo: Path, checklist: dict, weights: dict,
         problems.append(f"缺少检查项：{shown}{suffix}")
     if extra:
         problems.append(f"多余检查项：{', '.join(extra)}")
+
+    if items:
+        # WARN/FAIL 与风险问题清单的关联：每条 WARN/FAIL 必须在清单里有
+        # 对应条目，每条清单条目必须对应一个 WARN/FAIL 项。注意不要调
+        # scoring.validate()：它还要求 NEED_INFO 项进待补充清单，而这里
+        # need_info_list 是空列表，直接调会把每个 NEED_INFO 项误报。
+        issue_by_item: dict[str, list[dict]] = {}
+        for issue in issues:
+            issue_by_item.setdefault(issue["item_id"], []).append(issue)
+        item_by_id = {item["id"]: item for item in items}
+        for item in items:
+            if item["result"] in ("WARN", "FAIL") and item["id"] not in issue_by_item:
+                problems.append(f"{item['id']} 为 {item['result']} 但未列入风险问题清单")
+        for issue in issues:
+            target = item_by_id.get(issue["item_id"])
+            if target is None:
+                problems.append(
+                    f"风险问题 {issue.get('issue_id', '?')} 对应的检查项 {issue['item_id']} 不存在")
+            elif target["result"] not in ("WARN", "FAIL"):
+                problems.append(
+                    f"风险问题 {issue.get('issue_id', '?')} 对应的检查项 {issue['item_id']} "
+                    f"不是 WARN/FAIL（为 {target['result']}）")
 
     # 风险等级回填：逐项表无等级列时（旧格式），用问题清单的等级补。
     if items:
@@ -309,7 +345,8 @@ def validate_report(text: str, repo: Path, checklist: dict, weights: dict,
                 problems.append(f"总分声明为暂不评分，但重算得分为 {recomputed['total']}")
             elif abs(float(total_declared) - recomputed["total"]) > 0.1:
                 problems.append(f"项目总分不一致：声明 {total_declared}，重算 {recomputed['total']}")
-        based_match = re.search(r"基于\s*(\d+)\s*/\s*8", text)
+        based_matches = list(re.finditer(r"基于\s*(\d+)\s*/\s*8", text))
+        based_match = based_matches[-1] if based_matches else None
         if based_match and int(based_match.group(1)) != recomputed["scored_dimensions"]:
             problems.append(
                 f"可评分维度数不一致：声明基于 {based_match.group(1)}/8 个维度，"

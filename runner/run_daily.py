@@ -25,8 +25,11 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
+import weakref
+from concurrent.futures.thread import _worker  # 私有 stdlib 名；daemon 执行器复用它建线程
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -939,6 +942,12 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
                 previous = None
                 (ctx / "changed_files.json").unlink(missing_ok=True)
                 (ctx / "previous_report.md").unlink(missing_ok=True)
+            if changed_paths is None:
+                # Git diff 不可用不是“无变更”：走全量，且不把上次报告当上下文
+                # 传给模型（TTL 与 plan.full_scan 两条路都显式清了，这里补上）。
+                # 首轮无旧 state 时 previous 本来就是 None，unlink 无害。
+                previous = None
+                (ctx / "previous_report.md").unlink(missing_ok=True)
             # An unavailable Git diff is not an empty change set: ask for a full review.
             scan_type = "incremental" if previous and (ctx / "changed_files.json").is_file() else "full"
             recheck_items = None
@@ -988,6 +997,9 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
             if secret_hits:
                 rec["secret_scan"] = {"blocked": True, "patterns": secret_hits}
                 raise RuntimeError("报告脱敏检查未通过，已拦截落盘")
+            # 批次超时作废点：校验与脱敏之后、落盘之前。若批次已超时，本轮
+            # 该项目记 error（外层 except），不落盘、不写 state。
+            _check_abort(settings)
             report_path = report_dir / f"{pid}.md"
             write_text_atomic(report_path, raw, mode=0o600)
             result_dir.mkdir(parents=True, exist_ok=True)
@@ -1023,6 +1035,10 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
             if snapshot_at is not None:
                 state.update({"snapshot_at": snapshot_text(snapshot_at),
                               "snapshot_method": SNAPSHOT_METHOD})
+            # 批次超时作废点之二：写 state 之前。若在落盘与写 state 之间
+            # 批次超时，报告文件可能已落地，但 state 仍指向旧的好报告，
+            # 本轮该项目记 error，不更新 state。
+            _check_abort(settings)
             write_json_atomic(state_file, state, mode=0o600)
     except Exception as exc:
         rec.update({"status": "error", "error": str(exc)[:800],
@@ -1031,6 +1047,50 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
     finally:
         metrics["total_seconds"] = round(time.perf_counter() - started, 4)
     return rec
+
+
+def _check_abort(settings: dict) -> None:
+    """批次超时后作废本次扫描：孤儿线程不再落盘、不写 state。"""
+    event = settings.get("_abort_event")
+    if event is not None and event.is_set():
+        raise RuntimeError("批次已超时，本次扫描作废")
+
+
+class DaemonThreadPoolExecutor(cf.ThreadPoolExecutor):
+    """工作线程为 daemon 且不登记 _threads_queues 的 ThreadPoolExecutor。
+
+    只置 daemon=True 不够：CPython 3.12 的 concurrent.futures.thread
+    ._python_exit() 会 join _threads_queues 里的全部线程（含 daemon），
+    实测进程仍会被孤儿线程拖住（10 秒任务照样等满 10 秒）。这里按
+    3.12 的 _adjust_thread_count 写法重写，只改两点：建线程时置
+    daemon=True，且不写 _threads_queues——_threads_queues 只被
+    _python_exit() 用来 join，跳过登记不影响正常路径（正常路径仍用
+    shutdown(wait=True) 显式等；executor 被回收时 weakref 回调仍会唤
+    醒空闲线程）。批次超时后未完成的扫描会被进程退出丢弃（预期行
+    为）：落盘前与写 state 前的 abort 检查保证它们不会写出结果；
+    Harness 调用本身受 per_project_timeout_sec 约束，容器由 Harness
+    自身的超时/清理负责。
+    """
+
+    def _adjust_thread_count(self):
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread_name = '%s_%d' % (self._thread_name_prefix or self,
+                                     num_threads)
+            t = threading.Thread(name=thread_name, target=_worker,
+                                 args=(weakref.ref(self, weakref_cb),
+                                       self._work_queue,
+                                       self._initializer,
+                                       self._initargs))
+            t.daemon = True
+            t.start()
+            self._threads.add(t)
 
 
 def main() -> int:
@@ -1120,6 +1180,7 @@ def main() -> int:
         progress["report_mode"] = report_mode
     write_json_atomic(runlog, progress, mode=0o600)
     completed = {}
+    batch_timed_out = False
     if args.summary_only:
         report_dir = outdir / "reports" / run_date / args.run_id
         for p in projects:
@@ -1148,8 +1209,12 @@ def main() -> int:
         write_json_atomic(runlog, progress, mode=0o600)
     else:
         # 手动管理 executor：批次总时限到时不再等待运行中的任务，未完成项目
-        # 记 error，随后仍正常汇总已完成的 recs。
-        executor = cf.ThreadPoolExecutor(max_workers=parallel)
+        # 记 error，随后仍正常汇总已完成的 recs。工作线程是 daemon 且不登记
+        # _threads_queues，进程退出时不被孤儿线程拖住；超时后先 set abort
+        # 事件，孤儿线程在落盘前与写 state 前作废，不写出结果。
+        abort_event = threading.Event()
+        settings["_abort_event"] = abort_event
+        executor = DaemonThreadPoolExecutor(max_workers=parallel)
         jobs = {executor.submit(scan_project, p, settings, run_date, args, snapshot_at): p for p in projects}
         try:
             for job in cf.as_completed(jobs, timeout=batch_timeout):
@@ -1165,6 +1230,8 @@ def main() -> int:
                 progress["pending_projects"] = [pid for pid in ids if pid not in completed]
                 write_json_atomic(runlog, progress, mode=0o600)
         except TimeoutError:
+            batch_timed_out = True
+            abort_event.set()
             log(f"批次总时限到（{batch_timeout} 秒），未完成项目记为失败，不再等待")
             for p in projects:
                 if p["project_id"] not in completed:
@@ -1180,9 +1247,14 @@ def main() -> int:
     recs = progress["projects"]
     if not args.dry_run:
         report_dir = outdir / "reports" / run_date / args.run_id
+        summary_settings = settings
+        if batch_timed_out:
+            # 批次已超时：孤儿线程可能占着模型名额，汇总只等 1 秒；拿不到
+            # 名额就走已有的汇总失败兜底（项目报告不受影响）。
+            summary_settings = dict(settings, model_queue_timeout_sec=1)
         try:
-            with model_slot(settings):
-                summary_settings = dict(settings, _progress_callback=progress_logger("整体汇总"))
+            with model_slot(summary_settings):
+                summary_settings = dict(summary_settings, _progress_callback=progress_logger("整体汇总"))
                 summary = summary_adapter.generate_batch(recs, report_dir, summary_settings, args.run_id)
             write_text_atomic(report_dir / "_summary.md", summary["text"], mode=0o600)
             progress["summary_status"] = summary["status"]
