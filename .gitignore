@@ -15,3 +15,6 @@ model.env
 /config/projects.local.csv
 /secrets/
 /audit-data/
+# 本地临时文件与测试报告
+/claude/
+*-report.md

@@ -100,6 +100,7 @@ class QualitySuiteTest(unittest.TestCase):
         fake_results = self.write_results()
         config = json.loads((ROOT / "config/settings.json").read_text(encoding="utf-8"))
         config.update(max_parallel=2, prescan_tools=[])
+        config["summary"]["enabled"] = False
         config["agent"].update(type="deepseek-harness", network="test-network", env_file="/tmp/test-model.env")
         for path in fake_results.glob("*.json"):
             path.with_suffix(".md").write_text(markdown_from_result(json.loads(path.read_text(encoding="utf-8"))),
@@ -130,13 +131,14 @@ class QualitySuiteTest(unittest.TestCase):
                                  env=env, capture_output=True, text=True, timeout=45)
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         result_dir = dest / "output/results/2026-11-23"
-        progress = json.loads((result_dir / "_run.json").read_text(encoding="utf-8"))
+        progress = json.loads(next(result_dir.glob("*/_run.json")).read_text(encoding="utf-8"))
         self.assertEqual(progress["status"], "complete")
-        self.assertTrue(all(p["status"] == "ok" and p["metrics"]["code_map"]["status"] == "ok"
-                            for p in progress["projects"]))
-        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
-        report = evaluate.evaluate(result_dir, manifest)
-        self.assertEqual((report["passed_checks"], report["total_checks"]), (5, 5))
+        self.assertTrue(all(p["status"] == "ok" for p in progress["projects"]))
+        for record in progress["projects"]:
+            self.assertEqual(Path(record["report_path"]).read_text(encoding="utf-8"),
+                             (fake_results / (record["project_id"] + ".md")).read_text(encoding="utf-8"))
+        self.assertFalse(list(result_dir.rglob("sql_unsafe.json")))
+
 
 
 if __name__ == "__main__":

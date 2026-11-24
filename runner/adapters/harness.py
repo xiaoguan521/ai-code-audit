@@ -2,7 +2,7 @@
 
 The adapter owns only the process lifecycle and event transport. It does not
 plan audit steps, inspect source files, or decide how the Agent Loop works.
-The final Markdown answer is returned unchanged for the parser layer.
+The final Markdown answer is returned unchanged as the project report.
 """
 from __future__ import annotations
 

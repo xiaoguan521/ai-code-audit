@@ -51,8 +51,9 @@ class ProgressTest(unittest.TestCase):
                 deadline = time.monotonic() + 3
                 progress = {}
                 while time.monotonic() < deadline:
-                    if self.log.exists():
-                        progress = json.loads(self.log.read_text(encoding="utf-8"))
+                    logs = list(self.log.parent.glob("*/_run.json"))
+                    if logs:
+                        progress = json.loads(logs[0].read_text(encoding="utf-8"))
                         if len(progress.get("projects", [])) == 1:
                             break
                     time.sleep(0.01)
@@ -64,7 +65,7 @@ class ProgressTest(unittest.TestCase):
                 thread.join(5)
         self.assertFalse(thread.is_alive())
         self.assertEqual(results, [0])
-        self.assertEqual(json.loads(self.log.read_text(encoding="utf-8"))["status"], "complete")
+        self.assertEqual(json.loads(next(self.log.parent.glob("*/_run.json")).read_text(encoding="utf-8"))["status"], "complete")
 
     def test_dry_run_does_not_overwrite_formal_run_log(self):
         self.log.parent.mkdir(parents=True)
@@ -76,7 +77,7 @@ class ProgressTest(unittest.TestCase):
         with mock.patch.object(sys, "argv", args), mock.patch.object(run_daily, "scan_project", side_effect=scan):
             self.assertEqual(run_daily.main(), 0)
         self.assertEqual(json.loads(self.log.read_text(encoding="utf-8")), {"previous": True})
-        self.assertTrue((self.log.parent / "_dry_run.json").exists())
+        self.assertEqual(len(list(self.log.parent.glob("*/_run.json"))), 1)
 
     def test_project_id_cannot_escape_workspace(self):
         self.projects.write_text("project_id,project_name,status\n../outside,unsafe,在研\n", encoding="utf-8")

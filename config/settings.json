@@ -5,12 +5,7 @@
   "max_parallel": 2,
   "max_model_concurrency": 2,
   "per_project_timeout_sec": 3600,
-  "full_scan_weekday": 6,
-  "full_scan_strategy": "weekday",
-  "full_scan_interval_days": 7,
   "clone_depth": 200,
-  "code_map_enabled": true,
-  "code_map_max_entries": 120,
   "default_scope_out": [
     "vendor/",
     "node_modules/",
@@ -29,24 +24,10 @@
     "lizard"
   ],
   "prescan_parallelism": 2,
-  "alert": {
-    "score_drop_threshold": 1.0,
-    "new_p0": true
-  },
   "summary": {
-    "enabled": false,
+    "enabled": true,
     "timeout_sec": 900,
-    "agent": {
-      "type": "deepseek-harness",
-      "strategy": "single",
-      "launcher": "docker",
-      "image": "deepseek-harness:固定版本",
-      "network": "ai-audit-net",
-      "bin": "dsh",
-      "args": ["headless", "--json", "--permission-mode", "read-only", "--approval-policy", "never"],
-      "env_file": "/etc/ai-audit/deepseek.env"
-    },
-    "_说明": "enabled=true 时启动独立 Summary Agent；它只读取 audit.md/audit.json，不读取源码；未配置凭证、启动失败或输出无效时自动使用确定性摘要，不影响审查评分"
+    "_说明": "独立 Harness 会话只读取本次项目 Markdown；汇总失败时保留项目报告及索引"
   },
   "agent": {
     "type": "deepseek-harness",
@@ -56,7 +37,14 @@
     "env_file": "/etc/ai-audit/model.env",
     "network": "ai-audit-model-net",
     "bin": "dsh",
-    "args": ["headless", "--json", "--permission-mode", "read-only", "--approval-policy", "never"],
+    "args": [
+      "headless",
+      "--json",
+      "--permission-mode",
+      "read-only",
+      "--approval-policy",
+      "never"
+    ],
     "memory": "6g",
     "cpus": 2,
     "_说明": "只支持 DeepSeek Harness；必须 strategy=single，由完整 Harness Agent Loop 自己拆分任务，不由 Runner 按维度拆分"

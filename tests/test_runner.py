@@ -83,95 +83,6 @@ class SchemaTest(unittest.TestCase):
         self.assertTrue(scoring.schema_errors(r))
 
 
-class CheckOutputTest(unittest.TestCase):
-    def test_structural_raises_with_full_problem_list(self):
-        with self.assertRaises(run_daily.AgentOutputError) as cm:
-            run_daily.check_output(with_structural_problem(), CK)
-        self.assertTrue(cm.exception.problems)
-
-    def test_semantic_returns_problems(self):
-        problems = run_daily.check_output(with_semantic_problem(), CK)
-        self.assertTrue(any("1.1" in p for p in problems), problems)
-
-    def test_undetermined_items_and_dimensions_must_be_represented(self):
-        result = valid_result()
-        result["items"][0].update(result="NEED_INFO-证据不足", evidence=[])
-        result["dimension_notes"][0]["dimension"] = "2"
-        problems = run_daily.check_output(result, CK)
-        self.assertTrue(any("1.1" in p and "待补充" in p for p in problems))
-        self.assertTrue(any("维度结论" in p for p in problems))
-
-    def test_need_info_cannot_reference_unknown_item(self):
-        result = valid_result()
-        result["need_info_list"] = [{"items": ["9.9"], "missing": "材料", "why": "原因",
-                                     "form": "文档", "unlocks": "结论", "priority": "中"}]
-        problems = run_daily.check_output(result, CK)
-        self.assertTrue(any("不存在的检查项" in p for p in problems))
-        self.assertEqual(run_daily.repair_semantics(result, CK), [])
-        self.assertEqual(result["need_info_list"], [])
-
-
-class RetryTest(unittest.TestCase):
-    """scan_project 的重试逻辑：结构不合格的输出绝不进入评分。"""
-
-    def run_scan(self, outputs):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        settings = {"workdir": f"{tmp.name}/work", "output_dir": f"{tmp.name}/out", "prescan_tools": [],
-                    "agent": {"type": "deepseek-harness", "launcher": "local"}}
-        repo = Path(settings["workdir"]) / "p1" / "repo"
-        repo.mkdir(parents=True)
-        (repo / "a.py").write_text("pass\n", encoding="utf-8")
-        project = {"project_id": "p1", "project_name": "测试项目"}
-        args = types.SimpleNamespace(force_full=True, dry_run=False)
-        calls = iter(outputs)
-
-        def fake_agent(*_a, **_k):
-            r = next(calls)
-            if isinstance(r, Exception):
-                raise r
-            return {"result": copy.deepcopy(r), "cost_usd": None, "session_id": "s"}
-
-        with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
-                mock.patch.object(run_daily, "call_agent", side_effect=fake_agent) as agent:
-            rec = run_daily.scan_project(project, settings, "2026-11-21", args, CK)
-        return rec, agent.call_count
-
-    def test_structural_then_good(self):
-        rec, n = self.run_scan([with_structural_problem(), valid_result()])
-        self.assertEqual((rec["status"], n, rec["validation_problems"]), ("ok", 2, 0))
-
-    def test_retry_prompt_lists_schema_problems(self):
-        with mock.patch.object(run_daily, "call_agent") as agent:
-            agent.side_effect = [{"result": with_structural_problem(), "cost_usd": None, "session_id": "s"},
-                                 {"result": valid_result(), "cost_usd": None, "session_id": "s"}]
-            tmp = tempfile.TemporaryDirectory()
-            self.addCleanup(tmp.cleanup)
-            repo = Path(tmp.name) / "w" / "p1" / "repo"
-            repo.mkdir(parents=True)
-            (repo / "a.py").write_text("pass\n", encoding="utf-8")
-            with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40):
-                run_daily.scan_project({"project_id": "p1", "project_name": "x"},
-                                       {"workdir": f"{tmp.name}/w", "output_dir": f"{tmp.name}/o", "agent": {"type": "deepseek-harness", "launcher": "local"}},
-                                       "2026-11-21", types.SimpleNamespace(force_full=True, dry_run=False), CK)
-        second_prompt = agent.call_args_list[1].args[0]
-        self.assertIn("上次输出校验未通过", second_prompt)
-        self.assertIn("NEED_INFO", second_prompt)
-
-    def test_structural_twice_fails_cleanly(self):
-        rec, n = self.run_scan([with_structural_problem(), with_structural_problem()])
-        self.assertEqual((rec["status"], n), ("error", 2))
-        self.assertIn("JSON Schema", rec["error"])
-
-    def test_semantic_then_structural_does_not_score(self):
-        rec, n = self.run_scan([with_semantic_problem(), with_structural_problem()])
-        self.assertEqual((rec["status"], n), ("ok", 1))
-
-    def test_unparseable_then_good(self):
-        rec, n = self.run_scan([run_daily.AgentOutputError("最终回复中没有 JSON 对象"), valid_result()])
-        self.assertEqual((rec["status"], n), ("ok", 2))
-
-
 class NetworkTest(unittest.TestCase):
     def test_docker_harness_requires_explicit_network(self):
         agent = {"type": "deepseek-harness", "image": "harness:test", "launcher": "docker"}
@@ -196,13 +107,11 @@ class NetworkTest(unittest.TestCase):
 class PromptTest(unittest.TestCase):
     def test_large_change_list_points_to_complete_manifest(self):
         project = {"project_id": "p", "project_name": "测试项目"}
-        changes = [f"file-{i}.py" for i in range(801)]
-        prompt = run_daily.build_prompt(project, "incremental", "c" * 40, {}, None,
-                                        "/workspace/context/previous_result.json", changes, False,
-                                        "/workspace/context/changed_files.txt")
+        prompt = run_daily.build_prompt(project, "c" * 40, {}, "incremental",
+                                        prev_file="/workspace/context/previous_result.json",
+                                        changes_file="/workspace/context/changed_files.txt")
         self.assertIn("/workspace/context/changed_files.txt", prompt)
-        self.assertIn("file-799.py", prompt)
-        self.assertNotIn("file-800.py", prompt)
+        self.assertIn("仅作参考", prompt)
 
 
 class SyncRepoTest(unittest.TestCase):

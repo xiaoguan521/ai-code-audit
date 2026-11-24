@@ -55,6 +55,11 @@ def configure_settings(settings: dict, env: dict) -> dict:
 
     settings["workdir"] = str(Path(data_dir) / "work")
     settings["output_dir"] = str(Path(data_dir) / "output")
+    semgrep_rules = env.get("AUDIT_SEMGREP_RULES_DIR", "").strip()
+    if semgrep_rules:
+        if not Path(semgrep_rules).is_absolute():
+            raise ValueError("AUDIT_SEMGREP_RULES_DIR 必须是容器内可读的绝对路径")
+        settings["semgrep_rules_dir"] = semgrep_rules
     agent = settings.setdefault("agent", {})
     agent_type = (env.get("AUDIT_AGENT_TYPE") or agent.get("type") or "deepseek-harness").strip()
     if agent_type != "deepseek-harness":
@@ -74,7 +79,7 @@ def configure_settings(settings: dict, env: dict) -> dict:
                 "args", ["headless", "--json", "--permission-mode", "read-only", "--approval-policy", "never"]
             )]
     summary = settings.setdefault("summary", {})
-    summary["enabled"] = _env_bool(env, "AUDIT_SUMMARY_ENABLED", bool(summary.get("enabled", False)))
+    summary["enabled"] = _env_bool(env, "AUDIT_SUMMARY_ENABLED", bool(summary.get("enabled", True)))
     if summary["enabled"] and agent_type == "deepseek-harness":
         summary_agent = summary.setdefault("agent", {})
         summary_agent.update({

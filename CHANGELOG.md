@@ -1,22 +1,12 @@
 # 变更记录
 
 ## 未发布
-- 默认按维度拆分审查：独立契约、证据核验和有限重试，全部通过后合并评分；项目共享模型调用并发上限
-- 证据改为结构化仓库引用，评分前核验路径、行号和可选片段；未通过核验的结果隔离保存且不评分，旧报告仍可渲染
-- 明确后端白名单、共享目录批次锁与原子落盘；按项目记录分阶段耗时和模型调用统计，完成一个项目即更新进度
-- 生成有界代码地图并记录预扫描跳过、失败和无报告状态；增加固定提交的合成质量样例和评估脚本
-- 同项目全量支持稳定错峰和逾期补扫；规则、范围或模型配置变化时不沿用旧口径
-- 调度镜像固定预装 cloc、gitleaks、semgrep、lizard，并在多架构构建冒烟测试中校验版本命令
-- Pi 达到轮次或输出长度硬上限不再原样重试；可选设置 `PI_TEMPERATURE`，重试可读取上次结构合格的结果
-- 扫描引擎切换为 Pi，继续使用现有内网 OpenAI 兼容模型、只读工具与双架构镜像
-- 修复 Qwen 0.26.1 把以 `-` 开头的提示词误识别为参数，镜像构建时以模拟模型验证真实入口
-- 同一 GitHub Actions 工作流构建并发布扫描与调度镜像，分别验证 amd64 / arm64，并为版本发布生成两种镜像的离线包
-- 镜像支持 ARM64：GHCR 推送 amd64 + arm64 多架构镜像，两个架构分别冒烟测试，Release 按架构各附一个离线包；`docker/build.sh` 支持 `PLATFORM`，离线包名带架构
-- 模型输出按 `result.schema.json` 逐字段校验，不合格带问题清单重试；结构不合格的输出不再进入评分导致崩溃
-- JSON 提取不再按 ``` 切分，证据中含代码块时也能正确解析
-- qwen-docker 后端必须配置 `agent.network`，留空拒绝启动
-- 同步代码时 `git reset` / `git clean` / `rev-parse` 失败立即报错，避免静默扫描旧提交
-- 新增 `tests/test_runner.py` 单元测试并纳入 CI
+- Skill 重写为无人值守版：合并评分规则、报告格式（含 YAML front matter）、64 项检查清单、增量规则和自检修复规则到 SKILL.md 一个文件；Harness 自主完成审查、自检修复和评分
+- 项目报告改为 Harness 直接输出含 YAML front matter 的 Markdown，Runner 不再解析和评分审查内容
+- Runner 从 front matter 提取评分元数据写入运行日志；汇总会话独立生成多项目整体报告，汇总失败不影响已完成的项目报告
+- 简化 Harness 提示：只传递项目元数据和扫描参数（scan_type full/incremental），不再拼装 MODE/OUTPUT_FORMAT 标志和 JSON 元数据
+- 新增 `runner/parsers/frontmatter.py`：纯 stdlib 解析 Markdown YAML front matter，提取评分和统计字段
+- 移除 Skill 对 `references/` 子目录的依赖（`audit-method.md`、`report-template.md` 已合并进 SKILL.md）
 
 ## v1.0.0 · 2026-11-21
 - 八性检查 Skill：8 个维度 64 个检查项，交互式审查与每日批量扫描共用

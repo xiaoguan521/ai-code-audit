@@ -1,14 +1,14 @@
-.git
-.github
-output
-work
-samples
-tests
-*.tar.gz
+# Only the files used by the two Dockerfiles are sent to the build context.
+*
+!docker/
+!docker/**
+!runner/
+!runner/**
+!config/
+!config/checklist.json
+!config/result.schema.json
+!config/settings.json
+!skill/
+!skill/eight-quality-audit/
+!skill/eight-quality-audit/**
 **/__pycache__
-# 不把本地模型凭据、Git 凭据或真实仓库清单发送给构建器
-.env
-*.env
-secrets
-config/projects.local.csv
-audit-data

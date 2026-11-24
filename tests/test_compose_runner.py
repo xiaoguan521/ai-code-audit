@@ -157,6 +157,7 @@ class ComposeRunnerTest(unittest.TestCase):
 
         settings = json.loads((ROOT / "config/settings.json").read_text(encoding="utf-8"))
         settings.update({"prescan_tools": [], "max_parallel": 1})
+        settings["summary"]["enabled"] = False
         settings["agent"].update(type="deepseek-harness", strategy="single")
         settings_file = self.root / "settings.json"
         settings_file.write_text(json.dumps(settings), encoding="utf-8")
@@ -191,7 +192,7 @@ class ComposeRunnerTest(unittest.TestCase):
                                  "--date", "2026-11-21", "--force-full"],
                                 env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        runlog = json.loads((data_dir / "output/results/2026-11-21/_run.json").read_text(encoding="utf-8"))
+        runlog = json.loads(next((data_dir / "output/results/2026-11-21").glob("*/_run.json")).read_text(encoding="utf-8"))
         actual = {p["project_id"]: (p["status"], p["commit"]) for p in runlog["projects"]}
         self.assertEqual(actual, {"first-main": ("ok", first_main), "first-dev": ("ok", first_dev),
                                   "second-main": ("ok", second_main)})
@@ -204,7 +205,8 @@ class ComposeRunnerTest(unittest.TestCase):
             self.assertEqual(args[args.index("--env-file") + 1], str(model_file))
             image_index = args.index("example.test/scanner:test")
             self.assertEqual(args[image_index + 1:image_index + 3], ["dsh", "headless"])
-            self.assertIn("OUTPUT_FORMAT: markdown", args[-1])
+            self.assertIn("YAML front matter", args[-1])
+            self.assertNotIn("OUTPUT_FORMAT: markdown", args[-1])
             self.assertNotIn("dummy-secret", " ".join(args))
 
     def test_git_credentials_are_selected_per_repository_and_never_rewritten(self):

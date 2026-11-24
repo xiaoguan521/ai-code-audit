@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "runner"))
 sys.path.insert(0, str(ROOT / "tests"))
 
 import run_daily  # noqa: E402
+import scoring  # noqa: E402
 from adapters import harness  # noqa: E402
 from parsers import audit_markdown  # noqa: E402
 from test_runner import CK  # noqa: E402
@@ -45,15 +46,15 @@ class MarkdownParserTest(unittest.TestCase):
         self.assertEqual(parsed.metadata["item_count"], 64)
         self.assertTrue(parsed.metadata["complete"])
         self.assertEqual(len(parsed.result["dimension_notes"]), 8)
-        self.assertEqual(run_daily.scoring.schema_errors(parsed.result), [])
-        self.assertEqual(run_daily.scoring.validate(parsed.result, CK), [])
+        self.assertEqual(scoring.schema_errors(parsed.result), [])
+        self.assertEqual(scoring.validate(parsed.result, CK), [])
 
     def test_issue_id_is_separate_from_check_item_id(self):
         parsed = audit_markdown.parse(audit_markdown_text(with_issue=True), CK)
         issue = parsed.result["issues"][0]
         self.assertEqual(issue["issue_id"], "Q001")
         self.assertEqual(issue["item_id"], "6.1")
-        self.assertEqual(run_daily.scoring.validate(parsed.result, CK), [])
+        self.assertEqual(scoring.validate(parsed.result, CK), [])
 
     def test_missing_item_is_unverified(self):
         text = audit_markdown_text().replace("id: 8.10", "id: 8.9", 1)
@@ -221,14 +222,15 @@ class IntegrationContractTest(unittest.TestCase):
     def test_harness_prompt_requests_markdown_not_json(self):
         prompt = run_daily.build_prompt(
             {"project_id": "p", "project_name": "x"},
-            "full",
             "c" * 40,
             {"agent": {"type": "deepseek-harness"}, "default_scope_out": []},
-            None, None, None, False,
+            "full",
         )
-        self.assertIn("audit-complete", prompt)
-        self.assertIn("OUTPUT_FORMAT: markdown", prompt)
+        self.assertIn("64 项", prompt)
+        self.assertIn("YAML front matter", prompt)
         self.assertNotIn("符合 JSON Schema 的结构化结果", prompt)
+        self.assertNotIn("MODE: batch", prompt)
+        self.assertNotIn("OUTPUT_FORMAT:", prompt)
 
     def test_harness_docker_uses_container_context_path(self):
         self.assertEqual(
@@ -240,50 +242,6 @@ class IntegrationContractTest(unittest.TestCase):
             "/host/context",
         )
 
-    def test_scan_projects_verified_markdown_into_artifacts(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            repo = root / "work" / "p1" / "repo"
-            repo.mkdir(parents=True)
-            (repo / "a.py").write_text("pass\n", encoding="utf-8")
-            settings = {
-                "workdir": str(root / "work"),
-                "output_dir": str(root / "out"),
-                "prescan_tools": [],
-                "code_map_enabled": False,
-                "agent": {"type": "deepseek-harness", "strategy": "single", "launcher": "local"},
-            }
-            output = {
-                "raw_text": audit_markdown_text(),
-                "event_log": [{"type": "final", "reason": {"kind": "completed"}}],
-                "stats": {"event_count": 1},
-                "cost_usd": None,
-                "session_id": "s1",
-                "agent_status": "completed",
-                "final_reason_kind": "completed",
-            }
-            args = types.SimpleNamespace(force_full=True, dry_run=False)
-            with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
-                    mock.patch.object(run_daily, "call_agent", return_value=output):
-                rec = run_daily.scan_project(
-                    {"project_id": "p1", "project_name": "测试项目"},
-                    settings, "2026-11-23", args, CK,
-                )
-            self.assertEqual(rec["status"], "ok")
-            self.assertEqual(rec["agent_status"], "completed")
-            self.assertEqual(rec["audit_status"], "verified")
-            artifacts = root / "out" / "artifacts" / "2026-11-23" / "p1"
-            self.assertEqual((artifacts / "audit.md").read_text(encoding="utf-8"), output["raw_text"])
-            self.assertTrue((artifacts / "audit.json").exists())
-            self.assertTrue((artifacts / "metrics.json").exists())
-            self.assertTrue((artifacts / "run-events.jsonl").exists())
-            self.assertTrue((artifacts / "summary.md").exists())
-            self.assertTrue((artifacts / "summary.meta.json").exists())
-            stored = json.loads((artifacts / "audit.json").read_text(encoding="utf-8"))
-            self.assertEqual(stored["meta"]["summary"]["status"], "disabled")
-            metrics = json.loads((artifacts / "metrics.json").read_text(encoding="utf-8"))
-            self.assertIn("summary", metrics)
-            self.assertGreaterEqual(metrics["total_seconds"], metrics["stages_seconds"]["summary"])
 
 
 if __name__ == "__main__":

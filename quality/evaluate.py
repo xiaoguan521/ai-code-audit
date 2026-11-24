@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "runner"))
-import run_daily  # noqa: E402
+import offline_validation  # noqa: E402
 import scoring  # noqa: E402
 from dataset import fixture_digest  # noqa: E402
 
@@ -52,8 +52,8 @@ def evaluate(results: Path, manifest: dict) -> dict:
             if not isinstance(result, dict) or not isinstance(result.get("meta"), dict) or result["meta"].get("commit") != pin["commit"]:
                 record.update(status="invalid", validation_problems=["结果提交与样例基线不一致"])
                 continue
-            problems = run_daily.check_output(result, checklist, DATASET / "fixtures" / case["id"])
-        except (OSError, UnicodeError, json.JSONDecodeError, run_daily.AgentOutputError) as e:
+            problems = offline_validation.check_output(result, checklist, DATASET / "fixtures" / case["id"])
+        except (OSError, UnicodeError, json.JSONDecodeError, offline_validation.OfflineValidationError) as e:
             record.update(status="invalid", validation_problems=[str(e)[:500]])
             continue
         record["validation_problems"] = problems[:20]
