@@ -34,13 +34,9 @@ on:
 permissions:
   contents: read
 
-env:
-  # 同时支持 x86_64 和 ARM64（鲲鹏、飞腾等 ARM 服务器）；推到 GHCR 的是多架构镜像，docker pull 自动选架构
-  PLATFORMS: linux/amd64,linux/arm64
-
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -52,12 +48,22 @@ jobs:
       - run: python tests/make_samples.py /tmp/out
       - run: for f in docker/*.sh; do sh -n "$f"; done
 
+  # 每个架构在原生 runner 上构建一次：amd64 跑 ubuntu-24.04，arm64 跑
+  # ubuntu-24.04-arm，不再用 QEMU 模拟。两个镜像（扫描 + 调度）在同一个
+  # job 里构建，因为 harness_openai_smoke.py 需要同架构的两个镜像配合验证。
   build:
     needs: test
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
-      contents: write      # 打 tag 时把离线镜像包挂到 Release
-      packages: write      # 推送到 GHCR
+      packages: write      # 推送架构镜像到 GHCR
     steps:
       - uses: actions/checkout@v4
 
@@ -74,14 +80,120 @@ jobs:
           echo "dsh_version=$v" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
           echo "runner_image=ghcr.io/${GITHUB_REPOSITORY,,}-runner" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-qemu-action@v3
-        with:
-          cache-image: ${{ github.event_name != 'pull_request' }}
       - uses: docker/setup-buildx-action@v3
 
       - name: 登录 GHCR
         if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 每个镜像只构建一次并本地加载冒烟；同时打上 ci 标签（本地冒烟用）和
+      # sha-<短提交号>-<架构> 标签（后续合并多架构 manifest 用，冒烟通过后推送）。
+      - name: 构建扫描镜像（本地加载用于冒烟测试）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: |
+            ai-code-audit:ci-${{ matrix.arch }}
+            ${{ steps.vars.outputs.image }}:sha-${{ steps.vars.outputs.short_sha }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.title=ai-code-audit
+            org.opencontainers.image.description=八性 AI 代码检查（DeepSeek Harness + Skill）
+            io.deepseek.harness.version=${{ steps.vars.outputs.dsh_version }}
+          build-args: DSH_VERSION=${{ steps.vars.outputs.dsh_version }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,scope={0},mode=max,ignore-error=true', matrix.arch) || '' }}
+
+      - name: 冒烟测试扫描镜像（不连模型）
+        run: sh docker/smoke_scanner_image.sh ${{ matrix.arch }}
+
+      - name: 构建调度镜像（本地加载用于冒烟测试）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.runner
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: |
+            ai-code-audit-runner:ci-${{ matrix.arch }}
+            ${{ steps.vars.outputs.runner_image }}:sha-${{ steps.vars.outputs.short_sha }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.title=ai-code-audit-runner
+            org.opencontainers.image.description=八性 AI 代码检查批量调度器
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=runner-${{ matrix.arch }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,scope=runner-{0},mode=max,ignore-error=true', matrix.arch) || '' }}
+
+      - name: 调度器冒烟测试（本架构，不连接 Git 或模型）
+        run: |
+          arch="${{ matrix.arch }}"
+          img="ai-code-audit-runner:ci-$arch"
+          [ "$(docker image inspect -f '{{.Architecture}}' "$img")" = "$arch" ] || { echo "::error::$img 架构不是 $arch"; exit 1; }
+          docker run --rm --network none --platform "linux/$arch" --entrypoint sh "$img" -c '
+            python3 --version && git --version && docker --version && ssh -V 2>&1 &&
+            cloc --version >/dev/null && gitleaks version >/dev/null &&
+            semgrep --version >/dev/null && lizard --version >/dev/null &&
+            test -x /opt/ai-code-audit/docker/git-credential-readonly.sh &&
+            test "$(git config --system --get credential.useHttpPath)" = true &&
+            test "$(git config --system --get credential.helper)" = /opt/ai-code-audit/docker/git-credential-readonly.sh &&
+            test -f /opt/ai-code-audit/runner/run_daily.py &&
+            test -f /opt/ai-code-audit/config/checklist.json'
+          docker run --rm --network none --platform "linux/$arch" \
+            -e AUDIT_DATA_DIR=/tmp/audit -e AUDIT_MODEL_NETWORK=ci-model \
+            "$img" --help | grep -q -- '--dry-run'
+          docker run --rm --network none --platform "linux/$arch" \
+            -e PYTHONPATH=/opt/ai-code-audit \
+            -v "$PWD/tests/runner_prescan_smoke.py:/test/prescan.py:ro" \
+            --entrypoint python3 "$img" /test/prescan.py
+
+      - name: 验证本架构两个镜像与 OpenAI 兼容模型的 Harness 工具调用
+        run: python3 tests/harness_openai_smoke.py "ai-code-audit:ci-${{ matrix.arch }}" "ai-code-audit-runner:ci-${{ matrix.arch }}"
+
+      # 冒烟通过后再推送架构标签；manifest 步骤用这两个标签合并多架构镜像。
+      # 只推送 sha 架构标签，不推送 ci 标签（ci 标签只供本机冒烟）。
+      - name: 推送架构镜像
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push "${{ steps.vars.outputs.image }}:sha-${{ steps.vars.outputs.short_sha }}-${{ matrix.arch }}"
+          docker push "${{ steps.vars.outputs.runner_image }}:sha-${{ steps.vars.outputs.short_sha }}-${{ matrix.arch }}"
+
+  # 把两个架构的镜像合并成多架构 manifest，再打上 main / sha / latest 等标签。
+  manifest:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write      # 打 tag 时把离线镜像包挂到 Release
+      packages: write      # 合并并推送多架构 manifest 到 GHCR
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备变量
+        id: vars
+        env:
+          INPUT_VERSION: ${{ inputs.dsh_version }}
+        run: |
+          v="$INPUT_VERSION"
+          if [ -n "$v" ] && ! printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::DeepSeek Harness 版本号格式不对：$v"; exit 1
+          fi
+          [ -z "$v" ] && v="$(tr -d '[:space:]' < docker/DSH_VERSION)"
+          echo "dsh_version=$v" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "runner_image=ghcr.io/${GITHUB_REPOSITORY,,}-runner" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -122,117 +234,24 @@ jobs:
             org.opencontainers.image.description=八性 AI 代码检查批量调度器
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
-      # 每个架构各构建一份并本地加载，分别验证 dsh、headless Profile 和八性 Skill；
-      # arm64 在 x86 runner 上经 QEMU 模拟运行（较慢，靠缓存加速）。
-      - name: 构建 amd64（本地加载用于冒烟测试）
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile
-          platforms: linux/amd64
-          load: true
-          tags: ai-code-audit:ci-amd64
-          build-args: DSH_VERSION=${{ steps.vars.outputs.dsh_version }}
-          cache-from: type=gha,scope=amd64
-          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=amd64,mode=max,ignore-error=true' || '' }}
-
-      - name: 冒烟测试 amd64（不连模型）
-        run: sh docker/smoke_scanner_image.sh amd64
-
-      - name: 构建 arm64（本地加载用于冒烟测试）
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile
-          platforms: linux/arm64
-          load: true
-          tags: ai-code-audit:ci-arm64
-          build-args: DSH_VERSION=${{ steps.vars.outputs.dsh_version }}
-          cache-from: type=gha,scope=arm64
-          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=arm64,mode=max,ignore-error=true' || '' }}
-
-      - name: 冒烟测试 arm64（不连模型）
-        run: sh docker/smoke_scanner_image.sh arm64
-
-      - name: 构建调度器 amd64（本地加载用于冒烟测试）
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.runner
-          platforms: linux/amd64
-          load: true
-          tags: ai-code-audit-runner:ci-amd64
-          cache-from: type=gha,scope=runner-amd64
-          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=runner-amd64,mode=max,ignore-error=true' || '' }}
-
-      - name: 构建调度器 arm64（本地加载用于冒烟测试）
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.runner
-          platforms: linux/arm64
-          load: true
-          tags: ai-code-audit-runner:ci-arm64
-          cache-from: type=gha,scope=runner-arm64
-          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=runner-arm64,mode=max,ignore-error=true' || '' }}
-
-      - name: 调度器冒烟测试（两个架构，不连接 Git 或模型）
+      - name: 合并多架构镜像
         run: |
-          for arch in amd64 arm64; do
-            img="ai-code-audit-runner:ci-$arch"
-            [ "$(docker image inspect -f '{{.Architecture}}' "$img")" = "$arch" ] || { echo "::error::$img 架构不是 $arch"; exit 1; }
-            docker run --rm --network none --platform "linux/$arch" --entrypoint sh "$img" -c '
-              python3 --version && git --version && docker --version && ssh -V 2>&1 &&
-              cloc --version >/dev/null && gitleaks version >/dev/null &&
-              semgrep --version >/dev/null && lizard --version >/dev/null &&
-              test -x /opt/ai-code-audit/docker/git-credential-readonly.sh &&
-              test "$(git config --system --get credential.useHttpPath)" = true &&
-              test "$(git config --system --get credential.helper)" = /opt/ai-code-audit/docker/git-credential-readonly.sh &&
-              test -f /opt/ai-code-audit/runner/run_daily.py &&
-              test -f /opt/ai-code-audit/config/checklist.json'
-            docker run --rm --network none --platform "linux/$arch" \
-              -e AUDIT_DATA_DIR=/tmp/audit -e AUDIT_MODEL_NETWORK=ci-model \
-              "$img" --help | grep -q -- '--dry-run'
-            docker run --rm --network none --platform "linux/$arch" \
-              -e PYTHONPATH=/opt/ai-code-audit \
-              -v "$PWD/tests/runner_prescan_smoke.py:/test/prescan.py:ro" \
-              --entrypoint python3 "$img" /test/prescan.py
-          done
-
-      - name: 验证两个镜像与 OpenAI 兼容模型的 Harness 工具调用
-        run: |
-          for arch in amd64 arm64; do
-            python3 tests/harness_openai_smoke.py "ai-code-audit:ci-$arch" "ai-code-audit-runner:ci-$arch"
-          done
-
-      - name: 推送扫描镜像
-        if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile
-          platforms: ${{ env.PLATFORMS }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: DSH_VERSION=${{ steps.vars.outputs.dsh_version }}
-          cache-from: |
-            type=gha,scope=amd64
-            type=gha,scope=arm64
-
-      - name: 推送调度镜像
-        if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.runner
-          platforms: ${{ env.PLATFORMS }}
-          push: true
-          tags: ${{ steps.runner_meta.outputs.tags }}
-          labels: ${{ steps.runner_meta.outputs.labels }}
-          cache-from: |
-            type=gha,scope=runner-amd64
-            type=gha,scope=runner-arm64
+          set -euo pipefail
+          image="${{ steps.vars.outputs.image }}"
+          runner_image="${{ steps.vars.outputs.runner_image }}"
+          short_sha="${{ steps.vars.outputs.short_sha }}"
+          scanner_args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && scanner_args+=(-t "$tag")
+          done <<< "${{ steps.meta.outputs.tags }}"
+          runner_args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && runner_args+=(-t "$tag")
+          done <<< "${{ steps.runner_meta.outputs.tags }}"
+          docker buildx imagetools create "${scanner_args[@]}" \
+            "$image:sha-$short_sha-amd64" "$image:sha-$short_sha-arm64"
+          docker buildx imagetools create "${runner_args[@]}" \
+            "$runner_image:sha-$short_sha-amd64" "$runner_image:sha-$short_sha-arm64"
 
       - name: 导出离线镜像包（仅版本 tag，每种镜像和架构各一个）
         if: startsWith(github.ref, 'refs/tags/v')
