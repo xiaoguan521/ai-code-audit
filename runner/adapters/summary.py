@@ -34,7 +34,7 @@ def generate_batch(projects: list[dict], report_dir: Path, settings: dict, run_i
                 f"status {record.get('status', '')}",
             ]
             scores = record.get("report_scores") or {}
-            if scores:
+            if scores and record.get("status") == "ok":
                 total = scores.get("total")
                 total_text = f"{total}" if total is not None else "暂不评分"
                 coverage = scores.get("coverage")
