@@ -42,7 +42,8 @@ def configure_settings(settings: dict, env: dict) -> dict:
         raise ValueError("AUDIT_MODEL_NETWORK 不能为空")
 
     for variable, setting in (("AUDIT_MAX_PARALLEL", "max_parallel"),
-                              ("AUDIT_MAX_MODEL_CONCURRENCY", "max_model_concurrency")):
+                              ("AUDIT_MAX_MODEL_CONCURRENCY", "max_model_concurrency"),
+                              ("AUDIT_PER_PROJECT_TIMEOUT_SEC", "per_project_timeout_sec")):
         raw = env.get(variable, "").strip()
         if raw:
             try:

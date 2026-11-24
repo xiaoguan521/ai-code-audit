@@ -31,6 +31,17 @@ class ProgressTest(unittest.TestCase):
                               {"project_id": "slow", "project_name": "slow", "status": "在研"}])
         self.log = self.root / "out/results/2026-11-23/_run.json"
 
+    def test_live_progress_reports_steps_and_usage_without_content(self):
+        with mock.patch.object(run_daily, "log") as log:
+            progress = run_daily.progress_logger("demo")
+            progress({"type": "status", "phase": "step_start", "step": 57})
+            progress({"type": "status", "phase": "step_end", "step": 57,
+                      "usage": {"inputTokens": 100, "outputTokens": 20}, "text": "secret"})
+        messages = "\n".join(call.args[0] for call in log.call_args_list)
+        self.assertIn("第 57 步", messages)
+        self.assertIn("输入 100 tokens", messages)
+        self.assertNotIn("secret", messages)
+
     def test_progress_is_written_before_other_project_finishes(self):
         release = threading.Event()
         started = threading.Event()

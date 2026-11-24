@@ -31,6 +31,8 @@ docker compose run --rm --pull never -T audit --only project-a project-b --summa
 
 不同项目可通过多条命令同时扫描；同一项目的并发任务会互斥。`AUDIT_MAX_PARALLEL` 控制每个 Runner 批次的项目数；共享数据目录的所有 Runner 使用 `AUDIT_MAX_MODEL_CONCURRENCY` 限制并发模型会话，请保持这些 Runner 的配置一致。模型服务承载能力不足时，应降低并发。
 
+扫描时日志显示预扫描、等待模型名额、Harness 步骤以及每步耗时和可用的 Token 数；步骤数不是完成百分比。`AUDIT_PER_PROJECT_TIMEOUT_SEC` 默认 3600 秒，只计一次 Harness 进程运行，不包含预扫描或排队；可按实际需求调整，修改只对新任务生效。项目级会话并发上限不限制 Harness 自行创建的子代理请求，模型服务的实际并发能力也会影响耗时。
+
 运行结束时日志会打印运行编号和报告路径。每次运行都有独立目录，不会覆盖其他批次：
 
 ```text

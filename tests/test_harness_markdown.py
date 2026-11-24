@@ -101,6 +101,36 @@ class HarnessAdapterTest(unittest.TestCase):
         self.assertEqual(process.call_args.args[0][-1], "审查整个仓库")
         self.assertFalse(process.call_args.kwargs["shell"])
 
+    def test_streams_redacted_step_and_tool_events_before_final(self):
+        script = (
+            "import json,time; "
+            "print(json.dumps({'type':'status','phase':'step_start','turn':1,'step':40}),flush=True); "
+            "print(json.dumps({'type':'tool_call','tool':'read','input':{'path':'SECRET_FILE'}}),flush=True); "
+            "time.sleep(.1); "
+            "print(json.dumps({'type':'status','phase':'step_end','turn':1,'step':40,'usage':{'inputTokens':100,'outputTokens':20}}),flush=True); "
+            "print(json.dumps({'type':'final','reason':{'kind':'completed'},'text':'# Report'}),flush=True)"
+        )
+        seen = []
+        out = harness.run("audit", Path("."), Path("."), {
+            "agent": {"launcher": "local", "command": [sys.executable, "-c", script]},
+            "_progress_callback": seen.append,
+        }, 5)
+        self.assertEqual(out["raw_text"], "# Report")
+        self.assertTrue(any(e.get("phase") == "step_start" and e.get("step") == 40 for e in seen))
+        self.assertTrue(any(e.get("tool") == "read" for e in seen))
+        self.assertTrue(any(e.get("usage", {}).get("inputTokens") == 100 for e in seen))
+        self.assertNotIn("SECRET_FILE", json.dumps(seen))
+        self.assertNotIn("# Report", json.dumps(seen))
+        self.assertTrue(any(e.get("phase") == "step_start" for e in out["event_log"]))
+
+    def test_streaming_session_timeout_is_reported(self):
+        with self.assertRaises(harness.HarnessError) as caught:
+            harness.run("audit", Path("."), Path("."), {
+                "agent": {"launcher": "local", "command": [sys.executable, "-c", "import time; time.sleep(2)"]},
+                "_progress_callback": lambda event: None,
+            }, .2)
+        self.assertEqual(caught.exception.agent_status, "timeout")
+
     def test_requires_final_reason_kind(self):
         completed = subprocess.CompletedProcess(
             [], 0, stdout=json.dumps({"type": "final", "answer": "x"}), stderr=""
@@ -227,7 +257,8 @@ class IntegrationContractTest(unittest.TestCase):
             "full",
         )
         self.assertIn("64 项", prompt)
-        self.assertIn("YAML front matter", prompt)
+        self.assertNotIn("front matter", prompt)
+        self.assertIn("总分", prompt)
         self.assertNotIn("符合 JSON Schema 的结构化结果", prompt)
         self.assertNotIn("MODE: batch", prompt)
         self.assertNotIn("OUTPUT_FORMAT:", prompt)

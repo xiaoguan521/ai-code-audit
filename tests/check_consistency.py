@@ -37,6 +37,13 @@ if bad:
     errors.append(f"result.schema.json 的 id 规则不接受：{bad}")
 if not re.search(r"^name: [a-z0-9-]+$", skill, re.M):
     errors.append("SKILL.md frontmatter 缺少合法 name")
+# JSON string syntax is valid YAML and keeps quotes in the description unambiguous.
+description = re.search(r"^description: (.+)$", skill, re.M)
+try:
+    if not description or not isinstance(json.loads(description.group(1)), str):
+        raise ValueError("missing description")
+except (json.JSONDecodeError, ValueError):
+    errors.append("SKILL.md description 必须是合法的 JSON/YAML 字符串")
 
 dockerfile = (ROOT / "docker/Dockerfile").read_text(encoding="utf-8")
 for option, src in re.findall(r"^COPY\s+(?:(--\S+)\s+)?(\S+)", dockerfile, re.M):

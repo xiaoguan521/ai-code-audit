@@ -26,6 +26,21 @@ docker run --rm --platform "linux/$arch" --entrypoint sh "$img" -c '
   test ! -d /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@earendil-works/pi-coding-agent &&
   [ "$(id -u)" != "0" ] && echo "Harness 镜像内容检查通过：$(uname -m)"'
 
+# Use the same YAML package as Harness skill discovery; existence alone does not prove the Skill can load.
+docker run --rm --platform "linux/$arch" --network none --read-only --entrypoint node "$img" -e '
+  const fs = require("node:fs");
+  const { createRequire } = require("node:module");
+  const fromSkill = createRequire("/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-skill-filesystem/package.json");
+  const { parse } = fromSkill("yaml");
+  const raw = fs.readFileSync("/opt/audit/skills/eight-quality-code-audit/SKILL.md", "utf8");
+  const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u.exec(raw);
+  if (!match) throw new Error("Skill YAML frontmatter missing");
+  const data = parse(match[1]);
+  if (data.name !== "eight-quality-code-audit" || typeof data.description !== "string" || !data.description) {
+    throw new Error("Skill name or description invalid");
+  }
+  console.log("八性 Skill 元数据解析通过");'
+
 help_output=$(docker run --rm --init --platform "linux/$arch" --network none --read-only \
   --tmpfs /tmp:rw,size=128m --cap-drop ALL --security-opt no-new-privileges \
   --entrypoint dsh "$img" --profile headless --help)

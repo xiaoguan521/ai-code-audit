@@ -33,7 +33,6 @@ import code_map  # noqa: E402
 import incremental  # noqa: E402
 from adapters import harness as harness_adapter  # noqa: E402
 from adapters import summary as summary_adapter  # noqa: E402
-from parsers import frontmatter  # noqa: E402
 
 TZ = dt.timezone(dt.timedelta(hours=8))
 
@@ -307,11 +306,11 @@ def build_prompt(p: dict, commit: str, settings: dict, scan_type: str,
         lines.append(f"scope_out: {'; '.join(scope)}")
     lines.append("")
     lines.extend([
-        "交付一份完整的中文 Markdown（含 YAML front matter），包含全部 64 项、检查范围、真实源码证据、问题及整改建议、"
+        "交付一份完整的中文 Markdown，包含全部 64 项、检查范围、真实源码证据、问题及整改建议、"
         "待补充信息、八维得分、总分、安全分、覆盖率和评分依据。无法判断或证据不足时如实标记 NEED_INFO。",
         "按 Skill 的评分规则计算；自行使用只读计算工具辅助算术并核对，不修改项目代码。",
         "完成前在当前会话自行核对覆盖、关键证据、结论及分数；发现错误只补查并修正对应部分，不要重新审查整个项目。",
-        "直接返回完整 Markdown 报告（含 YAML front matter），不写入文件。",
+        "直接返回完整 Markdown 报告，不写入文件。",
     ])
     if prescan_dir:
         lines.append(f"预扫描线索目录：{prescan_dir}；工具结果必须回源码核实。")
@@ -365,6 +364,39 @@ def call_deepseek_harness(prompt: str, repo: Path, ctx: Path, settings: dict, ti
         raise AgentCallError(str(exc), stats=exc.stats, agent_status=exc.agent_status) from exc
 
 
+def progress_logger(label: str):
+    """Log only lifecycle boundaries, never model text, source or tool arguments."""
+    state = {"step": None, "step_started": None, "tools": 0, "last_event": time.monotonic()}
+    def progress(event: dict) -> None:
+        kind = event.get("type") or event.get("event")
+        if kind == "heartbeat":
+            step = state["step"] if state["step"] is not None else "尚未收到"
+            idle = max(0, int(time.monotonic() - state["last_event"]))
+            log(f"{label}: Harness 已运行 {event.get('elapsed_seconds', 0)} 秒，最近步骤 {step}，"
+                f"工具调用 {state['tools']} 次，最近事件距今 {idle} 秒")
+            return
+        state["last_event"] = time.monotonic()
+        if kind == "tool_call":
+            state["tools"] += 1
+        if event.get("phase") == "step_start":
+            state["step"] = event.get("step")
+            state["step_started"] = time.monotonic()
+            log(f"{label}: Harness 开始第 {state['step']} 步（不是百分比）")
+        elif event.get("phase") == "step_end" and state["step_started"] is not None:
+            elapsed = round(time.monotonic() - state["step_started"], 1)
+            usage = event.get("usage") or {}
+            counts = []
+            for key, title in (("inputTokens", "输入"), ("outputTokens", "输出")):
+                if isinstance(usage.get(key), (int, float)):
+                    counts.append(f"{title} {usage[key]} tokens")
+            suffix = "，" + "，".join(counts) if counts else ""
+            log(f"{label}: Harness 第 {event.get('step', state['step'])} 步结束，耗时 {elapsed} 秒{suffix}")
+            state["step_started"] = None
+        elif kind == "session_started":
+            log(f"{label}: 已获得模型并发名额，等待 {event.get('queue_seconds', 0)} 秒")
+    return progress
+
+
 def call_agent(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: int) -> dict:
     problem = backend_problem(settings)
     if problem:
@@ -372,6 +404,9 @@ def call_agent(prompt: str, repo: Path, ctx: Path, settings: dict, timeout: int)
     waiting = time.perf_counter()
     with model_slot(settings):
         acquired = time.perf_counter()
+        progress = settings.get("_progress_callback")
+        if callable(progress):
+            progress({"type": "session_started", "queue_seconds": round(acquired - waiting, 1)})
         output = call_deepseek_harness(prompt, repo, ctx, settings, timeout)
         output["queue_seconds"] = round(acquired - waiting, 4)
         output["execution_seconds"] = round(time.perf_counter() - acquired, 4)
@@ -441,9 +476,11 @@ def scan_project(p: dict, settings: dict, run_date: str, args) -> dict:
             pre_settings["default_scope_out"] = [
                 s.strip() for s in (p.get("scope_out") or "").replace("；", ";").split(";") if s.strip()
             ] + list(settings.get("default_scope_out", []))
+            log(f"{pid}: 开始预扫描")
             with measure(metrics["stages_seconds"], "prescan"):
                 pre = prescan(repo, ctx / "prescan", settings.get("prescan_tools", []), pre_settings)
             metrics["prescan_tools"] = pre
+            log(f"{pid}: 预扫描结束，耗时 {metrics['stages_seconds']['prescan']} 秒")
             unavailable = [f"{name}: {info.get('reason', info['status'])}" for name, info in pre.items()
                            if info["status"] != "ok"]
             if unavailable:
@@ -463,7 +500,8 @@ def scan_project(p: dict, settings: dict, run_date: str, args) -> dict:
                             write_json_atomic(ctx / "changed_files.json", {"files": paths})
                 except (OSError, ValueError, TypeError):
                     previous = None
-            scan_type = "incremental" if previous else "full"
+            # An unavailable Git diff is not an empty change set: ask for a full review.
+            scan_type = "incremental" if previous and (ctx / "changed_files.json").is_file() else "full"
             view = ctx_view(settings, ctx)
             prompt = build_prompt(
                 p, commit, settings, scan_type,
@@ -472,8 +510,10 @@ def scan_project(p: dict, settings: dict, run_date: str, args) -> dict:
                 changes_file=f"{view}/changed_files.json" if (ctx / "changed_files.json").is_file() else None,
             )
             log(f"{pid}: scan_type={scan_type}")
+            log(f"{pid}: 等待模型并发名额")
+            session_settings = dict(settings, _progress_callback=progress_logger(pid))
             with measure(metrics["stages_seconds"], "model"):
-                out = call_agent(prompt, repo, ctx, settings, int(settings.get("per_project_timeout_sec", 3600)))
+                out = call_agent(prompt, repo, ctx, session_settings, int(settings.get("per_project_timeout_sec", 3600)))
             raw = out.get("raw_text")
             if not isinstance(raw, str) or not raw.strip():
                 raise AgentCallError("Harness 没有返回报告", agent_status="failed")
@@ -489,9 +529,6 @@ def scan_project(p: dict, settings: dict, run_date: str, args) -> dict:
             rec.update({"agent_status": out.get("agent_status", "completed"),
                         "report_path": str(report_path), "report_sha256": sha256_file(report_path),
                         "scan_type": scan_type})
-            fm = frontmatter.run_log_fields(raw)
-            if fm:
-                rec.update(fm)
             write_json_atomic(state_file, {"last_commit": commit, "last_report": str(report_path),
                                            "last_scan_date": run_date}, mode=0o600)
     except Exception as exc:
@@ -601,7 +638,8 @@ def main() -> int:
         report_dir = outdir / "reports" / run_date / args.run_id
         try:
             with model_slot(settings):
-                summary = summary_adapter.generate_batch(recs, report_dir, settings, args.run_id)
+                summary_settings = dict(settings, _progress_callback=progress_logger("整体汇总"))
+                summary = summary_adapter.generate_batch(recs, report_dir, summary_settings, args.run_id)
             write_text_atomic(report_dir / "_summary.md", summary["text"], mode=0o600)
             progress["summary_status"] = summary["status"]
             progress["summary_path"] = str(report_dir / "_summary.md")

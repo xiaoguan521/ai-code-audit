@@ -59,7 +59,8 @@ def generate_batch(projects: list[dict], report_dir: Path, settings: dict, run_i
                 target = context / f"{record['project_id']}.md"
                 shutil.copyfile(record["report_path"], target)
                 target.chmod(0o644)
-            output = harness.run(prompt, context, context, {"agent": summary_agent},
+            output = harness.run(prompt, context, context, {"agent": summary_agent,
+                                 "_progress_callback": settings.get("_progress_callback")},
                                  int(config.get("timeout_sec", 900)))
         text = output.get("raw_text")
         if not isinstance(text, str) or not text.strip():

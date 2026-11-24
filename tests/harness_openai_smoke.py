@@ -23,6 +23,7 @@ ANSWER = "HARNESS_OPENAI_TOOL_LOOP_OK"
 class MockHandler(BaseHTTPRequestHandler):
     requests = 0
     tool_results = 0
+    skill_seen = False
 
     def log_message(self, fmt, *args):
         pass
@@ -32,7 +33,8 @@ class MockHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps({"requests": type(self).requests,
-                                     "tool_results": type(self).tool_results}).encode())
+                                     "tool_results": type(self).tool_results,
+                                     "skill_seen": type(self).skill_seen}).encode())
 
     def do_POST(self):
         try:
@@ -43,6 +45,8 @@ class MockHandler(BaseHTTPRequestHandler):
             assert data.get("stream") is True
             assert data.get("max_tokens") == 2048, "max_tokens 未使用配置值"
             messages = data["messages"]
+            if "eight-quality-code-audit" in json.dumps(messages, ensure_ascii=False):
+                type(self).skill_seen = True
             tool_result = any(message.get("role") == "tool" and MARKER in json.dumps(message)
                               for message in messages)
             if tool_result:
@@ -89,19 +93,24 @@ def client():
             time.sleep(0.5)
     else:
         raise RuntimeError("模拟模型服务未启动")
+    progress_events = []
     result = harness.run("请使用 read 工具读取 a.py，然后回答。", root / "repo", root / "ctx", {
         "agent": {"launcher": "docker", "image": image, "network": network,
                   "env_file": str(root / "model.env")},
+        "_progress_callback": progress_events.append,
     }, 180)
     assert result["raw_text"] == ANSWER, result["raw_text"]
     assert result["agent_model"] == MODEL, result["agent_model"]
     assert result["final_reason_kind"] == "completed"
     assert result["stats"]["tool_calls_by_name"].get("read", 0) >= 1, result["stats"]
+    assert any(e.get("phase") == "step_start" for e in progress_events), "没有实时步骤事件"
+    assert MARKER not in json.dumps(progress_events), "进度日志泄露源码"
     assert KEY not in json.dumps(result, ensure_ascii=False)
     with urllib.request.urlopen(url, timeout=5) as response:
         status = json.load(response)
     assert status["requests"] >= 2 and status["tool_results"] >= 1, status
-    print(f"通过：调度镜像 → 扫描镜像 → {MODEL} 兼容接口，Harness 读取文件并完成多轮调用")
+    assert status["skill_seen"], f"八性 Skill 未被模型发现: {status}"
+    print(f"通过：调度镜像 → 扫描镜像 → {MODEL} 兼容接口，Harness 发现八性 Skill、读取文件并完成多轮调用")
 
 
 def main():

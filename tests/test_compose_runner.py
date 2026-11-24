@@ -81,10 +81,12 @@ class ComposeRunnerTest(unittest.TestCase):
         configured = compose_entrypoint.configure_settings(
             {"agent": {"type": "deepseek-harness"}},
             {"AUDIT_DATA_DIR": str(self.root / "data"), "AUDIT_MODEL_NETWORK": "harness-net",
-             "AUDIT_MAX_PARALLEL": "4", "AUDIT_MAX_MODEL_CONCURRENCY": "2"},
+             "AUDIT_MAX_PARALLEL": "4", "AUDIT_MAX_MODEL_CONCURRENCY": "2",
+             "AUDIT_PER_PROJECT_TIMEOUT_SEC": "7200"},
         )
         self.assertEqual(configured["max_parallel"], 4)
         self.assertEqual(configured["max_model_concurrency"], 2)
+        self.assertEqual(configured["per_project_timeout_sec"], 7200)
         with self.assertRaisesRegex(ValueError, "AUDIT_MAX_PARALLEL"):
             compose_entrypoint.configure_settings(
                 {"agent": {"type": "deepseek-harness"}},
@@ -205,7 +207,8 @@ class ComposeRunnerTest(unittest.TestCase):
             self.assertEqual(args[args.index("--env-file") + 1], str(model_file))
             image_index = args.index("example.test/scanner:test")
             self.assertEqual(args[image_index + 1:image_index + 3], ["dsh", "headless"])
-            self.assertIn("YAML front matter", args[-1])
+            self.assertNotIn("front matter", args[-1])
+            self.assertIn("总分", args[-1])
             self.assertNotIn("OUTPUT_FORMAT: markdown", args[-1])
             self.assertNotIn("dummy-secret", " ".join(args))
 

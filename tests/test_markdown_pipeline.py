@@ -33,7 +33,7 @@ class MarkdownPipelineTest(unittest.TestCase):
         self.args = types.SimpleNamespace(force_full=True, dry_run=False, run_id="run-1")
 
     def test_raw_markdown_is_preserved_without_parsing_or_rescanning(self):
-        text = '# 项目报告\n\n总分：7.2\n\n<!-- audit-dimension\ndimension: FS\n-->\n'
+        text = '---\nscore: 7.2\n---\n# 项目报告\n\n总分：7.2\n\n<!-- audit-dimension\ndimension: FS\n-->\n'
         response = {"raw_text": text, "event_log": [{"type": "final"}], "session_id": "session-1"}
         with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
              mock.patch.object(run_daily, "call_agent", return_value=response) as agent, \
@@ -44,6 +44,7 @@ class MarkdownPipelineTest(unittest.TestCase):
         self.assertEqual(agent.call_count, 1)
         self.assertEqual(Path(rec["report_path"]).read_text(), text)
         self.assertNotIn("audit_status", rec)
+        self.assertNotIn("score", rec)
         self.assertFalse(list((self.root / "out").rglob("audit.json")))
         prompt = agent.call_args.args[0]
         for word in ("64 项", "安全分", "评分依据", "当前会话", "只补查"):
@@ -71,6 +72,19 @@ class MarkdownPipelineTest(unittest.TestCase):
         self.assertIn("changed_files.json", prompt)
         self.assertIn("自行判断", prompt)
         self.assertNotIn("预计算的本次重判", prompt)
+
+    def test_missing_git_diff_never_masquerades_as_no_changes(self):
+        response = {"raw_text": "# 审查报告\n", "event_log": []}
+        args = types.SimpleNamespace(force_full=False, dry_run=False)
+        with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
+             mock.patch.object(run_daily, "changed_files", return_value=None), \
+             mock.patch.object(run_daily, "call_agent", return_value=response) as agent:
+            first = run_daily.scan_project(self.project, self.settings, "2026-11-23", args)
+            second = run_daily.scan_project(self.project, self.settings, "2026-11-24", args)
+        self.assertEqual([first["status"], second["status"]], ["ok", "ok"])
+        self.assertEqual(second["scan_type"], "full")
+        self.assertIn("scan_type: full", agent.call_args.args[0])
+        self.assertNotIn("changed_files.json", agent.call_args.args[0])
 
     def test_project_locks_allow_distinct_projects(self):
         with run_daily.project_lock(self.settings, "p1"):

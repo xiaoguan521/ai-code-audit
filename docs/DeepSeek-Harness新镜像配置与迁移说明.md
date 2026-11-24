@@ -46,11 +46,14 @@ AUDIT_HARNESS_BIN=dsh
 AUDIT_HARNESS_ARGS=["headless","--json","--permission-mode","read-only","--approval-policy","never"]
 AUDIT_MAX_PARALLEL=2
 AUDIT_MAX_MODEL_CONCURRENCY=2
+AUDIT_PER_PROJECT_TIMEOUT_SEC=3600
 AUDIT_SUMMARY_ENABLED=true
 AUDIT_SEMGREP_RULES_DIR=
 ```
 
-`AUDIT_DATA_DIR` 是宿主机绝对路径，Runner 容器与宿主机必须使用相同路径。模型网络必须可访问模型服务。`AUDIT_MAX_PARALLEL` 控制每个批次最多同时处理的项目数；`AUDIT_MAX_MODEL_CONCURRENCY` 控制同一数据目录下多个 Runner 合计可用的模型会话数。请在共享目录的不同 Runner 中使用相同的并发配置。
+`AUDIT_DATA_DIR` 是宿主机绝对路径，Runner 容器与宿主机必须使用相同路径。模型网络必须可访问模型服务。`AUDIT_MAX_PARALLEL` 控制每个批次最多同时处理的项目数；`AUDIT_MAX_MODEL_CONCURRENCY` 控制同一数据目录下多个 Runner 合计可用的模型会话数。请在共享目录的不同 Runner 中使用相同的并发配置。项目会话上限不限制一个 Harness 会话内部的子代理请求；子代理也会消耗模型服务的并发能力。
+
+`AUDIT_PER_PROJECT_TIMEOUT_SEC` 默认为 3600 秒，只限制 Harness 进程运行时间，不包含预扫描或等待模型名额。超时会结束该进程，不会自动保留未输出的完整报告；可以按仓库规模和模型服务速度调整，改动只影响之后启动的任务。
 
 已有 `.env` 如果包含 `AUDIT_SUMMARY_ENABLED=false`，升级后要改为 `true` 才会启动 AI 汇总；关闭时只生成项目报告索引。汇总会话默认复用扫描镜像、网络和模型凭据，仍为独立会话。
 

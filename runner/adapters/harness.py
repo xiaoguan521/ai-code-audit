@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
+import time
 import uuid
 from typing import Any
 
@@ -152,7 +154,7 @@ def _reason_from_event(event: dict) -> dict:
 def _sanitize(event: dict) -> dict:
     """Keep event telemetry while excluding prompts, source, and tool output."""
     result = {}
-    for key in ("type", "event", "turn", "duration_ms", "durationMs", "tool_name", "toolName",
+    for key in ("type", "event", "phase", "turn", "step", "duration_ms", "durationMs", "tool_name", "toolName",
                 "tool", "callId", "status", "session_id", "sessionId"):
         value = event.get(key)
         if isinstance(value, (str, int, float, bool)):
@@ -214,6 +216,69 @@ def _configured_model(agent: dict, launcher: str, env: dict) -> str | None:
     return agent.get("model") or None
 
 
+def _run_with_progress(command: list[str], cwd, prompt_input: str | None, env: dict,
+                       timeout: int, progress) -> subprocess.CompletedProcess:
+    """Stream sanitized event boundaries while preserving the original final event stream."""
+    process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE if prompt_input is not None else None,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, shell=False,
+                               encoding="utf-8", errors="replace")
+    stdout, stderr = [], []
+    start = time.monotonic()
+
+    def emit(event):
+        try:
+            progress(event)
+        except Exception:
+            pass  # Progress reporting must never interrupt the Harness session.
+
+    def pump(stream, output, events=False):
+        try:
+            for line in stream:
+                output.append(line)
+                if events:
+                    try:
+                        event = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if isinstance(event, dict):
+                        emit(_sanitize(event))
+        finally:
+            stream.close()
+
+    readers = [threading.Thread(target=pump, args=(process.stdout, stdout, True), daemon=True),
+               threading.Thread(target=pump, args=(process.stderr, stderr), daemon=True)]
+    for reader in readers:
+        reader.start()
+    if prompt_input is not None:
+        def send_input():
+            try:
+                process.stdin.write(prompt_input)
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        threading.Thread(target=send_input, daemon=True).start()
+    try:
+        while True:
+            remaining = timeout - (time.monotonic() - start)
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                process.wait(timeout=min(remaining, 30))
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() - start >= timeout:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                emit({"type": "heartbeat", "elapsed_seconds": int(time.monotonic() - start)})
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    finally:
+        for reader in readers:
+            reader.join(timeout=5)
+    return subprocess.CompletedProcess(command, process.returncode, "".join(stdout), "".join(stderr))
+
+
 def run(prompt: str, repo, ctx, settings: dict, timeout: int) -> dict:
     """Run one complete Harness task and return its final Markdown answer."""
     agent = settings.get("agent", {})
@@ -238,16 +303,20 @@ def run(prompt: str, repo, ctx, settings: dict, timeout: int) -> dict:
     if launcher == "local" and isinstance(configured_env, dict):
         env.update({str(key): str(value) for key, value in configured_env.items()})
     try:
-        completed = subprocess.run(
-            command,
-            cwd=repo,
-            input=prompt_input,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            shell=False,
-        )
+        progress = settings.get("_progress_callback")
+        if callable(progress):
+            completed = _run_with_progress(command, repo, prompt_input, env, timeout, progress)
+        else:
+            completed = subprocess.run(
+                command,
+                cwd=repo,
+                input=prompt_input,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                shell=False,
+            )
     except subprocess.TimeoutExpired as exc:
         if container_name:
             try:
