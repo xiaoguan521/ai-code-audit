@@ -1,6 +1,7 @@
 """Production Markdown workflow: autonomous sessions, isolation and batch summaries."""
 import csv
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,10 +14,19 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "runner"))
+sys.path.insert(0, str(ROOT / "tests"))
 import run_daily
 import scoring
-from parsers import audit_markdown
 from adapters import summary
+from report_fixture import readable_report
+
+
+def _all_pass_results(checklist, overrides=None):
+    """全部 PASS（证据指向 src/a.py:1），再按 overrides 改个别项。"""
+    results = {item["id"]: ("PASS", "none", [("src/a.py", 1)]) for item in checklist["items"]}
+    if overrides:
+        results.update(overrides)
+    return results
 
 
 class MarkdownPipelineTest(unittest.TestCase):
@@ -29,23 +39,42 @@ class MarkdownPipelineTest(unittest.TestCase):
                          "agent": {"type": "deepseek-harness", "launcher": "local"}}
         self.repo = Path(self.settings["workdir"]) / "p1" / "repo"
         self.repo.mkdir(parents=True)
+        (self.repo / "src").mkdir(exist_ok=True)
+        (self.repo / "src" / "a.py").write_text(
+            "\n".join(f"line {i}" for i in range(1, 31)) + "\n", encoding="utf-8")
         self.project = {"project_id": "p1", "project_name": "项目一"}
         self.args = types.SimpleNamespace(force_full=True, dry_run=False, run_id="run-1")
+        self.checklist = scoring.load_checklist()
 
-    def test_raw_markdown_is_preserved_without_parsing_or_rescanning(self):
-        text = '---\nscore: 7.2\n---\n# 项目报告\n\n总分：7.2\n\n<!-- audit-dimension\ndimension: FS\n-->\n'
+    def test_invalid_report_is_blocked_without_rescanning(self):
+        text = "# 项目报告\n\n总分：7.2\n"
         response = {"raw_text": text, "event_log": [{"type": "final"}], "session_id": "session-1"}
         with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
-             mock.patch.object(run_daily, "call_agent", return_value=response) as agent, \
-             mock.patch.object(audit_markdown, "parse", side_effect=AssertionError("runner must not parse")), \
-             mock.patch.object(scoring, "score_result", side_effect=AssertionError("runner must not score")):
+             mock.patch.object(run_daily, "call_agent", return_value=response) as agent:
+            rec = run_daily.scan_project(self.project, self.settings, "2026-11-24", self.args)
+        self.assertEqual(rec["status"], "error")
+        self.assertEqual(agent.call_count, 1)
+        self.assertNotIn("report_path", rec)
+        self.assertTrue(rec["report_validation"]["problems"])
+        self.assertFalse((self.root / "out" / "state" / "p1.json").exists())
+        self.assertFalse((self.root / "out" / "reports" / "2026-11-24" / "run-1" / "p1.md").exists())
+
+    def test_valid_report_lands_with_scores(self):
+        text = readable_report(self.checklist, _all_pass_results(self.checklist, {
+            "2.2": ("WARN", "P2", [("src/a.py", 5)]),
+            "6.4": ("FAIL", "P0", [("src/a.py", 10, 12)]),
+        }), report_mode="standard")
+        response = {"raw_text": text, "event_log": [{"type": "final"}], "session_id": "session-1"}
+        with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
+             mock.patch.object(run_daily, "call_agent", return_value=response) as agent:
             rec = run_daily.scan_project(self.project, self.settings, "2026-11-24", self.args)
         self.assertEqual(rec["status"], "ok")
         self.assertEqual(agent.call_count, 1)
         self.assertEqual(Path(rec["report_path"]).read_text(), text)
-        self.assertNotIn("audit_status", rec)
-        self.assertNotIn("score", rec)
-        self.assertFalse(list((self.root / "out").rglob("audit.json")))
+        self.assertTrue(rec["report_validation"]["ok"])
+        self.assertIn("total", rec["report_scores"])
+        state = json.loads((self.root / "out" / "state" / "p1.json").read_text())
+        self.assertEqual(state["scores"], rec["report_scores"])
         prompt = agent.call_args.args[0]
         for word in ("64 项", "安全分", "评分依据", "当前会话", "只补查"):
             self.assertIn(word, prompt)
@@ -58,14 +87,16 @@ class MarkdownPipelineTest(unittest.TestCase):
         self.assertNotIn("report_path", rec)
 
     def test_fast_mode_delivers_markdown_without_evidence_contract(self):
-        response = {"raw_text": "# 快速巡检\n总分：7.2\n", "event_log": []}
+        text = readable_report(self.checklist, _all_pass_results(self.checklist),
+                               report_mode="fast")
+        response = {"raw_text": text, "event_log": []}
         settings = dict(self.settings, fast_mode=True)
         with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
              mock.patch.object(run_daily, "call_agent", return_value=response) as agent:
             rec = run_daily.scan_project(self.project, settings, "2026-11-24", self.args)
         self.assertEqual(rec["status"], "ok")
         self.assertEqual(rec["report_mode"], "fast")
-        self.assertEqual(Path(rec["report_path"]).read_text(), response["raw_text"])
+        self.assertEqual(Path(rec["report_path"]).read_text(), text)
         prompt = agent.call_args.args[0]
         self.assertIn("report_mode: fast", prompt)
         self.assertIn("不生成逐项证据", prompt)
@@ -74,11 +105,18 @@ class MarkdownPipelineTest(unittest.TestCase):
         self.assertIn("安全分", prompt)
 
     def test_standard_mode_can_use_previous_fast_report_without_assuming_evidence(self):
-        response = {"raw_text": "# 巡检报告\n", "event_log": []}
+        fast_text = readable_report(self.checklist, _all_pass_results(self.checklist),
+                                    report_mode="fast")
+        standard_text = readable_report(self.checklist, _all_pass_results(self.checklist, {
+            "2.2": ("WARN", "P2", [("src/a.py", 5)]),
+            "6.4": ("FAIL", "P0", [("src/a.py", 10, 12)]),
+        }), report_mode="standard")
         args = types.SimpleNamespace(force_full=False, dry_run=False)
         with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
              mock.patch.object(run_daily, "changed_files", return_value=[]), \
-             mock.patch.object(run_daily, "call_agent", return_value=response) as agent:
+             mock.patch.object(run_daily, "call_agent", side_effect=[
+                 {"raw_text": fast_text, "event_log": []},
+                 {"raw_text": standard_text, "event_log": []}]) as agent:
             first = run_daily.scan_project(self.project, dict(self.settings, fast_mode=True), "2026-11-23", args)
             second = run_daily.scan_project(self.project, self.settings, "2026-11-24", args)
         self.assertEqual((first["report_mode"], second["report_mode"]), ("fast", "standard"))
@@ -87,11 +125,18 @@ class MarkdownPipelineTest(unittest.TestCase):
         self.assertIn("本次标准审查须", agent.call_args.args[0])
 
     def test_previous_report_is_context_not_a_runner_decision(self):
-        response = {"raw_text": "# 审查报告\n", "event_log": []}
+        fast_text = readable_report(self.checklist, _all_pass_results(self.checklist),
+                                    report_mode="fast")
+        standard_text = readable_report(self.checklist, _all_pass_results(self.checklist, {
+            "2.2": ("WARN", "P2", [("src/a.py", 5)]),
+            "6.4": ("FAIL", "P0", [("src/a.py", 10, 12)]),
+        }), report_mode="standard")
         args = types.SimpleNamespace(force_full=False, dry_run=False)
         with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
              mock.patch.object(run_daily, "changed_files", return_value=["src/a.py"]), \
-             mock.patch.object(run_daily, "call_agent", return_value=response) as agent:
+             mock.patch.object(run_daily, "call_agent", side_effect=[
+                 {"raw_text": fast_text, "event_log": []},
+                 {"raw_text": standard_text, "event_log": []}]) as agent:
             first = run_daily.scan_project(self.project, self.settings, "2026-11-23", args)
             second = run_daily.scan_project(self.project, self.settings, "2026-11-24", args)
         self.assertEqual([first["status"], second["status"]], ["ok", "ok"])
@@ -103,11 +148,18 @@ class MarkdownPipelineTest(unittest.TestCase):
         self.assertNotIn("预计算的本次重判", prompt)
 
     def test_missing_git_diff_never_masquerades_as_no_changes(self):
-        response = {"raw_text": "# 审查报告\n", "event_log": []}
+        fast_text = readable_report(self.checklist, _all_pass_results(self.checklist),
+                                    report_mode="fast")
+        standard_text = readable_report(self.checklist, _all_pass_results(self.checklist, {
+            "2.2": ("WARN", "P2", [("src/a.py", 5)]),
+            "6.4": ("FAIL", "P0", [("src/a.py", 10, 12)]),
+        }), report_mode="standard")
         args = types.SimpleNamespace(force_full=False, dry_run=False)
         with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
              mock.patch.object(run_daily, "changed_files", return_value=None), \
-             mock.patch.object(run_daily, "call_agent", return_value=response) as agent:
+             mock.patch.object(run_daily, "call_agent", side_effect=[
+                 {"raw_text": fast_text, "event_log": []},
+                 {"raw_text": standard_text, "event_log": []}]) as agent:
             first = run_daily.scan_project(self.project, self.settings, "2026-11-23", args)
             second = run_daily.scan_project(self.project, self.settings, "2026-11-24", args)
         self.assertEqual([first["status"], second["status"]], ["ok", "ok"])
@@ -162,6 +214,8 @@ class MarkdownPipelineTest(unittest.TestCase):
         self.assertEqual(report.read_text(), "# p1\n总分 7.2\n")
 
     def test_separate_runner_processes_scan_different_projects(self):
+        # setUp 在 work/p1/repo 里放了证据文件；子进程要从空目录 clone，先清掉。
+        shutil.rmtree(self.repo)
         source = self.root / "source"
         source.mkdir()
         subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True)
@@ -176,8 +230,19 @@ class MarkdownPipelineTest(unittest.TestCase):
             for pid in ("p1", "p2"):
                 writer.writerow({"project_id": pid, "project_name": pid, "git_url": source.as_uri(),
                                  "branch": "main", "status": "在研"})
+        # 假模型输出一份有效报告：证据引用被扫仓库内的 app.py:1。
+        valid_text = readable_report(self.checklist, {
+            "1.1": ("PASS", "none", [("app.py", 1)]),
+            "2.2": ("WARN", "P2", [("app.py", 1)]),
+            "6.4": ("FAIL", "P0", [("app.py", 1)]),
+        }, report_mode="standard")
+        (self.root / "valid_report.md").write_text(valid_text, encoding="utf-8")
         script = self.root / "fake_dsh.py"
-        script.write_text("import json,time\ntime.sleep(.5)\nprint(json.dumps({'type':'final','reason':{'kind':'completed'},'text':'# report'}))\n")
+        script.write_text(
+            "import json\n"
+            "from pathlib import Path\n"
+            "text = Path(__file__).with_name('valid_report.md').read_text(encoding='utf-8')\n"
+            "print(json.dumps({'type':'final','reason':{'kind':'completed'},'text': text}))\n")
         settings = dict(self.settings, max_parallel=2, max_model_concurrency=2,
                         agent={"type": "deepseek-harness", "launcher": "local", "command": [sys.executable, str(script)]})
         config = self.root / "settings.json"
