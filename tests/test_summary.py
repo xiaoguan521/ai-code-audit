@@ -30,7 +30,8 @@ class SummaryTest(unittest.TestCase):
                 self.assertEqual(repo, ctx)
                 self.assertEqual([p.name for p in repo.iterdir()], ["p1.md"])
                 self.assertTrue(repo.stat().st_mode & 0o005)
-                self.assertTrue((repo / "p1.md").stat().st_mode & 0o004)
+                # 报告副本只允许属主读写（0o600），不向同组/其他用户暴露。
+                self.assertEqual((repo / "p1.md").stat().st_mode & 0o777, 0o600)
                 self.assertEqual(model_settings["agent"]["type"], "deepseek-harness")
                 self.assertIn("仅使用报告已有事实和分数", prompt)
                 return {"raw_text": "# 汇总", "event_log": []}
