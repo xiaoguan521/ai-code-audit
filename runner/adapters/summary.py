@@ -18,16 +18,50 @@ def generate_batch(projects: list[dict], report_dir: Path, settings: dict, run_i
     def label(value: object) -> str:
         return str(value).replace("\n", " ").replace("\r", " ").replace("[", "（").replace("]", "）")
 
+    def meta_text() -> str:
+        """Runner 元数据：汇总口径说明（非模型输出），附到所有返回路径的 text 末尾。"""
+        lines = ["## 汇总口径说明（Runner 生成，非模型输出）", ""]
+        for record in projects:
+            parts = [
+                f"project_id {record.get('project_id', '')}",
+                f"project_name {label(record.get('project_name') or record.get('project_id', ''))}",
+                f"department {label(record.get('department', ''))}",
+                f"owner {label(record.get('owner', ''))}",
+                f"report_mode {record.get('report_mode', '')}",
+                f"scan_type {record.get('scan_type', '')}",
+                f"commit {record.get('commit', '')}",
+                f"source_date {record.get('source_date', '')}",
+                f"status {record.get('status', '')}",
+            ]
+            scores = record.get("report_scores") or {}
+            if scores:
+                total = scores.get("total")
+                total_text = f"{total}" if total is not None else "暂不评分"
+                coverage = scores.get("coverage")
+                coverage_text = f"{round(coverage * 100, 1)}%" if isinstance(coverage, (int, float)) else "—"
+                parts.append(f"总分 {total_text}（基于 {scores.get('scored_dimensions', '—')}/8 维度）"
+                             f"、覆盖率 {coverage_text}、NEED_INFO {scores.get('not_evaluated', '—')} 项")
+            lines.append("- " + "；".join(parts))
+        modes = {str(record.get("report_mode")) for record in projects if record.get("report_mode")}
+        if "fast" in modes and "standard" in modes:
+            lines.append("")
+            lines.append("本次汇总混合了 fast 与 standard 报告，总分不可直接比较")
+        return "\n".join(lines) + "\n"
+
     success = [record for record in projects if record.get("status") == "ok" and record.get("report_path")]
     failed = [record for record in projects if record.get("status") != "ok"]
     index = ["## 项目报告与运行状态", ""]
     for record in success:
         pid = record["project_id"]
         index.append(f"- [{label(record.get('project_name') or pid)}（{pid}）]({pid}.md)：审查进程完成"
-                     + (f"，报告日期 {label(record['source_date'])}" if record.get("source_date") else ""))
+                     + (f"，报告日期 {label(record['source_date'])}" if record.get("source_date") else "")
+                     + (f"，模式 {label(record['report_mode'])}" if record.get("report_mode") else "")
+                     + (f"，扫描 {label(record['scan_type'])}" if record.get("scan_type") else ""))
     for record in failed:
         index.append(f"- {label(record.get('project_name') or record['project_id'])}（{record['project_id']}）："
-                     f"{label(record.get('status', 'error'))}，未生成本次报告")
+                     f"{label(record.get('status', 'error'))}，未生成本次报告"
+                     + (f"，模式 {label(record['report_mode'])}" if record.get("report_mode") else "")
+                     + (f"，扫描 {label(record['scan_type'])}" if record.get("scan_type") else ""))
     if not projects:
         index.append("- 本次没有选择项目。")
     index_text = "\n".join(index) + "\n"
@@ -35,7 +69,7 @@ def generate_batch(projects: list[dict], report_dir: Path, settings: dict, run_i
     if not config.get("enabled", True) or not success:
         reason = "未启用 AI 汇总" if not config.get("enabled", True) else "没有可汇总的项目报告"
         return {"status": "disabled" if not config.get("enabled", True) else "empty",
-                "text": f"# 多项目质量汇总\n\n{reason}。\n\n{index_text}"}
+                "text": f"# 多项目质量汇总\n\n{reason}。\n\n{index_text}\n{meta_text()}"}
 
     summary_agent = copy.deepcopy(config.get("agent") or settings.get("agent", {}))
     summary_agent["strategy"] = "single"
@@ -60,15 +94,15 @@ def generate_batch(projects: list[dict], report_dir: Path, settings: dict, run_i
             for record in success:
                 target = context / f"{record['project_id']}.md"
                 shutil.copyfile(record["report_path"], target)
-                target.chmod(0o644)
+                target.chmod(0o600)
             output = harness.run(prompt, context, context, {"agent": summary_agent,
                                  "_progress_callback": settings.get("_progress_callback")},
                                  int(config.get("timeout_sec", 900)))
         text = output.get("raw_text")
         if not isinstance(text, str) or not text.strip():
             raise SummaryError("Summary 没有返回内容")
-        return {"status": "completed", "text": text.rstrip() + "\n\n" + index_text,
+        return {"status": "completed", "text": text.rstrip() + "\n\n" + index_text + "\n" + meta_text(),
                 "event_log": output.get("event_log", []), "session_id": output.get("session_id")}
     except Exception as exc:
-        return {"status": "fallback", "text": "# 多项目质量汇总\n\nAI 汇总未完成，以下为本次项目报告索引。\n\n" + index_text,
+        return {"status": "fallback", "text": "# 多项目质量汇总\n\nAI 汇总未完成，以下为本次项目报告索引。\n\n" + index_text + "\n" + meta_text(),
                 "error": type(exc).__name__}

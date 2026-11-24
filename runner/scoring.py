@@ -12,6 +12,8 @@ from pathlib import Path
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 NEED_INFO = ("NEED_INFO-运行数据", "NEED_INFO-补充材料", "NEED_INFO-证据不足")
+# 总分门槛：至少这么多个维度可评分，否则项目评分写“暂不评分”。
+MIN_SCORED_DIMENSIONS = 5
 
 
 def load_checklist() -> dict:
@@ -72,15 +74,38 @@ def schema_errors(value, schema: dict | None = None, path: str = "$") -> list[st
     return errs
 
 
-def parse_weights(raw: str | None, checklist: dict) -> dict[str, float]:
-    """projects.csv 的 weights 列，格式 "1:15;2:12;..."，留空用默认权重。"""
+def parse_weights(raw: str | None, checklist: dict, project_id: str = "") -> dict[str, float]:
+    """projects.csv 的 weights 列，格式 "1:15;2:12;..."，留空用默认权重。
+
+    严格校验：未知维度、非数字、负数、总和 <= 0、缺冒号的片段一律 raise
+    ValueError；空片段跳过。错误信息写明项目与出错片段。
+    """
+    def fail(msg: str) -> ValueError:
+        prefix = f"项目 {project_id} " if project_id else ""
+        return ValueError(f"{prefix}weights 无效：{msg}")
+
     weights = {d["id"]: float(d["weight"]) for d in checklist["dimensions"]}
-    if raw:
-        for part in raw.replace("，", ";").split(";"):
-            if ":" in part:
-                k, v = part.split(":", 1)
-                if k.strip() in weights:
-                    weights[k.strip()] = float(v)
+    if not raw:
+        return weights
+    for part in str(raw).replace("，", ";").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise fail(f"片段缺少冒号：{part!r}，应为“维度:权重”")
+        key, value = part.split(":", 1)
+        key, value = key.strip(), value.strip()
+        if key not in weights:
+            raise fail(f"未知维度：{key!r}（片段 {part!r}）")
+        try:
+            number = float(value)
+        except ValueError:
+            raise fail(f"维度 {key} 的权重不是数字：{value!r}（片段 {part!r}）") from None
+        if number < 0:
+            raise fail(f"维度 {key} 的权重为负数：{value}（片段 {part!r}）")
+        weights[key] = number
+    if sum(weights.values()) <= 0:
+        raise fail(f"权重总和必须大于 0，实际为 {sum(weights.values())}")
     return weights
 
 
@@ -185,7 +210,8 @@ def score_result(result: dict, checklist: dict, weights: dict[str, float]) -> di
                 pts.append(point[r])
         applicable = len(its) - counts["N/A"]
         coverage = judged / applicable if applicable else 0.0
-        if applicable == 0 or coverage < sc["min_coverage"]:
+        # N/A 占比过高时该维度也不能代表实际检查范围，同样不评分。
+        if applicable == 0 or coverage < sc["min_coverage"] or counts["N/A"] / len(its) > 0.4:
             score = None
         else:
             score = round(max(0.0, sum(pts) / judged * 10 - p0n * sc["p0_item_penalty"]), 1)
@@ -199,9 +225,15 @@ def score_result(result: dict, checklist: dict, weights: dict[str, float]) -> di
 
     scored = [x for x in dims.values() if x["score"] is not None]
     wsum = sum(x["weight"] for x in scored)
-    total = round(sum(x["score"] * x["weight"] for x in scored) / wsum, 1) if wsum else None
+    # 总分门槛：可评分维度太少或总体覆盖率不足时，总分写“暂不评分”，
+    # 避免个别维度的高分拼出一个看起来可信的总分。
     applicable_all = sum(x["applicable"] for x in dims.values())
     judged_all = sum(x["judged"] for x in dims.values())
+    overall_coverage = judged_all / applicable_all if applicable_all else 0.0
+    if len(scored) >= MIN_SCORED_DIMENSIONS and overall_coverage >= sc["min_coverage"] and wsum:
+        total = round(sum(x["score"] * x["weight"] for x in scored) / wsum, 1)
+    else:
+        total = None
     level_counts = {lv: 0 for lv in ("P0", "P1", "P2", "P3")}
     for i in result.get("issues", []):
         level_counts[i["level"]] += 1

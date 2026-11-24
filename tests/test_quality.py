@@ -11,11 +11,23 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "quality"))
+sys.path.insert(0, str(ROOT / "tests"))
 import evaluate  # noqa: E402
 import prepare  # noqa: E402
+import scoring  # noqa: E402
 from dataset import fixture_digest  # noqa: E402
 from test_runner import valid_result  # noqa: E402
-from audit_fixture import markdown_from_result  # noqa: E402
+from report_fixture import readable_report  # noqa: E402
+
+
+def _readable_from_result(result, checklist):
+    """把结构化结果转成现行 §11 格式的可读报告（假模型输出用）。"""
+    results = {}
+    for item in result["items"]:
+        refs = [(ref["path"], ref["start_line"], ref.get("end_line", ref["start_line"]))
+                for ref in item.get("evidence", [])]
+        results[item["id"]] = (item["result"], item["risk"], refs)
+    return readable_report(checklist, results, report_mode="standard")
 
 
 class QualitySuiteTest(unittest.TestCase):
@@ -103,8 +115,9 @@ class QualitySuiteTest(unittest.TestCase):
         config["summary"]["enabled"] = False
         config["agent"].update(type="deepseek-harness", network="test-network", env_file="/tmp/test-model.env")
         for path in fake_results.glob("*.json"):
-            path.with_suffix(".md").write_text(markdown_from_result(json.loads(path.read_text(encoding="utf-8"))),
-                                               encoding="utf-8")
+            result = json.loads(path.read_text(encoding="utf-8"))
+            path.with_suffix(".md").write_text(
+                _readable_from_result(result, scoring.load_checklist()), encoding="utf-8")
         config_path = self.root / "source-settings.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
         dest = self.root / "suite"

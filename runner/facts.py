@@ -252,24 +252,6 @@ def collect(repo: Path, commit: str, code_map_data: dict | None = None,
         first = signals["weak_crypto_matches"][:5]
         findings.append(_finding("6.6", "WARN", "P1", "发现弱哈希、弱加密或非安全随机数线索",
                                  [_ref(x["path"], x["line"]) for x in first], "密码学风险线索"))
-    if signals["health_signals"]:
-        first = signals["health_signals"][:3]
-        findings.append(_finding("4.7", "PASS", "none", "发现健康检查或存活探针相关配置/代码",
-                                 [_ref(x["path"], x["line"]) for x in first], "健康检查信号"))
-    if signals["metrics_signals"]:
-        first = signals["metrics_signals"][:3]
-        findings.append(_finding("2.8", "PASS", "none", "发现指标或性能观测相关信号",
-                                 [_ref(x["path"], x["line"]) for x in first], "性能可观测性信号"))
-    if signals["logging_signals"]:
-        first = signals["logging_signals"][:3]
-        findings.append(_finding("5.6", "PASS", "none", "发现结构化日志或日志框架相关信号",
-                                 [_ref(x["path"], x["line"]) for x in first], "结构化日志信号"))
-    if signals["backup_files"]:
-        findings.append(_finding("3.6", "PASS", "none", "发现备份/恢复脚本或文件命名信号",
-                                 [_ref(signals["backup_files"][0], 1)], "备份恢复信号"))
-    if signals["lint_configs"]:
-        findings.append(_finding("8.3", "PASS", "none", "发现静态检查或格式化配置",
-                                 [_ref(signals["lint_configs"][0], 1)], "代码风格配置"))
     if signals["prompt_injection_matches"]:
         first = signals["prompt_injection_matches"][:5]
         findings.append(_finding("6.8", "WARN", "P1", "发现疑似要求审查助手改变规则或结论的仓库文字",
@@ -314,6 +296,9 @@ def apply_findings(result: dict, findings: list[dict], allowed_item_ids: set[str
 
     只会上调风险（PASS → WARN → FAIL），不会把模型的更严重结论降级；增量模式
     可通过 ``allowed_item_ids`` 限制只修改本次计划重判的项。
+
+    PASS 结论永不由确定性发现写入：关键词/文件名信号只能说明“存在相关线索”，
+    不能证明该项真正达标，desired == "PASS" 的 finding 一律跳过。
     """
     items = {item.get("id"): item for item in result.get("items", [])}
     issues = result.setdefault("issues", [])
@@ -326,6 +311,8 @@ def apply_findings(result: dict, findings: list[dict], allowed_item_ids: set[str
             continue
         item = items[item_id]
         desired = finding.get("result", "")
+        if desired == "PASS":
+            continue
         current = item.get("result", "NEED_INFO-证据不足")
         if desired not in {"PASS", "WARN", "FAIL"} or rank.get(desired, 0) < rank.get(current, 0):
             continue

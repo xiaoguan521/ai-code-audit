@@ -4,7 +4,12 @@
 
 每日批量任务可开启快速模式：仍输出 64 项、分数和整改建议，不生成详细证据、文件行号或代码片段；大型仓库可抽查非核心模块，无法判断的项标为 NEED_INFO。标准模式保留详细证据。快速模式减少证据整理和逐条复核，实际用时仍取决于仓库和模型服务。
 
-Runner 负责项目选择、同步扫描副本、可选预扫描、并发调度、报告归档和启动多项目汇总。Runner 不解析审查报告、不核验证据、不计算项目分数，也不会因为机器字段格式重跑项目。八性审查及交付前的证据、覆盖和评分自检由 Harness 完成；不确定内容应在报告中标明。
+Runner 负责项目选择、同步扫描副本、可选预扫描、并发调度、报告归档和启动多项目汇总。Runner 在落盘前只做最小机器校验（解析报告表格、重算分数、核验 WARN/FAIL 证据路径存在性），不改写报告、不判定结论、校验失败不重跑。八性审查及交付前的证据、覆盖和评分自检由 Harness 完成；不确定内容应在报告中标明。
+
+### 旧流程残留文件（不参与运行）
+
+- `runner/render.py`、`runner/dashboard_template.html`、`runner/parsers/audit_markdown.py`、`quality/`：只供单元测试与离线实验，不参与运行。注意 `runner/parsers/audit_markdown.py` 的 HTML 注释契约与现行 SKILL 格式不匹配（现行报告是人类可读 Markdown、无 audit-* 块），落盘校验解析的是人类可读表格，不用该解析器。`runner/scoring.py` 的算分函数与 `runner/evidence.py` 的引用核验则是落盘校验的底层构件，由 `runner/report_validate.py` 调用。
+- `runner/facts.py` 的 `collect()` 未接进热路径：全仓库文本扫描慢，且其关键词信号只能作 inventory 参考、不能证明检查项达标；便宜信号由预扫描（gitleaks/semgrep/lizard/cloc）与代码地图的路径盘点覆盖。
 
 全部项目结束后，独立的 Harness 会话只读取项目 Markdown，生成跨项目整体报告。汇总失败时保留项目报告，并生成报告索引。Harness 的 `--json` 仅表示运行事件流，最终报告仍是 Markdown。
 

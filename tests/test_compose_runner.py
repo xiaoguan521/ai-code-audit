@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT / "docker"))
 from test_runner import valid_result  # noqa: E402
-from audit_fixture import markdown_from_result  # noqa: E402
+import scoring  # noqa: E402
+from report_fixture import readable_report  # noqa: E402
 import compose_entrypoint  # noqa: E402
 
 
@@ -191,13 +192,19 @@ class ComposeRunnerTest(unittest.TestCase):
         output = valid_result()
         for item in output["items"]:
             item["evidence"] = [{"path": "app.py", "start_line": 1}]
+        # 假模型输出现行 §11 格式的可读报告（快速模式，无证据列）。
+        results = {item["id"]: (item["result"], item["risk"],
+                                [(ref["path"], ref["start_line"], ref.get("end_line", ref["start_line"]))
+                                 for ref in item.get("evidence", [])])
+                   for item in output["items"]}
+        fake_report = readable_report(scoring.load_checklist(), results, report_mode="fast")
         env = dict(os.environ, PATH=f"{bin_dir}:{os.environ.get('PATH', '')}",
                    AUDIT_DATA_DIR=str(data_dir), AUDIT_MODEL_NETWORK="test-model-net",
                    AUDIT_SCANNER_IMAGE="example.test/scanner:test", AUDIT_MODEL_ENV_PATH=str(model_file),
                    AUDIT_SETTINGS_FILE=str(settings_file), AUDIT_PROJECTS_FILE=str(projects),
                    FAKE_DOCKER_LOG=str(log_file),
                    FAKE_DOCKER_EVENTS=json.dumps({"type": "final", "reason": {"kind": "completed"},
-                                                 "text": markdown_from_result(output)}, ensure_ascii=False))
+                                                 "text": fake_report}, ensure_ascii=False))
         result = subprocess.run([sys.executable, str(ROOT / "docker/compose_entrypoint.py"),
                                  "--date", "2026-11-21", "--force-full", "--fast"],
                                 env=env, capture_output=True, text=True, timeout=60)
