@@ -24,8 +24,13 @@ class ReleaseImagesTest(unittest.TestCase):
             "import json, os, pathlib, sys\n"
             "p = pathlib.Path(os.environ['FAKE_DOCKER_TAGS'])\n"
             "tags = json.loads(p.read_text()) if p.exists() else {}\n"
-            "if sys.argv[1] == 'tag':\n"
-            "    tags[sys.argv[3]] = sys.argv[2]\n"
+            "if sys.argv[1] == 'pull':\n"
+            "    image = sys.argv[-1]\n"
+            "    arch = sys.argv[3].rsplit('/', 1)[-1]\n"
+            "    tags[image] = f'{image}#{arch}'\n"
+            "    p.write_text(json.dumps(tags))\n"
+            "elif sys.argv[1] == 'tag':\n"
+            "    tags[sys.argv[3]] = tags.get(sys.argv[2], sys.argv[2])\n"
             "    p.write_text(json.dumps(tags))\n"
             "elif sys.argv[1] == 'save':\n"
             "    sources = [tags[name] for name in sys.argv[2:]]\n"
@@ -55,14 +60,14 @@ class ReleaseImagesTest(unittest.TestCase):
                 archive = offline / f"{component}_v9.1.2_{arch}.tar.gz"
                 with gzip.open(archive, "rt", encoding="utf-8") as f:
                     saved = json.load(f)
-                self.assertEqual(saved["source"], f"{component}:ci-{arch}")
+                self.assertEqual(saved["source"], f"{remote}:9.1.2#{arch}")
                 self.assertEqual(saved["tags"], [f"{component}:9.1.2", f"{remote}:9.1.2"])
                 expected = hashlib.sha256(archive.read_bytes()).hexdigest()
                 self.assertEqual((offline / f"{archive.name}.sha256").read_text().split(),
                                  [expected, archive.name])
 
     def test_export_stops_when_docker_save_fails(self):
-        self.env["FAKE_DOCKER_FAIL"] = "ai-code-audit-runner:ci-arm64"
+        self.env["FAKE_DOCKER_FAIL"] = "ghcr.io/example/audit-runner:9.1.2#arm64"
         self.assertNotEqual(self.run_export().returncode, 0)
         self.assertFalse((self.root / "offline/ai-code-audit-runner_v9.1.2_arm64.tar.gz.sha256").exists())
 
