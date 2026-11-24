@@ -57,6 +57,35 @@ class MarkdownPipelineTest(unittest.TestCase):
         self.assertEqual((rec["status"], rec["agent_status"], agent.call_count), ("error", "timeout", 1))
         self.assertNotIn("report_path", rec)
 
+    def test_fast_mode_delivers_markdown_without_evidence_contract(self):
+        response = {"raw_text": "# 快速巡检\n总分：7.2\n", "event_log": []}
+        settings = dict(self.settings, fast_mode=True)
+        with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
+             mock.patch.object(run_daily, "call_agent", return_value=response) as agent:
+            rec = run_daily.scan_project(self.project, settings, "2026-11-24", self.args)
+        self.assertEqual(rec["status"], "ok")
+        self.assertEqual(rec["report_mode"], "fast")
+        self.assertEqual(Path(rec["report_path"]).read_text(), response["raw_text"])
+        prompt = agent.call_args.args[0]
+        self.assertIn("report_mode: fast", prompt)
+        self.assertIn("不生成逐项证据", prompt)
+        self.assertNotIn("本次是标准审查", prompt)
+        self.assertIn("64 项", prompt)
+        self.assertIn("安全分", prompt)
+
+    def test_standard_mode_can_use_previous_fast_report_without_assuming_evidence(self):
+        response = {"raw_text": "# 巡检报告\n", "event_log": []}
+        args = types.SimpleNamespace(force_full=False, dry_run=False)
+        with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
+             mock.patch.object(run_daily, "changed_files", return_value=[]), \
+             mock.patch.object(run_daily, "call_agent", return_value=response) as agent:
+            first = run_daily.scan_project(self.project, dict(self.settings, fast_mode=True), "2026-11-23", args)
+            second = run_daily.scan_project(self.project, self.settings, "2026-11-24", args)
+        self.assertEqual((first["report_mode"], second["report_mode"]), ("fast", "standard"))
+        self.assertEqual(second["scan_type"], "incremental")
+        self.assertIn("上次是快速报告", agent.call_args.args[0])
+        self.assertIn("本次标准审查须", agent.call_args.args[0])
+
     def test_previous_report_is_context_not_a_runner_decision(self):
         response = {"raw_text": "# 审查报告\n", "event_log": []}
         args = types.SimpleNamespace(force_full=False, dry_run=False)

@@ -56,6 +56,10 @@ def configure_settings(settings: dict, env: dict) -> dict:
 
     settings["workdir"] = str(Path(data_dir) / "work")
     settings["output_dir"] = str(Path(data_dir) / "output")
+    fast_mode = settings.get("fast_mode", False)
+    if not isinstance(fast_mode, bool):
+        raise ValueError("fast_mode 必须是 true/false")
+    settings["fast_mode"] = _env_bool(env, "AUDIT_FAST_MODE", fast_mode)
     semgrep_rules = env.get("AUDIT_SEMGREP_RULES_DIR", "").strip()
     if semgrep_rules:
         if not Path(semgrep_rules).is_absolute():

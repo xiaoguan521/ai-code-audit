@@ -42,6 +42,22 @@ class ProgressTest(unittest.TestCase):
         self.assertIn("输入 100 tokens", messages)
         self.assertNotIn("secret", messages)
 
+    def test_fast_cli_overrides_config_for_each_project(self):
+        base = json.loads(self.settings.read_text(encoding="utf-8"))
+        for configured, argument, expected in ((False, "--fast", True), (True, "--no-fast", False)):
+            with self.subTest(argument=argument):
+                base["fast_mode"] = configured
+                self.settings.write_text(json.dumps(base), encoding="utf-8")
+                seen = []
+                def scan(project, settings, *_args):
+                    seen.append(settings["fast_mode"])
+                    return {"project_id": project["project_id"], "status": "dry-run"}
+                args = ["run_daily.py", "--settings", str(self.settings), "--projects", str(self.projects),
+                        "--date", "2026-11-23", "--dry-run", argument]
+                with mock.patch.object(sys, "argv", args), mock.patch.object(run_daily, "scan_project", side_effect=scan):
+                    self.assertEqual(run_daily.main(), 0)
+                self.assertEqual(seen, [expected, expected])
+
     def test_progress_is_written_before_other_project_finishes(self):
         release = threading.Event()
         started = threading.Event()

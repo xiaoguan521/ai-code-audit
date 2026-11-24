@@ -47,6 +47,7 @@ AUDIT_HARNESS_ARGS=["headless","--json","--permission-mode","read-only","--appro
 AUDIT_MAX_PARALLEL=2
 AUDIT_MAX_MODEL_CONCURRENCY=2
 AUDIT_PER_PROJECT_TIMEOUT_SEC=3600
+AUDIT_FAST_MODE=false
 AUDIT_SUMMARY_ENABLED=true
 AUDIT_SEMGREP_RULES_DIR=
 ```
@@ -54,6 +55,8 @@ AUDIT_SEMGREP_RULES_DIR=
 `AUDIT_DATA_DIR` 是宿主机绝对路径，Runner 容器与宿主机必须使用相同路径。模型网络必须可访问模型服务。`AUDIT_MAX_PARALLEL` 控制每个批次最多同时处理的项目数；`AUDIT_MAX_MODEL_CONCURRENCY` 控制同一数据目录下多个 Runner 合计可用的模型会话数。请在共享目录的不同 Runner 中使用相同的并发配置。项目会话上限不限制一个 Harness 会话内部的子代理请求；子代理也会消耗模型服务的并发能力。
 
 `AUDIT_PER_PROJECT_TIMEOUT_SEC` 默认为 3600 秒，只限制 Harness 进程运行时间，不包含预扫描或等待模型名额。超时会结束该进程，不会自动保留未输出的完整报告；可以按仓库规模和模型服务速度调整，改动只影响之后启动的任务。
+
+`AUDIT_FAST_MODE=true` 可让每天的任务默认使用快速巡检：输出 64 项结果、分数和整改建议，但不生成逐项证据、文件路径行号或代码片段；大型仓库可抽查非核心模块，无法判断的项标为 NEED_INFO。默认 `false` 是标准审查。两种模式均由 Harness 自主规划；快速模式减少证据整理和复核，完成时间仍取决于实际仓库和模型吞吐。
 
 已有 `.env` 如果包含 `AUDIT_SUMMARY_ENABLED=false`，升级后要改为 `true` 才会启动 AI 汇总；关闭时只生成项目报告索引。汇总会话默认复用扫描镜像、网络和模型凭据，仍为独立会话。
 
@@ -92,6 +95,12 @@ AUDIT_SEMGREP_RULES_DIR=/home/atwa/ai-code-audit/data/rules/semgrep
 ```bash
 # 一批并发扫描两个项目
 docker compose run --rm --pull never -T audit --only project-a project-b
+
+# 快速巡检全部在研项目
+docker compose run --rm --pull never -T audit --fast
+
+# 环境变量默认开启快速模式时，此次切回标准模式
+docker compose run --rm --pull never -T audit --no-fast --only project-a
 
 # 单项目：不使用历史 Markdown 作为参考
 docker compose run --rm --pull never -T audit --only project-a --force-full

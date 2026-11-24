@@ -1,6 +1,8 @@
 # 八性代码质量审查平台
 
-平台使用 **DeepSeek Harness** 和八性 Skill 审查 Git 项目，支持自部署的 OpenAI 兼容模型。每个项目由独立 Harness 会话自主规划和执行审查，直接输出包含 64 项、证据、整改建议和分数的 Markdown 报告。
+平台使用 **DeepSeek Harness** 和八性 Skill 审查 Git 项目，支持自部署的 OpenAI 兼容模型。每个项目由独立 Harness 会话自主规划和执行审查，直接输出包含 64 项、整改建议和分数的 Markdown 报告；标准模式另附详细证据。
+
+每日批量任务可开启快速模式：仍输出 64 项、分数和整改建议，不生成详细证据、文件行号或代码片段；大型仓库可抽查非核心模块，无法判断的项标为 NEED_INFO。标准模式保留详细证据。快速模式减少证据整理和逐条复核，实际用时仍取决于仓库和模型服务。
 
 Runner 负责项目选择、同步扫描副本、可选预扫描、并发调度、报告归档和启动多项目汇总。Runner 不解析审查报告、不核验证据、不计算项目分数，也不会因为机器字段格式重跑项目。八性审查及交付前的证据、覆盖和评分自检由 Harness 完成；不确定内容应在报告中标明。
 
@@ -22,12 +24,17 @@ Runner 负责项目选择、同步扫描副本、可选预扫描、并发调度�
 # 扫描多个项目；Harness 在独立会话里自行审查
 docker compose run --rm --pull never -T audit --only project-a project-b
 
+# 快速巡检全部在研项目，不生成详细证据
+docker compose run --rm --pull never -T audit --fast
+
 # 不带上次报告作为参考，重新审查指定项目
 docker compose run --rm --pull never -T audit --only project-a --force-full
 
 # 分别扫描过后，按各项目最近一次报告重新生成整体报告
 docker compose run --rm --pull never -T audit --only project-a project-b --summary-only
 ```
+
+要让每天的批量任务默认使用快速模式，可在 `.env` 设置 `AUDIT_FAST_MODE=true`；运行命令时加 `--no-fast` 可临时切回标准模式。默认值为 `false`，也可只在需要时添加 `--fast`。模式只影响新启动的项目扫描。
 
 不同项目可通过多条命令同时扫描；同一项目的并发任务会互斥。`AUDIT_MAX_PARALLEL` 控制每个 Runner 批次的项目数；共享数据目录的所有 Runner 使用 `AUDIT_MAX_MODEL_CONCURRENCY` 限制并发模型会话，请保持这些 Runner 的配置一致。模型服务承载能力不足时，应降低并发。
 

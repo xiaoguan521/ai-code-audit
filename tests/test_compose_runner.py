@@ -94,6 +94,14 @@ class ComposeRunnerTest(unittest.TestCase):
                  "AUDIT_MAX_PARALLEL": "0"},
             )
 
+    def test_compose_fast_mode_is_explicit_and_rejects_bad_values(self):
+        env = {"AUDIT_DATA_DIR": str(self.root / "data"), "AUDIT_MODEL_NETWORK": "harness-net"}
+        self.assertFalse(compose_entrypoint.configure_settings({"agent": {}}, env)["fast_mode"])
+        enabled = compose_entrypoint.configure_settings({"agent": {}}, dict(env, AUDIT_FAST_MODE="true"))
+        self.assertTrue(enabled["fast_mode"])
+        with self.assertRaisesRegex(ValueError, "AUDIT_FAST_MODE"):
+            compose_entrypoint.configure_settings({"agent": {}}, dict(env, AUDIT_FAST_MODE="invalid"))
+
     def test_compose_can_enable_isolated_summary_with_harness_defaults(self):
         configured = compose_entrypoint.configure_settings(
             {"agent": {"type": "deepseek-harness"}, "summary": {"enabled": False}},
@@ -191,13 +199,15 @@ class ComposeRunnerTest(unittest.TestCase):
                    FAKE_DOCKER_EVENTS=json.dumps({"type": "final", "reason": {"kind": "completed"},
                                                  "text": markdown_from_result(output)}, ensure_ascii=False))
         result = subprocess.run([sys.executable, str(ROOT / "docker/compose_entrypoint.py"),
-                                 "--date", "2026-11-21", "--force-full"],
+                                 "--date", "2026-11-21", "--force-full", "--fast"],
                                 env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         runlog = json.loads(next((data_dir / "output/results/2026-11-21").glob("*/_run.json")).read_text(encoding="utf-8"))
         actual = {p["project_id"]: (p["status"], p["commit"]) for p in runlog["projects"]}
         self.assertEqual(actual, {"first-main": ("ok", first_main), "first-dev": ("ok", first_dev),
                                   "second-main": ("ok", second_main)})
+        self.assertEqual(runlog["report_mode"], "fast")
+        self.assertTrue(all(p["report_mode"] == "fast" for p in runlog["projects"]))
         calls = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(calls), 3)
         for pid, args in zip(("first-main", "first-dev", "second-main"), calls):
@@ -209,6 +219,8 @@ class ComposeRunnerTest(unittest.TestCase):
             self.assertEqual(args[image_index + 1:image_index + 3], ["dsh", "headless"])
             self.assertNotIn("front matter", args[-1])
             self.assertIn("总分", args[-1])
+            self.assertIn("report_mode: fast", args[-1])
+            self.assertIn("不生成逐项证据", args[-1])
             self.assertNotIn("OUTPUT_FORMAT: markdown", args[-1])
             self.assertNotIn("dummy-secret", " ".join(args))
 
