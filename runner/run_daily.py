@@ -595,6 +595,43 @@ def prescan(repo: Path, out: Path, tools: list[str], settings: dict,
 
 # ---------- 调用模型 ----------
 
+def classify_project_scale(code_map_counts: dict | None, prescan_summary_data: dict | None) -> tuple[str, int, int]:
+    """根据已索引源码文件数与 cloc 代码行数划分项目规模（small/medium/large）。"""
+    indexed = int((code_map_counts or {}).get("indexed", 0) or 0)
+    loc = 0
+    cloc_ok = False
+    if isinstance(prescan_summary_data, dict):
+        cloc_info = prescan_summary_data.get("cloc")
+        if isinstance(cloc_info, dict) and cloc_info.get("status") == "ok":
+            cloc_ok = True
+            loc = int(cloc_info.get("loc", 0) or 0)
+    if indexed >= 300 or loc >= 50000:
+        return "large", indexed, loc
+    if cloc_ok and 0 < indexed <= 60 and loc <= 8000:
+        return "small", indexed, loc
+    return "medium", indexed, loc
+
+
+def resolve_project_timeout(settings: dict, scale: str) -> int:
+    """按项目规模动态分配单项目超时，避免大项目强杀或小项目长期占坑。"""
+    base = int(settings.get("per_project_timeout_sec", 3600))
+    if not settings.get("adaptive_timeout", True) or base < 600:
+        return base
+    scale_map = settings.get("scale_timeouts")
+    if isinstance(scale_map, dict) and scale in scale_map:
+        try:
+            custom = int(scale_map[scale])
+            if custom > 0:
+                return custom
+        except (TypeError, ValueError):
+            pass
+    if scale == "small":
+        return max(900, min(base, int(base * 0.5)))
+    if scale == "large":
+        return max(base, min(7200, int(base * 1.5)))
+    return base
+
+
 def build_prompt(p: dict, commit: str, settings: dict, scan_type: str,
                  prescan_dir: str | None = None, prev_file: str | None = None,
                  changes_file: str | None = None, previous_report_mode: str | None = None,
@@ -602,7 +639,10 @@ def build_prompt(p: dict, commit: str, settings: dict, scan_type: str,
                  prescan_summary_text: str | None = None,
                  coverage_gaps: list[str] | None = None,
                  injection_suspects: list[str] | None = None,
-                 recheck_items: list[tuple[str, str]] | None = None) -> str:
+                 recheck_items: list[tuple[str, str]] | None = None,
+                 code_map_summary_text: str | None = None,
+                 project_scale: str | None = None,
+                 timeout_sec: int | None = None) -> str:
     """Build the Harness prompt. The Harness owns the full audit workflow;
     this prompt only passes project metadata and scan parameters."""
     scope = [s.strip() for s in (p.get("scope_out") or "").replace("；", ";").split(";") if s.strip()]
@@ -647,6 +687,19 @@ def build_prompt(p: dict, commit: str, settings: dict, scan_type: str,
                      "报告注明模式和实际检查范围。")
     else:
         lines.append("本次是标准审查：按 Skill 输出并核对支持结论的源码证据。")
+    if project_scale or timeout_sec:
+        budget_min = max(1, int(timeout_sec or 3600) // 60)
+        scale_label = project_scale or "medium"
+        lines.append(f"时间预算与并发策略（project_scale={scale_label}，timeout={budget_min} 分钟）：")
+        if scale_label == "large":
+            lines.append("- 大型仓库建议按核心模块或维度组并发派生 2-3 个子代理（并行子代理上限 3 个），"
+                         "通过上下文隔离缩短单次耗时；在快速模式下核心链路重点查、边缘模块按比例抽查。")
+        else:
+            lines.append("- 中小仓库建议在当前会话直接完成，避免派生子代理带来的启动与汇总开销。")
+        lines.append("- 注意时间预算：单组检查搜索 2-3 轮无直接线索即止损标 NEED_INFO-证据不足；"
+                     "预算接近上限时停止新开探索，立即汇总已查结果输出完整 64 项报告。")
+    if code_map_summary_text:
+        lines.append(code_map_summary_text)
     if prescan_dir:
         lines.append(f"预扫描线索目录：{prescan_dir}；工具结果必须回源码核实。")
     if prescan_summary_text:
@@ -794,6 +847,53 @@ def write_text_atomic(path: Path, value: str, mode: int = 0o644) -> None:
             pass
 
 
+def _try_resume_from_state(p: dict, commit: str, materials_hash: str | None, report_mode: str,
+                           run_date: str, state_file: Path, report_dir: Path,
+                           output: Path, settings: dict) -> dict | None:
+    """在 --resume 模式下，若上次成功状态与当前提交、配置、材料完全一致，则直接复用上次报告。"""
+    if not state_file.exists():
+        return None
+    try:
+        old_state = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(old_state, dict):
+        return None
+    if old_state.get("last_commit") != commit:
+        return None
+    if old_state.get("materials_hash") != materials_hash:
+        return None
+    if old_state.get("report_mode", "standard") != report_mode:
+        return None
+    if ((old_state.get("branch") or "main") != (p.get("branch") or "main")
+            or old_state.get("git_url") != p.get("git_url")
+            or old_state.get("weights") != (p.get("weights") or "")):
+        return None
+    if ttl_force_full(old_state, run_date):
+        return None
+    try:
+        old_report = Path(old_state.get("last_report", "")).resolve()
+        if not old_report.is_relative_to((output / "reports").resolve()) or not old_report.is_file():
+            return None
+        _check_abort(settings)
+        report_dir.mkdir(parents=True, exist_ok=True)
+        target = report_dir / f"{p['project_id']}.md"
+        shutil.copyfile(old_report, target)
+    except (OSError, ValueError, TypeError):
+        return None
+    resumed_rec = {
+        "status": "ok",
+        "resumed": True,
+        "scan_type": "resumed",
+        "report_path": str(target),
+        "report_sha256": sha256_file(target),
+        "source_date": old_state.get("last_scan_date"),
+    }
+    if old_state.get("scores") is not None:
+        resumed_rec["report_scores"] = old_state["scores"]
+    return resumed_rec
+
+
 def scan_project(p: dict, settings: dict, run_date: str, args,
                  snapshot_at: dt.datetime | None = None) -> dict:
     """One isolated project session. The Markdown answer is the deliverable."""
@@ -844,6 +944,13 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
                                 size = -1
                             parts.append(f"{relative}:{size}")
                         materials_hash = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+            if getattr(args, "resume", False) and not getattr(args, "force_full", False):
+                resumed = _try_resume_from_state(p, commit, materials_hash, report_mode, run_date,
+                                                 state_file, report_dir, output, settings)
+                if resumed is not None:
+                    rec.update(resumed)
+                    log(f"{pid}: 代码与配置未变化（{commit[:10]}），已复用上次报告")
+                    return rec
             ctx = work / "context"
             if ctx.exists():
                 shutil.rmtree(ctx)
@@ -866,10 +973,12 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
             write_json_atomic(ctx / "prescan_summary.json", summary_pre, mode=0o600)
             metrics["prescan_summary"] = summary_pre
             gaps: list[str] = []
+            code_map_summary_text: str | None = None
             try:
                 code_map_data = code_map.build(repo, commit, pre_settings["default_scope_out"])
                 write_json_atomic(ctx / "code_map.json", code_map_data, mode=0o600)
                 metrics["code_map_counts"] = code_map_data["counts"]
+                code_map_summary_text = code_map.summarize(code_map_data)
                 gaps = detect_coverage_gaps(repo, code_map_data)
             except Exception as exc:
                 log(f"{pid}: 代码地图生成失败：{exc}")
@@ -962,6 +1071,11 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
             if injection_suspects:
                 rec["prompt_injection_suspects"] = injection_suspects
             view = ctx_view(settings, ctx)
+            project_scale, indexed_files, cloc_loc = classify_project_scale(
+                metrics.get("code_map_counts"), summary_pre)
+            project_timeout = resolve_project_timeout(settings, project_scale)
+            metrics["project_scale"] = project_scale
+            metrics["timeout_sec"] = project_timeout
             prompt = build_prompt(
                 p, commit, settings, scan_type,
                 prescan_dir=f"{view}/prescan" if any(v["status"] == "ok" for v in pre.values()) else None,
@@ -973,12 +1087,16 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
                 coverage_gaps=gaps or None,
                 injection_suspects=injection_suspects or None,
                 recheck_items=recheck_items,
+                code_map_summary_text=code_map_summary_text or None,
+                project_scale=project_scale,
+                timeout_sec=project_timeout,
             )
-            log(f"{pid}: scan_type={scan_type}，report_mode={report_mode}")
+            log(f"{pid}: scan_type={scan_type}，report_mode={report_mode}，"
+                f"scale={project_scale}(files={indexed_files}, loc={cloc_loc})，timeout={project_timeout}s")
             log(f"{pid}: 等待模型并发名额")
             session_settings = dict(settings, _progress_callback=progress_logger(pid))
             with measure(metrics["stages_seconds"], "model"):
-                out = call_agent(prompt, repo, ctx, session_settings, int(settings.get("per_project_timeout_sec", 3600)))
+                out = call_agent(prompt, repo, ctx, session_settings, project_timeout)
             raw = out.get("raw_text")
             if not isinstance(raw, str) or not raw.strip():
                 raise AgentCallError("Harness 没有返回报告", agent_status="failed")
@@ -1101,6 +1219,8 @@ def main() -> int:
     ap.add_argument("--fast", action=argparse.BooleanOptionalAction, default=None,
                     help="快速巡检：不生成详细证据；--no-fast 使用标准模式")
     ap.add_argument("--force-full", action="store_true", help="不提供上次审查报告作为参考")
+    ap.add_argument("--resume", action="store_true",
+                    help="若上次成功扫描的提交、配置、材料与报告模式未变，直接复用上次报告并跳过模型调用")
     ap.add_argument("--snapshot-at", help="固定 Git 快照时间 ISO-8601；未指定时取本批启动时间")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--summary-only", action="store_true", help="仅汇总所选项目最近一次 Markdown 报告")
@@ -1109,12 +1229,25 @@ def main() -> int:
     if args.summary_only and args.dry_run:
         log("拒绝启动：--summary-only 不能与 --dry-run 同时使用")
         return 2
+    if args.resume and args.force_full:
+        log("拒绝启动：--resume 不能与 --force-full 同时使用")
+        return 2
     settings = json.loads(Path(args.settings).read_text(encoding="utf-8"))
     if args.fast is not None:
         settings["fast_mode"] = args.fast
     if not isinstance(settings.get("fast_mode", False), bool):
         log("拒绝启动：fast_mode 必须为 true/false")
         return 2
+    if not isinstance(settings.get("adaptive_timeout", True), bool):
+        log("拒绝启动：adaptive_timeout 必须为 true/false")
+        return 2
+    scale_timeouts = settings.get("scale_timeouts")
+    if scale_timeouts is not None:
+        if (not isinstance(scale_timeouts, dict)
+                or not set(scale_timeouts).issubset({"small", "medium", "large"})
+                or any(isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in scale_timeouts.values())):
+            log("拒绝启动：scale_timeouts 必须是键为 small/medium/large 的正整数映射")
+            return 2
     try:
         snapshot_at = parse_snapshot_at(args.snapshot_at or settings.get("snapshot_at"))
     except ValueError as exc:

@@ -5,9 +5,15 @@
   "max_parallel": 2,
   "max_model_concurrency": 2,
   "model_queue_timeout_sec": 1800,
-  "batch_timeout_sec": 21600,
+  "batch_timeout_sec": 43200,
   "prescan_timeouts": {},
   "per_project_timeout_sec": 3600,
+  "adaptive_timeout": true,
+  "scale_timeouts": {
+    "small": 1800,
+    "medium": 3600,
+    "large": 5400
+  },
   "fast_mode": false,
   "snapshot_at": "",
   "clone_depth": 200,

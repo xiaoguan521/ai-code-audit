@@ -120,3 +120,30 @@ def build(repo: Path, commit: str, scope_out: list[str], limit: int = 120) -> di
         "omitted_per_list": dict(omitted),
         "max_entries_per_list": limit,
     }
+
+
+def summarize(data: dict) -> str:
+    """将代码地图压缩为几行 Prompt 摘要，减少模型开局重复列目录的步数。"""
+    if not isinstance(data, dict):
+        return ""
+    counts = data.get("counts") or {}
+    indexed = int(counts.get("indexed", 0) or 0)
+    tracked = int(data.get("tracked_files", 0) or 0)
+    lines = [f"代码地图摘要：tracked={tracked}，indexed={indexed}"]
+
+    def _top_pairs(mapping: dict, limit: int) -> str:
+        items = sorted(mapping.items(), key=lambda kv: (-int(kv[1]), kv[0]))[:limit]
+        return "、".join(f"{k}({v})" for k, v in items)
+
+    langs = data.get("language_file_counts") or {}
+    if langs:
+        lines.append(f"- 语言分布：{_top_pairs(langs, 6)}")
+    tops = data.get("top_level_file_counts") or {}
+    if tops:
+        lines.append(f"- 一级目录：{_top_pairs(tops, 8)}")
+    for key, label in (("manifests", "构建清单"), ("entrypoints", "入口文件"), ("ci", "CI 配置")):
+        items = data.get(key) or []
+        if items:
+            preview = "、".join(items[:8]) + (" 等" if len(items) > 8 else "")
+            lines.append(f"- {label}：{preview}")
+    return "\n".join(lines)

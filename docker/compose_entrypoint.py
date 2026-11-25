@@ -43,7 +43,8 @@ def configure_settings(settings: dict, env: dict) -> dict:
 
     for variable, setting in (("AUDIT_MAX_PARALLEL", "max_parallel"),
                               ("AUDIT_MAX_MODEL_CONCURRENCY", "max_model_concurrency"),
-                              ("AUDIT_PER_PROJECT_TIMEOUT_SEC", "per_project_timeout_sec")):
+                              ("AUDIT_PER_PROJECT_TIMEOUT_SEC", "per_project_timeout_sec"),
+                              ("AUDIT_BATCH_TIMEOUT_SEC", "batch_timeout_sec")):
         raw = env.get(variable, "").strip()
         if raw:
             try:
@@ -60,6 +61,25 @@ def configure_settings(settings: dict, env: dict) -> dict:
     if not isinstance(fast_mode, bool):
         raise ValueError("fast_mode 必须是 true/false")
     settings["fast_mode"] = _env_bool(env, "AUDIT_FAST_MODE", fast_mode)
+    adaptive_timeout = settings.get("adaptive_timeout", True)
+    if not isinstance(adaptive_timeout, bool):
+        raise ValueError("adaptive_timeout 必须是 true/false")
+    settings["adaptive_timeout"] = _env_bool(env, "AUDIT_ADAPTIVE_TIMEOUT", adaptive_timeout)
+    scale_timeouts = dict(settings.get("scale_timeouts") or {})
+    for variable, scale_key in (("AUDIT_TIMEOUT_SMALL_SEC", "small"),
+                                ("AUDIT_TIMEOUT_MEDIUM_SEC", "medium"),
+                                ("AUDIT_TIMEOUT_LARGE_SEC", "large")):
+        raw = env.get(variable, "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"{variable} 必须是正整数") from exc
+            if value < 1:
+                raise ValueError(f"{variable} 必须是正整数")
+            scale_timeouts[scale_key] = value
+    if scale_timeouts:
+        settings["scale_timeouts"] = scale_timeouts
     snapshot_at = env.get("AUDIT_SNAPSHOT_AT", "").strip()
     if snapshot_at:
         settings["snapshot_at"] = snapshot_at
