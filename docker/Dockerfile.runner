@@ -1,5 +1,14 @@
 # 调度器只需 Docker 客户端，无需在镜像内携带 buildx 和 Compose 插件。
 FROM docker:27-cli AS docker-client
+# 多阶段构建前端静态资源，最终 Runner 镜像不携带 Node.js 运行时。
+FROM node:22-alpine AS frontend-builder
+WORKDIR /build
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend/index.html frontend/tsconfig.json frontend/vite.config.ts ./
+COPY frontend/src/ src/
+RUN npm run build
+
 FROM alpine:3.21.3
 COPY --from=docker-client /usr/local/bin/docker /usr/local/bin/docker
 
@@ -29,6 +38,7 @@ RUN apk add --no-cache \
 
 WORKDIR /opt/ai-code-audit
 COPY runner/ runner/
+COPY --from=frontend-builder /build/dist frontend/dist
 COPY config/checklist.json config/result.schema.json config/settings.json config/
 COPY skill/eight-quality-audit/ skill/eight-quality-audit/
 COPY docker/compose_entrypoint.py docker/compose_entrypoint.py

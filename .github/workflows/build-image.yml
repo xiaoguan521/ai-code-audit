@@ -6,6 +6,7 @@ on:
     tags: ["v*"]
     paths:
       - "docker/**"
+      - "frontend/**"
       - "skill/**"
       - "config/**"
       - "runner/**"
@@ -17,6 +18,7 @@ on:
   pull_request:
     paths:
       - "docker/**"
+      - "frontend/**"
       - "skill/**"
       - "config/**"
       - "runner/**"
