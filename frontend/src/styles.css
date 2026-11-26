@@ -505,6 +505,60 @@ tbody tr.clickable:hover {
   background: rgba(220, 38, 38, 0.08);
 }
 
+.progress-track {
+  height: 10px;
+  border-radius: 999px;
+  background: var(--grid);
+  overflow: hidden;
+  margin: 8px 0 10px;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.35s ease;
+}
+
+.progress-fill.done {
+  background: var(--good);
+}
+
+.progress-fill.warn {
+  background: var(--warning);
+}
+
+.weekday-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.weekday-btn {
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  background: var(--bg-1);
+  color: var(--text-2);
+  border: 1px solid var(--border);
+}
+
+.weekday-btn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.chip-dot.pulse {
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+
 .report-layout {
   display: grid;
   grid-template-columns: 240px 1fr;

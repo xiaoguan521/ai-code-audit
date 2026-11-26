@@ -56,6 +56,208 @@ LOGIN_MAX_FAILURES = 10
 AUTH_LOCK = threading.Lock()
 SESSIONS: dict[str, float] = {}
 LOGIN_FAILURES: dict[str, deque[float]] = {}
+SCHEDULE_LOCK = threading.Lock()
+TIME_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def _default_schedule() -> dict:
+    return {
+        "enabled": False,
+        "time": "02:00",
+        "weekdays": [1, 2, 3, 4, 5, 6, 7],
+        "fast": True,
+        "resume": True,
+        "force_full": False,
+        "only": [],
+        "last_triggered_slot": None,
+        "last_triggered_at": None,
+        "last_task_id": None,
+        "last_error": None,
+    }
+
+
+def _schedule_file(output_dir: Path) -> Path:
+    return output_dir / "state" / "schedule.json"
+
+
+def _load_schedule(output_dir: Path) -> dict:
+    base = _default_schedule()
+    raw = _read_json(_schedule_file(output_dir))
+    if isinstance(raw, dict):
+        base.update({k: v for k, v in raw.items() if k in base})
+    return base
+
+
+def _save_schedule(output_dir: Path, data: dict) -> None:
+    target = _schedule_file(output_dir)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, target)
+
+
+def _next_run_at(schedule: dict, now_dt: dt.datetime | None = None) -> str | None:
+    if not schedule.get("enabled"):
+        return None
+    m = TIME_HHMM_RE.fullmatch(str(schedule.get("time") or ""))
+    weekdays = set(schedule.get("weekdays") or [])
+    if not m or not weekdays:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2))
+    now = now_dt or dt.datetime.now()
+    for offset in range(0, 8):
+        cand_date = now.date() + dt.timedelta(days=offset)
+        if cand_date.isoweekday() not in weekdays:
+            continue
+        cand = dt.datetime.combine(cand_date, dt.time(hour, minute))
+        slot = cand.strftime("%Y-%m-%d %H:%M")
+        if cand >= now.replace(second=0, microsecond=0) and slot != schedule.get("last_triggered_slot"):
+            if cand > now or (cand.strftime("%Y-%m-%d %H:%M") == now.strftime("%Y-%m-%d %H:%M")):
+                return slot
+    return None
+
+
+def _update_schedule(output_dir: Path, payload: dict) -> dict:
+    with SCHEDULE_LOCK:
+        cur = _load_schedule(output_dir)
+        enabled = bool(payload.get("enabled", cur["enabled"]))
+        time_str = str(payload.get("time", cur["time"])).strip()
+        if not TIME_HHMM_RE.fullmatch(time_str):
+            return {"bad_request": True, "error": "执行时间格式必须为 HH:MM（24 小时制，例如 02:00）"}
+        raw_days = payload.get("weekdays", cur["weekdays"])
+        if not isinstance(raw_days, list):
+            return {"bad_request": True, "error": "weekdays 必须为 1–7 的整数列表"}
+        try:
+            weekdays = sorted({int(d) for d in raw_days if 1 <= int(d) <= 7})
+        except (TypeError, ValueError):
+            return {"bad_request": True, "error": "weekdays 必须为 1–7 的整数列表"}
+        if enabled and not weekdays:
+            return {"bad_request": True, "error": "启用定时扫描时至少需要选择一个星期"}
+        fast = bool(payload.get("fast", cur["fast"]))
+        resume = bool(payload.get("resume", cur["resume"]))
+        force_full = bool(payload.get("force_full", cur["force_full"]))
+        if resume and force_full:
+            return {"bad_request": True, "error": "--resume 不能与 --force-full 同时启用"}
+        raw_only = payload.get("only", cur["only"])
+        if not isinstance(raw_only, list):
+            return {"bad_request": True, "error": "only 必须为项目 ID 列表"}
+        only = [str(x) for x in raw_only if _is_safe_segment(str(x))]
+        cur.update({
+            "enabled": enabled,
+            "time": time_str,
+            "weekdays": weekdays or [1, 2, 3, 4, 5, 6, 7],
+            "fast": fast,
+            "resume": resume,
+            "force_full": force_full,
+            "only": only,
+        })
+        _save_schedule(output_dir, cur)
+        now = dt.datetime.now()
+        return {
+            "schedule": cur,
+            "next_run_at": _next_run_at(cur, now),
+            "server_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+
+def _schedule_tick(cfg: dict, now_dt: dt.datetime | None = None) -> dict | None:
+    """检查当前分钟是否命中定时配置；命中则异步启动扫描并持久化触发槽位。"""
+    output_dir: Path = cfg["output_dir"]
+    now = now_dt or dt.datetime.now()
+    slot = now.strftime("%Y-%m-%d %H:%M")
+    hhmm = now.strftime("%H:%M")
+    weekday = now.isoweekday()
+    with SCHEDULE_LOCK:
+        sched = _load_schedule(output_dir)
+        if not sched.get("enabled"):
+            return None
+        if sched.get("time") != hhmm or weekday not in (sched.get("weekdays") or []):
+            return None
+        if sched.get("last_triggered_slot") == slot:
+            return None
+        sched["last_triggered_slot"] = slot
+        sched["last_triggered_at"] = now.isoformat(timespec="seconds")
+        payload = {
+            "only": sched.get("only") or None,
+            "fast": bool(sched.get("fast", True)),
+            "resume": bool(sched.get("resume", True)),
+            "force_full": bool(sched.get("force_full", False)),
+            "dry_run": False,
+            "summary_only": False,
+        }
+        res = _start_scan_task(
+            payload, ROOT, cfg["settings_path"], cfg["projects_csv"], trigger="schedule"
+        )
+        if res.get("task_id"):
+            sched["last_task_id"] = res["task_id"]
+            sched["last_error"] = None
+        else:
+            sched["last_error"] = res.get("error") or "定时触发失败"
+        _save_schedule(output_dir, sched)
+        return res
+
+
+def _build_run_progress(date_str: str, run_id: str, data: dict) -> dict:
+    projects = data.get("projects") or []
+    pending = [str(p) for p in (data.get("pending_projects") or [])]
+    completed_count = len(projects)
+    total_count = completed_count + len(pending)
+    ok_count = sum(1 for p in projects if p.get("status") == "ok")
+    error_count = sum(1 for p in projects if p.get("status") == "error")
+    percent = round(completed_count * 100 / total_count) if total_count > 0 else (100 if data.get("status") != "running" else 0)
+    return {
+        "date": data.get("date") or date_str,
+        "run_id": data.get("run_id") or run_id,
+        "status": data.get("status", "unknown"),
+        "report_mode": data.get("report_mode", ""),
+        "started_at": data.get("started_at"),
+        "finished_at": data.get("finished_at"),
+        "summary_status": data.get("summary_status"),
+        "total_count": total_count,
+        "completed_count": completed_count,
+        "ok_count": ok_count,
+        "error_count": error_count,
+        "pending_count": len(pending),
+        "percent": percent,
+        "completed_projects": [
+            {
+                "project_id": p.get("project_id", ""),
+                "project_name": p.get("project_name") or p.get("project_id", ""),
+                "status": p.get("status", "unknown"),
+                "total": (p.get("report_scores") or {}).get("total"),
+                "error": p.get("error"),
+            }
+            for p in projects
+        ],
+        "pending_projects": pending,
+    }
+
+
+def _build_live_progress(output_dir: Path) -> dict:
+    runs = _discover_runs(output_dir)
+    active_runs: list[dict] = []
+    latest_run: dict | None = None
+    for idx, r in enumerate(runs[:10]):
+        data = _read_json(_resolve_run_file(output_dir, r["date"], r["run_id"]))
+        if not isinstance(data, dict):
+            continue
+        item = _build_run_progress(r["date"], r["run_id"], data)
+        if idx == 0:
+            latest_run = item
+        if item["status"] == "running":
+            active_runs.append(item)
+    with SCAN_LOCK:
+        all_tasks = [_serialize_task(t, include_logs=False) for t in reversed(list(SCAN_TASKS.values()))]
+        running_task = next(
+            (_serialize_task(t, include_logs=True) for t in reversed(list(SCAN_TASKS.values())) if t["status"] == "running"),
+            None,
+        )
+    return {
+        "active_runs": active_runs,
+        "latest_run": latest_run,
+        "running_task": running_task,
+        "tasks": all_tasks,
+    }
 
 
 def _prune_sessions(now_ts: float) -> None:
@@ -476,7 +678,8 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict) -> di
     }
 
 
-def _start_scan_task(payload: dict, root: Path, settings_path: Path, projects_csv: Path) -> dict:
+def _start_scan_task(payload: dict, root: Path, settings_path: Path, projects_csv: Path,
+                     trigger: str = "manual") -> dict:
     task_id = dt.datetime.now().strftime("%H%M%S") + "-" + uuid.uuid4().hex[:8]
     compose_ep = root / "docker" / "compose_entrypoint.py"
     use_compose = bool(os.environ.get("AUDIT_DATA_DIR", "").strip()) and compose_ep.is_file()
@@ -520,6 +723,7 @@ def _start_scan_task(payload: dict, root: Path, settings_path: Path, projects_cs
 
     task = {
         "task_id": task_id,
+        "trigger": trigger,
         "command": " ".join(cmd),
         "status": "running",
         "started_at": dt.datetime.now().isoformat(),
@@ -595,6 +799,7 @@ def _serialize_task(task: dict, include_logs: bool) -> dict:
         if k == "logs":
             if include_logs:
                 out[k] = list(v)
+            out["latest_log"] = v[-1] if v else ""
         else:
             out[k] = v
     return out
@@ -770,6 +975,19 @@ class AuditHandler(BaseHTTPRequestHandler):
                 ROOT, output_dir=output_dir, projects_csv=projects_csv, settings_path=self.cfg["settings_path"]
             ))
 
+        if path == "/api/schedule":
+            with SCHEDULE_LOCK:
+                sched = _load_schedule(output_dir)
+                now = dt.datetime.now()
+            return self._send_json(200, {
+                "schedule": sched,
+                "next_run_at": _next_run_at(sched, now),
+                "server_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+
+        if path == "/api/scans/progress":
+            return self._send_json(200, _build_live_progress(output_dir))
+
         if path == "/api/scans":
             with SCAN_LOCK:
                 tasks = [_serialize_task(t, include_logs=False) for t in reversed(list(SCAN_TASKS.values()))]
@@ -834,6 +1052,15 @@ class AuditHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/") and not self._is_authenticated():
             return self._send_json(401, {"error": "未登录或会话已过期，请先认证"})
 
+        if path == "/api/schedule":
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            res = _update_schedule(self.cfg["output_dir"], payload)
+            if res.get("bad_request"):
+                return self._send_json(400, {"error": res["error"]})
+            return self._send_json(200, res)
+
         if path.startswith("/api/scans/") and path.endswith("/cancel"):
             task_id = urllib.parse.unquote(path[len("/api/scans/"):-len("/cancel")])
             res = _cancel_scan_task(task_id)
@@ -893,6 +1120,16 @@ def main() -> int:
         "dist_dir": dist_dir,
         "auth_token": auth_token,
     }
+    stop_event = threading.Event()
+
+    def scheduler_worker() -> None:
+        while not stop_event.wait(15.0):
+            try:
+                _schedule_tick(server.cfg)  # type: ignore[attr-defined]
+            except Exception as exc:
+                print(f"[web_server] scheduler tick error: {exc}", file=sys.stderr, flush=True)
+
+    threading.Thread(target=scheduler_worker, daemon=True, name="audit-scheduler").start()
     auth_mode = "token-enabled" if auth_token else "open (no AUDIT_WEB_TOKEN)"
     print(f"[web_server] Listening on http://{args.host}:{args.port} (output_dir={output_dir}, auth={auth_mode})", flush=True)
     try:
@@ -900,6 +1137,7 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        stop_event.set()
         server.server_close()
     return 0
 

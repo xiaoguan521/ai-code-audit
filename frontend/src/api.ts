@@ -1,11 +1,13 @@
 import type {
   CatalogProject,
   DoctorReport,
+  LiveProgressResponse,
   OverviewResponse,
   ReportResponse,
   RunDetailResponse,
   RunSummary,
   ScanTask,
+  ScheduleResponse,
 } from "./types";
 
 let unauthorizedHandler: (() => void) | null = null;
@@ -52,6 +54,22 @@ export const api = {
     ),
   projects: () => request<{ projects: CatalogProject[]; scan_statuses?: string[] }>("/api/projects"),
   doctor: () => request<DoctorReport>("/api/doctor"),
+  schedule: () => request<ScheduleResponse>("/api/schedule"),
+  saveSchedule: (payload: {
+    enabled: boolean;
+    time: string;
+    weekdays: number[];
+    fast: boolean;
+    resume: boolean;
+    force_full: boolean;
+    only: string[];
+  }) =>
+    request<ScheduleResponse>("/api/schedule", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  scanProgress: () => request<LiveProgressResponse>("/api/scans/progress"),
   scans: () => request<{ tasks: ScanTask[] }>("/api/scans"),
   scanDetail: (taskId: string) => request<ScanTask>(`/api/scans/${encodeURIComponent(taskId)}`),
   cancelScan: (taskId: string) =>

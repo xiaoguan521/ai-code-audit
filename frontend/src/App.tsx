@@ -270,7 +270,7 @@ export function App() {
         {page === "reports" && (
           <ReportsPage initialTarget={reportTarget} onTargetChange={setReportTarget} />
         )}
-        {page === "scans" && <ScansPage />}
+        {page === "scans" && <ScansPage onOpenReport={openReport} />}
       </main>
     </div>
   );

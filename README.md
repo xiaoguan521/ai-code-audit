@@ -90,7 +90,7 @@ docker compose up -d web
 - **质量看板**：KPI 指标卡片、全公司平均总分/安全分趋势折线、8 维度项目均分、可排序筛选的项目排行表（含较上次分差 `▲/▼`）。
 - **批次记录**：按日期与 `run_id` 浏览每次扫描状态、项目耗时/报错，一键打开单项目报告或 `_summary.md`。
 - **报告阅读**：侧边目录大纲（TOC）快速跳转、风险问题 `P0–P3` 筛选、直达链接复制分享、下载 `.md` / 导出问题 CSV / 打印另存 PDF。
-- **扫描与配置**：一键环境自检（Doctor）、查看项目清单与状态、支持 `--fast` / `--force-full` / `--resume` / `--snapshot-at` 触发扫描、实时日志与一键中止运行中任务。
+- **扫描与配置**：实时扫描进度条（同时感知 Web、定时与 CLI 触发的批次，支持点击已完成项目直达报告）、可视化定时扫描配置（持久化保存于 `output/state/schedule.json`）、一键环境自检（Doctor）、支持 `--fast` / `--force-full` / `--resume` / `--snapshot-at` 触发扫描、实时日志与一键中止任务。
 
 > 脚本调用 API 可在请求头携带 `Authorization: Bearer <AUDIT_WEB_TOKEN>`；`AUDIT_WEB_TOKEN` 留空时为免密模式（仅建议本机开发使用）。
 

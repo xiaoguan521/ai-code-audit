@@ -169,12 +169,65 @@ export interface CatalogProject {
 
 export interface ScanTask {
   task_id: string;
+  trigger?: "manual" | "schedule";
   command: string;
   status: "running" | "completed" | "failed" | "cancelled";
   started_at: string;
   finished_at: string | null;
   returncode: number | null;
+  latest_log?: string;
   logs?: string[];
+}
+
+export interface ScheduleConfig {
+  enabled: boolean;
+  time: string;
+  weekdays: number[];
+  fast: boolean;
+  resume: boolean;
+  force_full: boolean;
+  only: string[];
+  last_triggered_slot: string | null;
+  last_triggered_at: string | null;
+  last_task_id: string | null;
+  last_error: string | null;
+}
+
+export interface ScheduleResponse {
+  schedule: ScheduleConfig;
+  next_run_at: string | null;
+  server_time: string;
+}
+
+export interface RunProgressItem {
+  date: string;
+  run_id: string;
+  status: string;
+  report_mode: string;
+  started_at: string | null;
+  finished_at: string | null;
+  summary_status: string | null;
+  total_count: number;
+  completed_count: number;
+  ok_count: number;
+  error_count: number;
+  pending_count: number;
+  percent: number;
+  completed_projects: {
+    project_id: string;
+    project_name: string;
+    status: string;
+    total: number | null;
+    error?: string | null;
+  }[];
+  pending_projects: string[];
+}
+
+export interface LiveProgressResponse {
+  active_runs: RunProgressItem[];
+  latest_run: RunProgressItem | null;
+  running_task: ScanTask | null;
+  tasks: ScanTask[];
 }
 
 export interface DoctorCheck {
