@@ -264,12 +264,28 @@ def _parse_iso_ts(raw: str | None) -> float | None:
         return None
 
 
+def _is_real_model_scan(rec: dict, dur: float | None) -> bool:
+    """只把真正进入模型审查的项目计入耗时样本，剔除秒级 clone 失败与 resume 复用。"""
+    if dur is None or dur < 15.0:
+        return False
+    if rec.get("scan_type") == "resume" or rec.get("status") == "dry-run":
+        return False
+    stages = (rec.get("metrics") or {}).get("stages_seconds") or {}
+    model_sec = stages.get("model")
+    if isinstance(model_sec, (int, float)):
+        return model_sec >= 10.0
+    return rec.get("status") == "ok"
+
+
 def _build_run_progress(date_str: str, run_id: str, data: dict,
                         catalog: dict[str, dict] | None = None,
                         workdir: Path | None = None,
-                        settings: dict | None = None) -> dict:
+                        settings: dict | None = None,
+                        hist_by_pid: dict[str, float] | None = None,
+                        hist_global_avg: float | None = None) -> dict:
     cat = catalog or {}
     cfg_settings = settings or {}
+    pid_hist = hist_by_pid or {}
     projects = data.get("projects") or []
     pending = [str(p) for p in (data.get("pending_projects") or [])]
     completed_count = len(projects)
@@ -286,10 +302,13 @@ def _build_run_progress(date_str: str, run_id: str, data: dict,
         if started_ts is not None else None
     )
 
-    # 统计已完成项目的平均耗时（优先使用真实扫描时长，避免瞬间失败拉偏）
-    durations = [d for d in (_project_duration_seconds(p) for p in projects) if d is not None]
-    meaningful = [d for d in durations if d >= 10.0]
-    used_durations = meaningful or durations
+    # 只使用真实跑过模型的项目耗时作为均值样本（剔除几秒钟的 clone 失败和 resume 缓存命中）
+    real_durations = []
+    for p in projects:
+        d = _project_duration_seconds(p)
+        if _is_real_model_scan(p, d):
+            assert d is not None
+            real_durations.append(d)
     configured_parallel = max(1, int(cfg_settings.get("max_parallel", 2) or 2))
     per_project_timeout = float(cfg_settings.get("per_project_timeout_sec", 3600) or 3600)
 
@@ -303,10 +322,10 @@ def _build_run_progress(date_str: str, run_id: str, data: dict,
 
     effective_parallel = max(1, len(scanning_map) or configured_parallel)
     avg_project_sec: float | None = None
-    if used_durations:
-        avg_project_sec = sum(used_durations) / len(used_durations)
-    elif completed_count > 0 and elapsed_seconds is not None and elapsed_seconds > 0:
-        avg_project_sec = (elapsed_seconds / completed_count) * effective_parallel
+    if real_durations:
+        avg_project_sec = sum(real_durations) / len(real_durations)
+    elif hist_global_avg is not None:
+        avg_project_sec = hist_global_avg
 
     items: list[dict] = []
     for p in projects:
@@ -329,6 +348,7 @@ def _build_run_progress(date_str: str, run_id: str, data: dict,
         })
 
     scanning_etas: list[float] = []
+    queued_etas: list[float] = []
     queued_count = 0
     for pid in pending:
         meta = cat.get(pid, {})
@@ -336,20 +356,19 @@ def _build_run_progress(date_str: str, run_id: str, data: dict,
         proj_elapsed = None
         proj_eta = None
         timeout_rem = None
+        # 优先取该项目的历史真实耗时，否则回退到当前/历史全局均耗
+        expected_dur = pid_hist.get(pid) if pid in pid_hist else avg_project_sec
         if is_scanning:
             p_start = scanning_map[pid]
             proj_elapsed = max(0, round(now_ts - p_start)) if p_start is not None else 0
             timeout_rem = max(0, round(per_project_timeout - proj_elapsed))
-            if avg_project_sec is not None:
-                proj_eta = max(0, round(avg_project_sec - proj_elapsed))
-                scanning_etas.append(float(proj_eta))
-            else:
-                # 尚未有已完成项目时，暂用超时上限的 40% 作为保守参考
-                fallback_est = per_project_timeout * 0.4
-                proj_eta = max(0, round(fallback_est - proj_elapsed))
+            if expected_dur is not None:
+                proj_eta = max(0, round(expected_dur - proj_elapsed))
                 scanning_etas.append(float(proj_eta))
         else:
             queued_count += 1
+            if expected_dur is not None:
+                queued_etas.append(float(expected_dur))
         items.append({
             "project_id": pid,
             "project_name": meta.get("project_name") or pid,
@@ -366,13 +385,11 @@ def _build_run_progress(date_str: str, run_id: str, data: dict,
         })
 
     estimated_remaining_seconds: int | None = None
-    if data.get("status") == "running" and pending:
-        if avg_project_sec is not None:
-            # 正在扫描的剩余工作量 + 排队项目工作量，按有效并发度折算为墙钟剩余秒数
-            remaining_work = sum(scanning_etas) + queued_count * avg_project_sec
-            estimated_remaining_seconds = max(0, round(remaining_work / effective_parallel))
-        elif completed_count > 0 and elapsed_seconds is not None and elapsed_seconds > 0:
-            estimated_remaining_seconds = max(0, round((elapsed_seconds / completed_count) * len(pending)))
+    if data.get("status") == "running" and pending and (scanning_etas or queued_etas):
+        # 整体耗时至少不小于当前最慢的并行扫描项，同时计入排队项目按并发折算的时间
+        max_scanning = max(scanning_etas) if scanning_etas else 0.0
+        total_work = sum(scanning_etas) + sum(queued_etas)
+        estimated_remaining_seconds = max(0, round(max(max_scanning, total_work / effective_parallel)))
 
     return {
         "date": data.get("date") or date_str,
@@ -429,13 +446,43 @@ def _build_live_progress(output_dir: Path, projects_csv: Path | None = None,
         settings = {}
     workdir = _resolve_workdir(output_dir, settings)
     runs = _discover_runs(output_dir)
-    active_runs: list[dict] = []
-    latest_run: dict | None = None
-    for idx, r in enumerate(runs[:10]):
+    loaded_runs: list[tuple[dict, dict]] = []
+    hist_by_pid_mode: dict[tuple[str, str], float] = {}
+    hist_by_pid_any: dict[str, float] = {}
+    hist_by_mode: dict[str, list[float]] = {}
+    hist_all: list[float] = []
+    for r in runs[:10]:
         data = _read_json(_resolve_run_file(output_dir, r["date"], r["run_id"]))
         if not isinstance(data, dict):
             continue
-        item = _build_run_progress(r["date"], r["run_id"], data, catalog=catalog, workdir=workdir, settings=settings)
+        loaded_runs.append((r, data))
+        mode = str(data.get("report_mode") or "")
+        for p in data.get("projects") or []:
+            d = _project_duration_seconds(p)
+            if _is_real_model_scan(p, d):
+                assert d is not None
+                pid = str(p.get("project_id") or "")
+                if pid:
+                    hist_by_pid_mode.setdefault((pid, mode), d)
+                    hist_by_pid_any.setdefault(pid, d)
+                hist_by_mode.setdefault(mode, []).append(d)
+                hist_all.append(d)
+
+    active_runs: list[dict] = []
+    latest_run: dict | None = None
+    for idx, (r, data) in enumerate(loaded_runs):
+        mode = str(data.get("report_mode") or "")
+        mode_samples = hist_by_mode.get(mode) or hist_all
+        hist_avg = (sum(mode_samples) / len(mode_samples)) if mode_samples else None
+        pid_hist = dict(hist_by_pid_any)
+        for (pid, m), val in hist_by_pid_mode.items():
+            if m == mode:
+                pid_hist[pid] = val
+        item = _build_run_progress(
+            r["date"], r["run_id"], data,
+            catalog=catalog, workdir=workdir, settings=settings,
+            hist_by_pid=pid_hist, hist_global_avg=hist_avg,
+        )
         if idx == 0:
             latest_run = item
         if item["status"] == "running":

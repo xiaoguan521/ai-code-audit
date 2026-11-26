@@ -529,9 +529,11 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
                               {it.state === "scanning" ? (
                                 <div>
                                   <span style={{ color: "var(--accent)", fontWeight: 600 }}>
-                                    {it.eta_seconds != null && it.eta_seconds > 0
+                                    {it.eta_seconds == null
+                                      ? "估算中…"
+                                      : it.eta_seconds > 0
                                       ? `预计剩 ~${formatDuration(it.eta_seconds)}`
-                                      : "即将完成"}
+                                      : "已超均值（即将完成）"}
                                   </span>
                                   <div className="muted" style={{ fontSize: 11 }}>
                                     已扫 {formatDuration(it.elapsed_seconds)}
