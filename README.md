@@ -15,9 +15,10 @@
 
 ```text
 .
-├── runner/                    # 调度器与 Web API（零外部 Python 依赖）
+├── runner/                    # 调度器、自检工具与 Web API（零外部 Python 依赖）
 │   ├── run_daily.py           # 每日批量扫描主入口
 │   ├── web_server.py          # Web API 与前端静态资源托管服务
+│   ├── doctor.py              # 一键初始化（--init）与环境自检工具
 │   ├── report_validate.py     # 落盘前最小机器校验（表格解析、算分、证据核验）
 │   ├── scoring.py / evidence.py / code_map.py / incremental.py
 │   └── adapters/              # DeepSeek Harness 与跨项目汇总适配器
@@ -35,6 +36,16 @@
 > - `runner/facts.py` 的 `collect()` 未接入热路径；低成本静态信号由预扫描（`cloc`/`gitleaks`/`semgrep`/`lizard`）与代码地图覆盖。
 
 ## 部署与配置
+
+首次部署可一键初始化所需配置模板与占位目录（不覆盖已有文件），并执行环境自检：
+
+```bash
+# 生成 .env（含随机 AUDIT_WEB_TOKEN）、model.env、projects.local.csv 及 secrets 占位项
+python3 runner/doctor.py --init
+
+# 校验配置、权重、挂载项与工具链（加 --check-model 可探测模型连通性）
+python3 runner/doctor.py
+```
 
 详细文档与配置模板：
 
@@ -76,10 +87,10 @@ docker compose up -d web
 
 访问 `http://<宿主机地址>:8787`，输入 `AUDIT_WEB_TOKEN` 登录后可使用：
 
-- **质量看板**：KPI 指标卡片、全公司平均总分/安全分趋势折线、8 维度项目均分、可排序筛选的项目排行表。
+- **质量看板**：KPI 指标卡片、全公司平均总分/安全分趋势折线、8 维度项目均分、可排序筛选的项目排行表（含较上次分差 `▲/▼`）。
 - **批次记录**：按日期与 `run_id` 浏览每次扫描状态、项目耗时/报错，一键打开单项目报告或 `_summary.md`。
-- **报告阅读**：渲染单项目报告与跨项目汇总报告，支持按 `P0–P3` 等级和关键词筛选风险问题。
-- **扫描与配置**：查看项目清单及最近扫描状态，勾选在研项目直接触发扫描并查看实时运行日志。
+- **报告阅读**：侧边目录大纲（TOC）快速跳转、风险问题 `P0–P3` 筛选、直达链接复制分享、下载 `.md` / 导出问题 CSV / 打印另存 PDF。
+- **扫描与配置**：一键环境自检（Doctor）、查看项目清单与状态、支持 `--fast` / `--force-full` / `--resume` / `--snapshot-at` 触发扫描、实时日志与一键中止运行中任务。
 
 > 脚本调用 API 可在请求头携带 `Authorization: Bearer <AUDIT_WEB_TOKEN>`；`AUDIT_WEB_TOKEN` 留空时为免密模式（仅建议本机开发使用）。
 

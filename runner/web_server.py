@@ -38,6 +38,7 @@ ROOT = Path(__file__).resolve().parent.parent
 RUNNER_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(RUNNER_DIR))
 
+import doctor  # noqa: E402
 import report_validate  # noqa: E402
 import scoring  # noqa: E402
 
@@ -325,8 +326,9 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict) -> di
             if isinstance(data, dict):
                 states[f.stem] = data
 
-    # 按日期聚合趋势（每天取最新一次有评分项目的批次）
+    # 按日期聚合趋势，同时记录每个项目最近两次有效评分以便计算较上次变化
     trend_by_date: dict[str, dict] = {}
+    proj_history: dict[str, list[dict]] = {}
     for run in reversed(runs):  # 从早到晚遍历，同日后批次覆盖前批次
         run_data = _read_json(_resolve_run_file(output_dir, run["date"], run["run_id"]))
         if not isinstance(run_data, dict):
@@ -340,6 +342,13 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict) -> di
                 totals.append(float(sc["total"]))
             if sc.get("security_score") is not None:
                 secs.append(float(sc["security_score"]))
+            if sc.get("total") is not None or sc.get("security_score") is not None:
+                proj_history.setdefault(p["project_id"], []).append({
+                    "date": run["date"],
+                    "run_id": run["run_id"],
+                    "total": sc.get("total"),
+                    "security": sc.get("security_score"),
+                })
         if totals or secs:
             trend_by_date[run["date"]] = {
                 "date": run["date"],
@@ -402,6 +411,24 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict) -> di
                     run_date = parts[-3]
 
         status = rec.get("status") or ("ok" if st.get("last_report") else "pending")
+        hist = proj_history.get(pid, [])
+        prev_entry = None
+        for entry in reversed(hist):
+            if entry["date"] != run_date or entry["run_id"] != run_id:
+                prev_entry = entry
+                break
+        cur_total = scores.get("total")
+        cur_sec = scores.get("security_score")
+        delta_total = (
+            round(float(cur_total) - float(prev_entry["total"]), 1)
+            if prev_entry and cur_total is not None and prev_entry.get("total") is not None
+            else None
+        )
+        delta_security = (
+            round(float(cur_sec) - float(prev_entry["security"]), 1)
+            if prev_entry and cur_sec is not None and prev_entry.get("security") is not None
+            else None
+        )
         rows.append({
             "project_id": pid,
             "project_name": rec.get("project_name") or meta.get("project_name") or pid,
@@ -415,9 +442,12 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict) -> di
             "commit": (rec.get("commit") or st.get("last_commit") or "")[:10],
             "date": run_date,
             "run_id": run_id,
-            "total": scores.get("total"),
+            "total": cur_total,
+            "delta_total": delta_total,
+            "delta_security": delta_security,
+            "prev_date": prev_entry["date"] if prev_entry else None,
             "grade": scores.get("grade") or ("扫描失败" if status == "error" else "暂未扫描"),
-            "security": scores.get("security_score"),
+            "security": cur_sec,
             "coverage": scores.get("coverage"),
             "scored_dimensions": scores.get("scored_dimensions"),
             "security_p0": scores.get("security_p0", 0),
@@ -468,12 +498,25 @@ def _start_scan_task(payload: dict, root: Path, settings_path: Path, projects_cs
         cmd.append("--fast")
     elif payload.get("fast") is False:
         cmd.append("--no-fast")
+    if payload.get("resume") and payload.get("force_full"):
+        return {"bad_request": True, "error": "--resume 不能与 --force-full 同时使用"}
+    if payload.get("summary_only") and payload.get("dry_run"):
+        return {"bad_request": True, "error": "--summary-only 不能与 --dry-run 同时使用"}
     if payload.get("force_full"):
         cmd.append("--force-full")
+    if payload.get("resume"):
+        cmd.append("--resume")
     if payload.get("dry_run"):
         cmd.append("--dry-run")
     if payload.get("summary_only"):
         cmd.append("--summary-only")
+    snapshot_at = str(payload.get("snapshot_at") or "").strip()
+    if snapshot_at:
+        try:
+            dt.datetime.fromisoformat(snapshot_at.replace("Z", "+00:00"))
+        except ValueError:
+            return {"bad_request": True, "error": "snapshot_at 必须是合法的 ISO-8601 时间，例如 2026-11-24T00:00:00+08:00"}
+        cmd.extend(["--snapshot-at", snapshot_at])
 
     task = {
         "task_id": task_id,
@@ -483,6 +526,8 @@ def _start_scan_task(payload: dict, root: Path, settings_path: Path, projects_cs
         "finished_at": None,
         "returncode": None,
         "logs": deque(maxlen=500),
+        "_proc": None,
+        "_cancelled": False,
     }
 
     def runner_thread():
@@ -491,17 +536,26 @@ def _start_scan_task(payload: dict, root: Path, settings_path: Path, projects_cs
                 cmd, cwd=str(root), env=sub_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, encoding="utf-8", errors="replace",
             )
+            with SCAN_LOCK:
+                task["_proc"] = proc
+                if task["_cancelled"]:
+                    proc.terminate()
             assert proc.stdout is not None
             for line in proc.stdout:
                 with SCAN_LOCK:
                     task["logs"].append(line.rstrip("\n"))
             rc = proc.wait()
             with SCAN_LOCK:
+                task["_proc"] = None
                 task["returncode"] = rc
-                task["status"] = "completed" if rc == 0 else "failed"
+                if task["_cancelled"]:
+                    task["status"] = "cancelled"
+                else:
+                    task["status"] = "completed" if rc == 0 else "failed"
                 task["finished_at"] = dt.datetime.now().isoformat()
         except Exception as exc:
             with SCAN_LOCK:
+                task["_proc"] = None
                 task["logs"].append(f"[web_server] 启动失败: {exc}")
                 task["returncode"] = -1
                 task["status"] = "failed"
@@ -513,6 +567,37 @@ def _start_scan_task(payload: dict, root: Path, settings_path: Path, projects_cs
         SCAN_TASKS[task_id] = task
     threading.Thread(target=runner_thread, daemon=True).start()
     return {"task_id": task_id, "status": "running", "command": task["command"]}
+
+
+def _cancel_scan_task(task_id: str) -> dict:
+    with SCAN_LOCK:
+        task = SCAN_TASKS.get(task_id)
+        if not task:
+            return {"not_found": True, "error": "未找到任务"}
+        if task["status"] != "running":
+            return {"conflict": True, "error": f"任务当前状态为 {task['status']}，无法中止"}
+        task["_cancelled"] = True
+        task["logs"].append("[web_server] 收到中止请求，正在停止扫描进程…")
+        proc = task.get("_proc")
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        return {"task_id": task_id, "status": "cancelling"}
+
+
+def _serialize_task(task: dict, include_logs: bool) -> dict:
+    out = {}
+    for k, v in task.items():
+        if k.startswith("_"):
+            continue
+        if k == "logs":
+            if include_logs:
+                out[k] = list(v)
+        else:
+            out[k] = v
+    return out
 
 
 class AuditHandler(BaseHTTPRequestHandler):
@@ -680,12 +765,14 @@ class AuditHandler(BaseHTTPRequestHandler):
                 "checklist_dimensions": checklist["dimensions"],
             })
 
+        if path == "/api/doctor":
+            return self._send_json(200, doctor.run_checks(
+                ROOT, output_dir=output_dir, projects_csv=projects_csv, settings_path=self.cfg["settings_path"]
+            ))
+
         if path == "/api/scans":
             with SCAN_LOCK:
-                tasks = [
-                    {k: (list(v) if k == "logs" else v) for k, v in t.items() if k != "logs"}
-                    for t in reversed(list(SCAN_TASKS.values()))
-                ]
+                tasks = [_serialize_task(t, include_logs=False) for t in reversed(list(SCAN_TASKS.values()))]
             return self._send_json(200, {"tasks": tasks})
 
         if path.startswith("/api/scans/"):
@@ -694,7 +781,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                 t = SCAN_TASKS.get(task_id)
                 if not t:
                     return self._send_json(404, {"error": "未找到任务"})
-                snap = {k: (list(v) if k == "logs" else v) for k, v in t.items()}
+                snap = _serialize_task(t, include_logs=True)
             return self._send_json(200, snap)
 
         # 托管静态前端 (frontend/dist)
@@ -747,6 +834,15 @@ class AuditHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/") and not self._is_authenticated():
             return self._send_json(401, {"error": "未登录或会话已过期，请先认证"})
 
+        if path.startswith("/api/scans/") and path.endswith("/cancel"):
+            task_id = urllib.parse.unquote(path[len("/api/scans/"):-len("/cancel")])
+            res = _cancel_scan_task(task_id)
+            if res.get("not_found"):
+                return self._send_json(404, {"error": res["error"]})
+            if res.get("conflict"):
+                return self._send_json(409, {"error": res["error"]})
+            return self._send_json(200, res)
+
         if path != "/api/scans":
             return self._send_json(404, {"error": "Not Found"})
         payload = self._read_json_body()
@@ -754,6 +850,8 @@ class AuditHandler(BaseHTTPRequestHandler):
             return self._send_json(400, {"error": "无效的 JSON 请求体"})
 
         res = _start_scan_task(payload, ROOT, self.cfg["settings_path"], self.cfg["projects_csv"])
+        if res.get("bad_request"):
+            return self._send_json(400, {"error": res["error"]})
         if res.get("conflict"):
             return self._send_json(409, {"error": res["error"]})
         return self._send_json(202, res)

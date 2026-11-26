@@ -269,6 +269,9 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
                 <th className="num sortable" onClick={() => toggleSort("total")}>
                   总评分
                 </th>
+                <th className="num sortable" onClick={() => toggleSort("delta_total")}>
+                  较上次
+                </th>
                 <th>档位</th>
                 <th className="num sortable" onClick={() => toggleSort("security")}>
                   安全评分
@@ -311,6 +314,17 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
                     <td className="num">
                       <b>{fmt1(r.total)}</b>
                     </td>
+                    <td className="num" title={r.prev_date ? `对比上次 ${r.prev_date}` : "暂无上次记录"}>
+                      {r.delta_total == null ? (
+                        <span className="muted">—</span>
+                      ) : r.delta_total > 0 ? (
+                        <span className="delta-up">▲ {r.delta_total.toFixed(1)}</span>
+                      ) : r.delta_total < 0 ? (
+                        <span className="delta-down">▼ {Math.abs(r.delta_total).toFixed(1)}</span>
+                      ) : (
+                        <span className="muted">0.0</span>
+                      )}
+                    </td>
                     <td>
                       <span className="chip">
                         <span
@@ -339,7 +353,7 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
               })}
               {filtered.length === 0 && (
                 <tr>
-                  <td colSpan={12} className="muted" style={{ textAlign: "center", padding: 24 }}>
+                  <td colSpan={13} className="muted" style={{ textAlign: "center", padding: 24 }}>
                     没有符合条件的项目
                   </td>
                 </tr>

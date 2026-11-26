@@ -1,5 +1,6 @@
 import type {
   CatalogProject,
+  DoctorReport,
   OverviewResponse,
   ReportResponse,
   RunDetailResponse,
@@ -50,14 +51,21 @@ export const api = {
       `/api/reports/${encodeURIComponent(date)}/${encodeURIComponent(runId)}/${encodeURIComponent(target)}`
     ),
   projects: () => request<{ projects: CatalogProject[]; scan_statuses?: string[] }>("/api/projects"),
+  doctor: () => request<DoctorReport>("/api/doctor"),
   scans: () => request<{ tasks: ScanTask[] }>("/api/scans"),
   scanDetail: (taskId: string) => request<ScanTask>(`/api/scans/${encodeURIComponent(taskId)}`),
+  cancelScan: (taskId: string) =>
+    request<{ task_id: string; status: string }>(`/api/scans/${encodeURIComponent(taskId)}/cancel`, {
+      method: "POST",
+    }),
   startScan: (payload: {
     only?: string[];
     fast?: boolean;
     force_full?: boolean;
+    resume?: boolean;
     dry_run?: boolean;
     summary_only?: boolean;
+    snapshot_at?: string;
   }) =>
     request<{ task_id: string; status: string; command: string }>("/api/scans", {
       method: "POST",

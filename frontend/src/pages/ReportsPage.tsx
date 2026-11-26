@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
+import { Check, Download, Link2, Printer } from "lucide-react";
 import { Marked, Renderer } from "marked";
 import { api } from "../api";
 import type { ReportResponse, RunDetailResponse, RunSummary } from "../types";
+
+interface TocItem {
+  id: string;
+  depth: number;
+  text: string;
+}
 
 function escapeHtml(raw: string): string {
   return raw.replace(/[&<>"']/g, (ch) => {
@@ -16,7 +23,8 @@ function escapeHtml(raw: string): string {
   });
 }
 
-function createSafeMarked(): Marked {
+function renderMarkdownWithToc(markdown: string): { html: string; toc: TocItem[] } {
+  const toc: TocItem[] = [];
   const renderer = new Renderer();
   renderer.html = ({ text }) => escapeHtml(text);
   const origLink = renderer.link.bind(renderer);
@@ -35,16 +43,41 @@ function createSafeMarked(): Marked {
     }
     return origImage(token);
   };
-  return new Marked({ gfm: true, breaks: false, renderer });
+  renderer.heading = function ({ tokens, depth, text }) {
+    const inner = this.parser.parseInline(tokens);
+    if (depth === 2 || depth === 3) {
+      const id = `sec-${toc.length}`;
+      toc.push({ id, depth, text: text.replace(/[`*_#]/g, "").trim() });
+      return `<h${depth} id="${id}">${inner}</h${depth}>\n`;
+    }
+    return `<h${depth}>${inner}</h${depth}>\n`;
+  };
+  const instance = new Marked({ gfm: true, breaks: false, renderer });
+  const html = instance.parse(markdown) as string;
+  return { html, toc };
 }
 
-const safeMarked = createSafeMarked();
+function downloadBlob(filename: string, content: string, mime: string) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function csvCell(v: string): string {
+  const s = String(v ?? "");
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
 
 interface Props {
   initialTarget: { date: string; runId: string; target: string } | null;
+  onTargetChange?: (next: { date: string; runId: string; target: string }) => void;
 }
 
-export function ReportsPage({ initialTarget }: Props) {
+export function ReportsPage({ initialTarget, onTargetChange }: Props) {
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [date, setDate] = useState(initialTarget?.date || "");
   const [runId, setRunId] = useState(initialTarget?.runId || "");
@@ -52,6 +85,7 @@ export function ReportsPage({ initialTarget }: Props) {
   const [runDetail, setRunDetail] = useState<RunDetailResponse | null>(null);
   const [report, setReport] = useState<ReportResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const [levelFilter, setLevelFilter] = useState("");
   const [issueQuery, setIssueQuery] = useState("");
@@ -63,7 +97,7 @@ export function ReportsPage({ initialTarget }: Props) {
       setRunId(initialTarget.runId);
       setTarget(initialTarget.target);
     }
-  }, [initialTarget]);
+  }, [initialTarget?.date, initialTarget?.runId, initialTarget?.target]);
 
   useEffect(() => {
     api
@@ -77,6 +111,12 @@ export function ReportsPage({ initialTarget }: Props) {
       })
       .catch((err) => setError(err instanceof Error ? err.message : "加载批次列表失败"));
   }, []);
+
+  useEffect(() => {
+    if (date && runId && onTargetChange) {
+      onTargetChange({ date, runId, target });
+    }
+  }, [date, runId, target]);
 
   useEffect(() => {
     if (!date || !runId) return;
@@ -95,9 +135,9 @@ export function ReportsPage({ initialTarget }: Props) {
       });
   }, [date, runId, target]);
 
-  const html = useMemo(() => {
-    if (!report?.markdown) return "";
-    return safeMarked.parse(report.markdown) as string;
+  const { html, toc } = useMemo(() => {
+    if (!report?.markdown) return { html: "", toc: [] as TocItem[] };
+    return renderMarkdownWithToc(report.markdown);
   }, [report?.markdown]);
 
   const filteredIssues = useMemo(() => {
@@ -112,9 +152,37 @@ export function ReportsPage({ initialTarget }: Props) {
 
   const okProjects = (runDetail?.projects ?? []).filter((p) => p.status === "ok");
 
+  const handleCopyLink = () => {
+    const url = window.location.href;
+    navigator.clipboard?.writeText(url).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    }).catch(() => {});
+  };
+
+  const handleDownloadMd = () => {
+    if (!report?.markdown) return;
+    const fname = `${date}_${target === "_summary" ? "summary" : target}.md`;
+    downloadBlob(fname, report.markdown, "text/markdown;charset=utf-8");
+  };
+
+  const handleExportIssuesCsv = () => {
+    if (!report?.issues) return;
+    const header = ["ID", "等级", "检查项", "问题标题", "证据", "影响", "修复建议", "工作量"];
+    const lines = [
+      header.join(","),
+      ...filteredIssues.map((i) =>
+        [i.issue_id, i.level, i.item_id, i.title, i.evidence_text, i.impact, i.suggestion, i.effort]
+          .map(csvCell)
+          .join(",")
+      ),
+    ];
+    downloadBlob(`${date}_${target}_issues.csv`, "\ufeff" + lines.join("\n"), "text/csv;charset=utf-8");
+  };
+
   return (
     <div>
-      <div className="card" style={{ marginBottom: 14 }}>
+      <div className="card no-print" style={{ marginBottom: 14 }}>
         <div className="filters" style={{ marginBottom: 0 }}>
           <select
             value={date && runId ? `${date}/${runId}` : ""}
@@ -141,6 +209,26 @@ export function ReportsPage({ initialTarget }: Props) {
               </option>
             ))}
           </select>
+
+          <button className="btn" onClick={handleCopyLink} title="复制当前报告直达链接">
+            {copied ? <Check size={14} /> : <Link2 size={14} />} {copied ? "已复制" : "复制链接"}
+          </button>
+
+          {report && (
+            <>
+              <button className="btn" onClick={handleDownloadMd}>
+                <Download size={14} /> 下载 .md
+              </button>
+              {report.type === "project" && (report.issues?.length ?? 0) > 0 && (
+                <button className="btn" onClick={handleExportIssuesCsv}>
+                  <Download size={14} /> 导出问题 CSV
+                </button>
+              )}
+              <button className="btn" onClick={() => window.print()}>
+                <Printer size={14} /> 打印 / PDF
+              </button>
+            </>
+          )}
 
           {report?.type === "project" && (
             <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
@@ -200,7 +288,7 @@ export function ReportsPage({ initialTarget }: Props) {
 
       {report && tab === "issues" && report.type === "project" ? (
         <div className="card">
-          <div className="filters">
+          <div className="filters no-print">
             <select value={levelFilter} onChange={(e) => setLevelFilter(e.target.value)}>
               <option value="">全部等级</option>
               <option value="P0">P0</option>
@@ -257,8 +345,29 @@ export function ReportsPage({ initialTarget }: Props) {
         </div>
       ) : (
         report && (
-          <div className="card">
-            <div className="markdown-body" dangerouslySetInnerHTML={{ __html: html }} />
+          <div className={toc.length > 0 ? "report-layout" : undefined}>
+            {toc.length > 0 && (
+              <aside className="card toc-panel no-print">
+                <div className="card-title" style={{ marginBottom: 8 }}>
+                  <span>目录导航</span>
+                </div>
+                {toc.map((item) => (
+                  <button
+                    key={item.id}
+                    className={`toc-link level-${item.depth}`}
+                    title={item.text}
+                    onClick={() =>
+                      document.getElementById(item.id)?.scrollIntoView({ behavior: "smooth", block: "start" })
+                    }
+                  >
+                    {item.text}
+                  </button>
+                ))}
+              </aside>
+            )}
+            <div className="card">
+              <div className="markdown-body" dangerouslySetInnerHTML={{ __html: html }} />
+            </div>
           </div>
         )
       )}

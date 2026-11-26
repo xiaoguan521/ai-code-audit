@@ -28,6 +28,9 @@ export interface ProjectRow {
   date?: string;
   run_id?: string | null;
   total: number | null;
+  delta_total?: number | null;
+  delta_security?: number | null;
+  prev_date?: string | null;
   grade: string;
   security: number | null;
   coverage: number | null;
@@ -167,9 +170,23 @@ export interface CatalogProject {
 export interface ScanTask {
   task_id: string;
   command: string;
-  status: "running" | "completed" | "failed";
+  status: "running" | "completed" | "failed" | "cancelled";
   started_at: string;
   finished_at: string | null;
   returncode: number | null;
   logs?: string[];
+}
+
+export interface DoctorCheck {
+  name: string;
+  status: "ok" | "warn" | "error";
+  detail: string;
+  fix?: string;
+}
+
+export interface DoctorReport {
+  verdict: "ok" | "warn" | "error";
+  errors: number;
+  warnings: number;
+  checks: DoctorCheck[];
 }

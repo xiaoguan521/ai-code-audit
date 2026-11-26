@@ -8,9 +8,40 @@ import { ScansPage } from "./pages/ScansPage";
 import type { OverviewResponse } from "./types";
 
 type Page = "dashboard" | "runs" | "reports" | "scans";
+type ReportTarget = { date: string; runId: string; target: string };
+
+function parseHash(): { page: Page; reportTarget: ReportTarget | null } {
+  const raw = window.location.hash.replace(/^#\/?/, "");
+  const [pathPart, queryPart] = raw.split("?");
+  const page: Page =
+    pathPart === "runs" || pathPart === "reports" || pathPart === "scans" ? pathPart : "dashboard";
+  if (page === "reports" && queryPart) {
+    const params = new URLSearchParams(queryPart);
+    const date = params.get("date") || "";
+    const runId = params.get("run") || "";
+    const target = params.get("target") || "_summary";
+    if (date && runId) {
+      return { page, reportTarget: { date, runId, target } };
+    }
+  }
+  return { page, reportTarget: null };
+}
+
+function buildHash(page: Page, target: ReportTarget | null): string {
+  if (page === "reports" && target?.date && target?.runId) {
+    const params = new URLSearchParams({
+      date: target.date,
+      run: target.runId,
+      target: target.target || "_summary",
+    });
+    return `#/reports?${params.toString()}`;
+  }
+  return `#/${page}`;
+}
 
 export function App() {
-  const [page, setPage] = useState<Page>("dashboard");
+  const initial = parseHash();
+  const [page, setPage] = useState<Page>(initial.page);
   const [dark, setDark] = useState(false);
   const [authChecked, setAuthChecked] = useState(false);
   const [authRequired, setAuthRequired] = useState(false);
@@ -22,15 +53,28 @@ export function App() {
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [reportTarget, setReportTarget] = useState<{
-    date: string;
-    runId: string;
-    target: string;
-  } | null>(null);
+  const [reportTarget, setReportTarget] = useState<ReportTarget | null>(initial.reportTarget);
 
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? "dark" : "light";
   }, [dark]);
+
+  useEffect(() => {
+    const onHashChange = () => {
+      const next = parseHash();
+      setPage(next.page);
+      if (next.reportTarget) setReportTarget(next.reportTarget);
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  useEffect(() => {
+    const nextHash = buildHash(page, reportTarget);
+    if (window.location.hash !== nextHash) {
+      window.history.replaceState(null, "", nextHash);
+    }
+  }, [page, reportTarget]);
 
   useEffect(() => {
     setUnauthorizedHandler(() => {
@@ -100,8 +144,15 @@ export function App() {
   };
 
   const openReport = (date: string, runId: string, target: string) => {
-    setReportTarget({ date, runId, target });
+    const next = { date, runId, target };
+    setReportTarget(next);
     setPage("reports");
+    window.location.hash = buildHash("reports", next);
+  };
+
+  const navigate = (nextPage: Page) => {
+    setPage(nextPage);
+    window.location.hash = buildHash(nextPage, nextPage === "reports" ? reportTarget : null);
   };
 
   if (!authChecked) {
@@ -165,25 +216,25 @@ export function App() {
           <nav className="nav-tabs">
             <button
               className={`nav-tab ${page === "dashboard" ? "active" : ""}`}
-              onClick={() => setPage("dashboard")}
+              onClick={() => navigate("dashboard")}
             >
               <BarChart3 size={15} /> 质量看板
             </button>
             <button
               className={`nav-tab ${page === "runs" ? "active" : ""}`}
-              onClick={() => setPage("runs")}
+              onClick={() => navigate("runs")}
             >
               <History size={15} /> 批次记录
             </button>
             <button
               className={`nav-tab ${page === "reports" ? "active" : ""}`}
-              onClick={() => setPage("reports")}
+              onClick={() => navigate("reports")}
             >
               <FileText size={15} /> 报告阅读
             </button>
             <button
               className={`nav-tab ${page === "scans" ? "active" : ""}`}
-              onClick={() => setPage("scans")}
+              onClick={() => navigate("scans")}
             >
               <Activity size={15} /> 扫描与配置
             </button>
@@ -207,7 +258,7 @@ export function App() {
 
       <main className="main-wrap">
         {error && (
-          <div className="card" style={{ marginBottom: 14, borderColor: "var(--critical)" }}>
+          <div className="card no-print" style={{ marginBottom: 14, borderColor: "var(--critical)" }}>
             <b style={{ color: "var(--critical)" }}>API 连接提示：</b>
             <span>{error}（请确认已启动 python3 runner/web_server.py）</span>
           </div>
@@ -216,7 +267,9 @@ export function App() {
           <DashboardPage data={overview} loading={loading} onOpenReport={openReport} />
         )}
         {page === "runs" && <RunsPage onOpenReport={openReport} />}
-        {page === "reports" && <ReportsPage initialTarget={reportTarget} />}
+        {page === "reports" && (
+          <ReportsPage initialTarget={reportTarget} onTargetChange={setReportTarget} />
+        )}
         {page === "scans" && <ScansPage />}
       </main>
     </div>

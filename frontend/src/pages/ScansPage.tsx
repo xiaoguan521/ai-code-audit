@@ -1,7 +1,13 @@
 import { useEffect, useState } from "react";
-import { Play, RefreshCw } from "lucide-react";
+import { Play, RefreshCw, Square, Stethoscope } from "lucide-react";
 import { api } from "../api";
-import type { CatalogProject, ScanTask } from "../types";
+import type { CatalogProject, DoctorReport, ScanTask } from "../types";
+
+const DOCTOR_COLOR: Record<string, string> = {
+  ok: "var(--good)",
+  warn: "var(--warning)",
+  error: "var(--critical)",
+};
 
 export function ScansPage() {
   const [projects, setProjects] = useState<CatalogProject[]>([]);
@@ -9,11 +15,16 @@ export function ScansPage() {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [fast, setFast] = useState(false);
   const [forceFull, setForceFull] = useState(false);
+  const [resume, setResume] = useState(false);
   const [dryRun, setDryRun] = useState(true);
   const [summaryOnly, setSummaryOnly] = useState(false);
+  const [snapshotAt, setSnapshotAt] = useState("");
   const [tasks, setTasks] = useState<ScanTask[]>([]);
   const [activeTask, setActiveTask] = useState<ScanTask | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [doctor, setDoctor] = useState<DoctorReport | null>(null);
+  const [checkingDoctor, setCheckingDoctor] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const loadAll = async () => {
@@ -65,9 +76,11 @@ export function ScansPage() {
       const res = await api.startScan({
         only: selectedIds.length > 0 ? selectedIds : undefined,
         fast,
-        force_full: forceFull,
-        dry_run: dryRun,
+        force_full: summaryOnly ? false : forceFull,
+        resume: summaryOnly ? false : resume,
+        dry_run: summaryOnly ? false : dryRun,
         summary_only: summaryOnly,
+        snapshot_at: snapshotAt.trim() || undefined,
       });
       const detail = await api.scanDetail(res.task_id);
       setActiveTask(detail);
@@ -80,6 +93,34 @@ export function ScansPage() {
     }
   };
 
+  const handleCancel = async () => {
+    if (!activeTask || activeTask.status !== "running") return;
+    setCancelling(true);
+    setError(null);
+    try {
+      await api.cancelScan(activeTask.task_id);
+      const detail = await api.scanDetail(activeTask.task_id);
+      setActiveTask(detail);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "中止任务失败");
+    } finally {
+      setCancelling(false);
+    }
+  };
+
+  const handleDoctor = async () => {
+    setCheckingDoctor(true);
+    setError(null);
+    try {
+      const res = await api.doctor();
+      setDoctor(res);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "环境自检失败");
+    } finally {
+      setCheckingDoctor(false);
+    }
+  };
+
   return (
     <div style={{ display: "grid", gap: 14 }}>
       {error && (
@@ -87,13 +128,55 @@ export function ScansPage() {
           {error}
         </div>
       )}
+
       <div className="card">
         <div className="card-title">
           <span>项目清单与扫描触发</span>
-          <button className="btn" onClick={() => void loadAll()}>
-            <RefreshCw size={14} /> 刷新
-          </button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="btn" onClick={() => void handleDoctor()} disabled={checkingDoctor}>
+              <Stethoscope size={14} /> {checkingDoctor ? "检查中…" : "环境自检"}
+            </button>
+            <button className="btn" onClick={() => void loadAll()}>
+              <RefreshCw size={14} /> 刷新
+            </button>
+          </div>
         </div>
+
+        {doctor && (
+          <div
+            style={{
+              marginBottom: 14,
+              padding: 12,
+              borderRadius: 8,
+              border: "1px solid var(--border)",
+              background: "var(--bg-2)",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+              <b>
+                环境自检：{doctor.verdict.toUpperCase()}（错误 {doctor.errors} / 警告 {doctor.warnings}）
+              </b>
+              <button className="btn" style={{ padding: "2px 8px", fontSize: 12 }} onClick={() => setDoctor(null)}>
+                收起
+              </button>
+            </div>
+            <div style={{ display: "grid", gap: 6 }}>
+              {doctor.checks.map((c) => (
+                <div key={c.name} style={{ display: "flex", gap: 10, alignItems: "baseline", fontSize: 13 }}>
+                  <span className="chip" style={{ minWidth: 62, justifyContent: "center" }}>
+                    <span className="chip-dot" style={{ background: DOCTOR_COLOR[c.status] }} />
+                    {c.status.toUpperCase()}
+                  </span>
+                  <b style={{ minWidth: 130 }}>{c.name}</b>
+                  <span>
+                    {c.detail}
+                    {c.fix && <span className="muted"> · 建议：{c.fix}</span>}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="filters">
           <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
@@ -105,9 +188,24 @@ export function ScansPage() {
               type="checkbox"
               checked={forceFull}
               disabled={summaryOnly}
-              onChange={(e) => setForceFull(e.target.checked)}
+              onChange={(e) => {
+                setForceFull(e.target.checked);
+                if (e.target.checked) setResume(false);
+              }}
             />
             强制全量 (--force-full)
+          </label>
+          <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <input
+              type="checkbox"
+              checked={resume}
+              disabled={summaryOnly}
+              onChange={(e) => {
+                setResume(e.target.checked);
+                if (e.target.checked) setForceFull(false);
+              }}
+            />
+            跳过无变更 (--resume)
           </label>
           <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
             <input
@@ -124,11 +222,22 @@ export function ScansPage() {
               checked={summaryOnly}
               onChange={(e) => {
                 setSummaryOnly(e.target.checked);
-                if (e.target.checked) setDryRun(false);
+                if (e.target.checked) {
+                  setDryRun(false);
+                  setForceFull(false);
+                  setResume(false);
+                }
               }}
             />
             仅生成汇总 (--summary-only)
           </label>
+          <input
+            placeholder="快照时间 ISO-8601（可选）"
+            title="例如 2026-11-24T00:00:00+08:00"
+            value={snapshotAt}
+            onChange={(e) => setSnapshotAt(e.target.value)}
+            style={{ width: 215 }}
+          />
           <button
             className="btn btn-primary"
             style={{ marginLeft: "auto" }}
@@ -163,7 +272,11 @@ export function ScansPage() {
                       <input
                         type="checkbox"
                         disabled={!scannable}
-                        title={scannable ? "选择参与扫描" : `状态为「${p.status || "未知"}」，不在允许扫描状态（${scanStatuses.join("/")}）中`}
+                        title={
+                          scannable
+                            ? "选择参与扫描"
+                            : `状态为「${p.status || "未知"}」，不在允许扫描状态（${scanStatuses.join("/")}）中`
+                        }
                         checked={scannable && selectedIds.includes(p.project_id)}
                         onChange={() => scannable && toggleId(p.project_id)}
                       />
@@ -203,7 +316,7 @@ export function ScansPage() {
               <div
                 key={t.task_id}
                 className={`list-item ${activeTask?.task_id === t.task_id ? "active" : ""}`}
-                onClick={() => api.scanDetail(t.task_id).then(setActiveTask)}
+                onClick={() => api.scanDetail(t.task_id).then(setActiveTask).catch(() => {})}
               >
                 <div style={{ display: "flex", justifyContent: "space-between" }}>
                   <b>{t.task_id}</b>
@@ -220,6 +333,11 @@ export function ScansPage() {
         <div className="card">
           <div className="card-title">
             <span>实时日志 {activeTask ? `· ${activeTask.task_id} (${activeTask.status})` : ""}</span>
+            {activeTask?.status === "running" && (
+              <button className="btn btn-danger" onClick={() => void handleCancel()} disabled={cancelling}>
+                <Square size={13} /> {cancelling ? "中止中…" : "中止扫描"}
+              </button>
+            )}
           </div>
           {activeTask ? (
             <>
