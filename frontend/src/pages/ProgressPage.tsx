@@ -101,6 +101,7 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
   const [activeTask, setActiveTask] = useState<ScanTask | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
+  const [draftModal, setDraftModal] = useState<{ title: string; markdown: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const logBoxRef = useRef<HTMLDivElement | null>(null);
 
@@ -204,6 +205,16 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
       setError(err instanceof Error ? err.message : "重跑失败");
     } finally {
       setActionBusy(false);
+    }
+  };
+
+  const handleViewRejected = async (date: string, runId: string, pid: string, name: string) => {
+    setError(null);
+    try {
+      const res = await api.rejectedDraft(date, runId, pid);
+      setDraftModal({ title: `${name}（${pid}）被拦截的原始输出`, markdown: res.markdown });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载拦截草稿失败");
     }
   };
 
@@ -512,13 +523,46 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
                                 {STATE_LABEL[it.state]}
                               </span>
                             </td>
-                            <td style={{ whiteSpace: "normal", maxWidth: 280 }}>
+                            <td style={{ whiteSpace: "normal", maxWidth: 340 }}>
                               {it.state === "ok" ? (
                                 <b>{it.total != null ? `${it.total.toFixed(1)} 分` : "已完成"}</b>
                               ) : it.state === "error" ? (
-                                <span style={{ color: "var(--critical)" }} title={it.error || ""}>
-                                  {(it.error || "扫描失败").slice(0, 90)}
-                                </span>
+                                <div>
+                                  <span style={{ color: "var(--critical)" }} title={it.error || ""}>
+                                    {(it.error || "扫描失败").slice(0, 90)}
+                                  </span>
+                                  {((it.validation_problems?.length ?? 0) > 0 ||
+                                    (it.secret_patterns?.length ?? 0) > 0) && (
+                                    <details style={{ marginTop: 4, fontSize: 12 }}>
+                                      <summary style={{ cursor: "pointer", color: "var(--accent)" }}>
+                                        查看拦截原因（
+                                        {(it.validation_problems?.length ?? 0) +
+                                          (it.secret_patterns?.length ?? 0)}{" "}
+                                        条）
+                                      </summary>
+                                      <ul style={{ margin: "4px 0 0 16px", padding: 0, color: "var(--text-2)" }}>
+                                        {(it.secret_patterns || []).map((pat, i) => (
+                                          <li key={`s-${i}`}>命中高置信密钥模式：{pat}</li>
+                                        ))}
+                                        {(it.validation_problems || []).map((prob, i) => (
+                                          <li key={`v-${i}`}>{prob}</li>
+                                        ))}
+                                      </ul>
+                                    </details>
+                                  )}
+                                  {it.has_rejected_draft && (
+                                    <button
+                                      type="button"
+                                      className="btn"
+                                      style={{ marginTop: 4, padding: "2px 8px", fontSize: 11 }}
+                                      onClick={() =>
+                                        void handleViewRejected(run.date, run.run_id, it.project_id, it.project_name)
+                                      }
+                                    >
+                                      查看被拦截原始草稿
+                                    </button>
+                                  )}
+                                </div>
                               ) : it.state === "scanning" ? (
                                 <span style={{ color: "var(--accent)" }}>Harness 正在分析代码…</span>
                               ) : (
@@ -714,6 +758,37 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
           )}
         </div>
       </div>
+
+      {draftModal && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.48)",
+            display: "grid",
+            placeItems: "center",
+            padding: 20,
+            zIndex: 60,
+          }}
+          onClick={() => setDraftModal(null)}
+        >
+          <div
+            className="card"
+            style={{ width: "min(920px, 95vw)", maxHeight: "85vh", display: "flex", flexDirection: "column" }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="card-title">
+              <span>{draftModal.title}</span>
+              <button className="btn" onClick={() => setDraftModal(null)}>
+                关闭
+              </button>
+            </div>
+            <pre className="log-box" style={{ maxHeight: "70vh", margin: 0 }}>
+              {draftModal.markdown}
+            </pre>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

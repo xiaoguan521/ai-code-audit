@@ -50,6 +50,7 @@ export function RunsPage({ onOpenReport, onScanStarted }: Props) {
   const [detail, setDetail] = useState<RunDetailResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
+  const [draftModal, setDraftModal] = useState<{ title: string; markdown: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // 清册筛选状态
@@ -158,6 +159,17 @@ export function RunsPage({ onOpenReport, onScanStarted }: Props) {
       setError(err instanceof Error ? err.message : "标记中断失败");
     } finally {
       setActionBusy(false);
+    }
+  };
+
+  const handleViewRejected = async (pid: string, name: string) => {
+    if (!detail) return;
+    setError(null);
+    try {
+      const res = await api.rejectedDraft(detail.date, detail.run_id, pid);
+      setDraftModal({ title: `${name}（${pid}）被拦截的原始输出`, markdown: res.markdown });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加载拦截草稿失败");
     }
   };
 
@@ -412,11 +424,42 @@ export function RunsPage({ onOpenReport, onScanStarted }: Props) {
                             : "—"}
                         </td>
                         <td className="muted">{(p.commit || "").slice(0, 10) || "—"}</td>
-                        <td style={{ whiteSpace: "normal", maxWidth: 260 }}>
+                        <td style={{ whiteSpace: "normal", maxWidth: 320 }}>
                           {p.error ? (
-                            <span style={{ color: "var(--critical)", fontSize: 12 }} title={p.error}>
-                              {p.error.length > 120 ? `${p.error.slice(0, 120)}…` : p.error}
-                            </span>
+                            <div>
+                              <span style={{ color: "var(--critical)", fontSize: 12 }} title={p.error}>
+                                {p.error.length > 120 ? `${p.error.slice(0, 120)}…` : p.error}
+                              </span>
+                              {((p.report_validation?.problems?.length ?? 0) > 0 ||
+                                (p.secret_scan?.patterns?.length ?? 0) > 0) && (
+                                <details style={{ marginTop: 4, fontSize: 12 }}>
+                                  <summary style={{ cursor: "pointer", color: "var(--accent)" }}>
+                                    查看拦截原因（
+                                    {(p.report_validation?.problems?.length ?? 0) +
+                                      (p.secret_scan?.patterns?.length ?? 0)}{" "}
+                                    条）
+                                  </summary>
+                                  <ul style={{ margin: "4px 0 0 16px", padding: 0, color: "var(--text-2)" }}>
+                                    {(p.secret_scan?.patterns || []).map((pat, i) => (
+                                      <li key={`s-${i}`}>命中高置信密钥模式：{pat}</li>
+                                    ))}
+                                    {(p.report_validation?.problems || []).map((prob, i) => (
+                                      <li key={`v-${i}`}>{prob}</li>
+                                    ))}
+                                  </ul>
+                                </details>
+                              )}
+                              {p.has_rejected_draft && (
+                                <button
+                                  type="button"
+                                  className="btn"
+                                  style={{ marginTop: 4, padding: "2px 8px", fontSize: 11 }}
+                                  onClick={() => void handleViewRejected(p.project_id, p.project_name || p.project_id)}
+                                >
+                                  查看被拦截原始草稿
+                                </button>
+                              )}
+                            </div>
                           ) : (
                             <span className="muted" style={{ fontSize: 12 }}>
                               {fmtSec(totalSec)}
@@ -459,6 +502,37 @@ export function RunsPage({ onOpenReport, onScanStarted }: Props) {
           </div>
         )}
       </div>
+
+      {draftModal && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.48)",
+            display: "grid",
+            placeItems: "center",
+            padding: 20,
+            zIndex: 60,
+          }}
+          onClick={() => setDraftModal(null)}
+        >
+          <div
+            className="card"
+            style={{ width: "min(920px, 95vw)", maxHeight: "85vh", display: "flex", flexDirection: "column" }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="card-title">
+              <span>{draftModal.title}</span>
+              <button className="btn" onClick={() => setDraftModal(null)}>
+                关闭
+              </button>
+            </div>
+            <pre className="log-box" style={{ maxHeight: "70vh", margin: 0 }}>
+              {draftModal.markdown}
+            </pre>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

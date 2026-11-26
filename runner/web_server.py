@@ -282,7 +282,8 @@ def _build_run_progress(date_str: str, run_id: str, data: dict,
                         workdir: Path | None = None,
                         settings: dict | None = None,
                         hist_by_pid: dict[str, float] | None = None,
-                        hist_global_avg: float | None = None) -> dict:
+                        hist_global_avg: float | None = None,
+                        output_dir: Path | None = None) -> dict:
     cat = catalog or {}
     cfg_settings = settings or {}
     pid_hist = hist_by_pid or {}
@@ -328,10 +329,14 @@ def _build_run_progress(date_str: str, run_id: str, data: dict,
         avg_project_sec = hist_global_avg
 
     items: list[dict] = []
+    res_dir = _resolve_run_file(output_dir, date_str, run_id).parent if output_dir else None
     for p in projects:
         pid = p.get("project_id", "")
         meta = cat.get(pid, {})
         dur = _project_duration_seconds(p)
+        v_probs = (p.get("report_validation") or {}).get("problems") or []
+        s_pats = (p.get("secret_scan") or {}).get("patterns") or []
+        has_rej = bool(res_dir and _is_safe_segment(pid) and (res_dir / f"{pid}.rejected.md").is_file())
         items.append({
             "project_id": pid,
             "project_name": p.get("project_name") or meta.get("project_name") or pid,
@@ -341,6 +346,9 @@ def _build_run_progress(date_str: str, run_id: str, data: dict,
             "status": p.get("status", "unknown"),
             "total": (p.get("report_scores") or {}).get("total"),
             "error": p.get("error"),
+            "validation_problems": v_probs,
+            "secret_patterns": s_pats,
+            "has_rejected_draft": has_rej,
             "duration_seconds": round(dur) if dur is not None else None,
             "elapsed_seconds": None,
             "eta_seconds": None,
@@ -482,6 +490,7 @@ def _build_live_progress(output_dir: Path, projects_csv: Path | None = None,
             r["date"], r["run_id"], data,
             catalog=catalog, workdir=workdir, settings=settings,
             hist_by_pid=pid_hist, hist_global_avg=hist_avg,
+            output_dir=output_dir,
         )
         if idx == 0:
             latest_run = item
@@ -1257,6 +1266,19 @@ class AuditHandler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/runs/"):
             segs = [urllib.parse.unquote(s) for s in path[len("/api/runs/"):].split("/") if s]
+            # GET /api/runs/<date>/<run_id>/<project_id>/rejected -> 查看被校验拦截的原始草稿
+            if len(segs) == 4 and segs[3] == "rejected" and all(_is_safe_segment(s) for s in segs[:3]):
+                date_str, run_id, pid = segs[0], segs[1], segs[2]
+                res_dir = _resolve_run_file(output_dir, date_str, run_id).parent
+                rej_file = (res_dir / f"{pid}.rejected.md").resolve()
+                if not rej_file.is_relative_to(res_dir.resolve()) or not rej_file.is_file():
+                    return self._send_json(404, {"error": "未找到被拦截的原始草稿（仅新版本拦截落盘且无密钥泄露时保留）"})
+                return self._send_json(200, {
+                    "date": date_str,
+                    "run_id": run_id,
+                    "project_id": pid,
+                    "markdown": rej_file.read_text(encoding="utf-8", errors="replace"),
+                })
             if len(segs) != 2 or not all(_is_safe_segment(s) for s in segs):
                 return self._send_json(400, {"error": "无效的批次路径"})
             date_str, run_id = segs
@@ -1265,16 +1287,19 @@ class AuditHandler(BaseHTTPRequestHandler):
             if not isinstance(data, dict):
                 return self._send_json(404, {"error": "未找到该批次运行记录"})
             rep_dir = _resolve_report_dir(output_dir, date_str, run_id)
+            res_dir = run_file.parent
             data["has_summary"] = (rep_dir / "_summary.md").is_file()
             catalog = {p["project_id"]: p for p in _load_projects(projects_csv)}
             for p in data.get("projects") or []:
-                meta = catalog.get(p.get("project_id", ""), {})
+                pid = str(p.get("project_id") or "")
+                meta = catalog.get(pid, {})
                 if not p.get("department") and meta.get("department"):
                     p["department"] = meta["department"]
                 if not p.get("owner") and meta.get("owner"):
                     p["owner"] = meta["owner"]
                 if not p.get("project_name") and meta.get("project_name"):
                     p["project_name"] = meta["project_name"]
+                p["has_rejected_draft"] = bool(_is_safe_segment(pid) and (res_dir / f"{pid}.rejected.md").is_file())
             return self._send_json(200, data)
 
         if path.startswith("/api/reports/"):

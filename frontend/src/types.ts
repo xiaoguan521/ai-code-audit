@@ -77,6 +77,15 @@ export interface RunProjectRecord {
   report_mode?: string;
   commit?: string;
   error?: string;
+  report_validation?: {
+    ok?: boolean;
+    problems?: string[];
+  };
+  secret_scan?: {
+    blocked?: boolean;
+    patterns?: string[];
+  };
+  has_rejected_draft?: boolean;
   report_scores?: {
     total?: number | null;
     grade?: string;
@@ -208,6 +217,9 @@ export interface RunProgressProjectItem {
   status: string;
   total: number | null;
   error?: string | null;
+  validation_problems?: string[];
+  secret_patterns?: string[];
+  has_rejected_draft?: boolean;
   duration_seconds: number | null;
   elapsed_seconds: number | null;
   eta_seconds: number | null;

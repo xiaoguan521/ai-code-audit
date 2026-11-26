@@ -53,6 +53,10 @@ export const api = {
       `/api/runs/${encodeURIComponent(date)}/${encodeURIComponent(runId)}/mark-aborted`,
       { method: "POST" }
     ),
+  rejectedDraft: (date: string, runId: string, projectId: string) =>
+    request<{ date: string; run_id: string; project_id: string; markdown: string }>(
+      `/api/runs/${encodeURIComponent(date)}/${encodeURIComponent(runId)}/${encodeURIComponent(projectId)}/rejected`
+    ),
   report: (date: string, runId: string, target: string) =>
     request<ReportResponse>(
       `/api/reports/${encodeURIComponent(date)}/${encodeURIComponent(runId)}/${encodeURIComponent(target)}`

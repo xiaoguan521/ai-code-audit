@@ -1108,6 +1108,21 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
             if validation["scores"] is not None:
                 rec["report_scores"] = validation["scores"]
             if validation["problems"]:
+                # 若未命中高置信密钥，将未通过校验的原始草稿另存到 results/<日期>/<run_id>/<pid>.rejected.md
+                # 便于排查原因；绝不写入 reports/，也绝不更新 state。
+                if not scan_report_for_secrets(raw):
+                    try:
+                        _check_abort(settings)
+                        result_dir.mkdir(parents=True, exist_ok=True)
+                        rejected_path = result_dir / f"{pid}.rejected.md"
+                        write_text_atomic(rejected_path, raw, mode=0o600)
+                        rec["rejected_report_path"] = str(rejected_path)
+                        if out.get("event_log"):
+                            write_text_atomic(result_dir / f"{pid}.events.jsonl", "".join(
+                                json.dumps(event, ensure_ascii=False) + "\n" for event in out.get("event_log", [])
+                            ), mode=0o600)
+                    except OSError:
+                        pass
                 raise RuntimeError("报告校验未通过，已拦截落盘")
             # 脱敏复核：命中高置信密钥模式即拦截落盘；只记 error、不写 state，
             # 上次好报告继续当基线，绝不重跑。

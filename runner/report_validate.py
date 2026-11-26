@@ -23,18 +23,40 @@ ITEM_ID_RE = re.compile(r"\b(\d+\.\d+)\b")
 REF_RE = re.compile(r"([\w./-]+):(\d+)(?:-(\d+))?")
 LEVEL_RE = re.compile(r"\b(P[0-3])\b")
 MAX_PROBLEMS = 30
+DIMENSION_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("1", ("功能适合性", "FS")),
+    ("2", ("性能效率", "PE")),
+    ("3", ("可靠性", "RE")),
+    ("4", ("稳定性", "ST")),
+    ("5", ("易用性", "US")),
+    ("6", ("安全性", "SE")),
+    ("7", ("兼容性", "CO")),
+    ("8", ("可维护性", "MA")),
+)
+
+
+def _strip_md(cell: str) -> str:
+    return re.sub(r"[*`_]", "", cell).strip()
 
 
 def _sections(text: str) -> list[tuple[str, list[str]]]:
-    """按二级标题切分；返回 [(标题, 行列表)]。"""
+    """按二级标题切分（忽略代码块内部）；返回 [(标题, 行列表)]。"""
     sections: list[tuple[str, list[str]]] = []
     current: tuple[str, list[str]] | None = None
+    in_fence = False
     for line in text.splitlines():
-        match = re.match(r"##\s+(.*)", line)
-        if match:
-            current = (match.group(1).strip(), [])
-            sections.append(current)
-        elif current is not None:
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            if current is not None:
+                current[1].append(line)
+            continue
+        if not in_fence:
+            match = re.match(r"^##\s+(.*)", line)
+            if match:
+                current = (match.group(1).strip(), [])
+                sections.append(current)
+                continue
+        if current is not None:
             current[1].append(line)
     return sections
 
@@ -102,7 +124,7 @@ def _parse_items(text: str) -> tuple[list[dict], list[str]]:
     for cells in rows:
         if not cells:
             continue
-        item_id = cells[0].strip()
+        item_id = _strip_md(cells[0])
         if not re.fullmatch(r"\d+\.\d+", item_id):
             continue
         if item_id in seen:
@@ -138,27 +160,55 @@ def _parse_issues(text: str) -> list[dict]:
     if not lines:
         return []
     header, rows = _table_rows(lines)
-    columns = {name: index for index, name in enumerate(header or [])}
+    columns = {_strip_md(name): index for index, name in enumerate(header or [])}
+    item_col = next((i for name, i in columns.items() if "检查项" in name or "维度" in name), None)
+    level_col = next((i for name, i in columns.items() if "等级" in name or "级别" in name), None)
     evidence_col = next((i for name, i in columns.items() if "证据" in name), None)
     title_col = next((i for name, i in columns.items() if "标题" in name), None)
     issues: list[dict] = []
     for index, cells in enumerate(rows, 1):
         joined = " ".join(cells)
-        item_match = ITEM_ID_RE.search(joined)
-        if not item_match:
-            continue
-        level_match = LEVEL_RE.search(joined)
+        if item_col is not None and item_col < len(cells):
+            item_ids = list(dict.fromkeys(ITEM_ID_RE.findall(cells[item_col])))
+        else:
+            item_ids = []
+        if not item_ids:
+            m = ITEM_ID_RE.search(joined)
+            if not m:
+                continue
+            item_ids = [m.group(1)]
+        level_src = cells[level_col] if level_col is not None and level_col < len(cells) else joined
+        level_match = LEVEL_RE.search(level_src) or LEVEL_RE.search(joined)
         evidence_cell = cells[evidence_col] if evidence_col is not None and evidence_col < len(cells) else joined
         title = cells[title_col] if title_col is not None and title_col < len(cells) else ""
-        issues.append({
-            "item_id": item_match.group(1),
-            "level": level_match.group(1) if level_match else "P3",
-            "title": title,
-            "evidence": _extract_refs(evidence_cell),
-            "impact": "", "suggestion": "", "effort": "M",
-            "issue_id": f"Q{index:03d}",
-        })
+        raw_id = _strip_md(cells[0]) if cells else ""
+        issue_id = raw_id if re.fullmatch(r"[A-Za-z]-?\d+|[A-Za-z]\d+", raw_id) else f"Q{index:03d}"
+        refs = _extract_refs(evidence_cell)
+        for item_id in item_ids:
+            issues.append({
+                "item_id": item_id,
+                "level": level_match.group(1) if level_match else "P3",
+                "title": title,
+                "evidence": refs,
+                "impact": "", "suggestion": "", "effort": "M",
+                "issue_id": issue_id,
+            })
     return issues
+
+
+def _match_dimension_id(cell: str) -> str | None:
+    cleaned = _strip_md(cell)
+    m = re.match(r"(?:维度\s*)?([1-8])(?:\s*[.、·:\s]|$)", cleaned)
+    if m:
+        return m.group(1)
+    for dim_id, aliases in DIMENSION_ALIASES:
+        for alias in aliases:
+            if len(alias) <= 2:
+                if re.search(rf"\b{re.escape(alias)}\b", cleaned):
+                    return dim_id
+            elif alias in cleaned:
+                return dim_id
+    return None
 
 
 def _parse_overview(text: str) -> tuple[dict[str, dict], list[str]]:
@@ -172,10 +222,9 @@ def _parse_overview(text: str) -> tuple[dict[str, dict], list[str]]:
     for cells in rows:
         if not cells:
             continue
-        dim_match = re.match(r"(\d+)[.、\s]", cells[0].strip())
-        if not dim_match:
+        dim = _match_dimension_id(cells[0])
+        if not dim:
             continue
-        dim = dim_match.group(1)
         score_cell = cells[1] if len(cells) > 1 else ""
         if re.search(r"暂不评分|证据不足", score_cell):
             score = None
