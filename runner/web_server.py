@@ -292,7 +292,7 @@ def _build_run_progress(date_str: str, run_id: str, data: dict,
     completed_count = len(projects)
     total_count = completed_count + len(pending)
     ok_count = sum(1 for p in projects if p.get("status") == "ok")
-    error_count = sum(1 for p in projects if p.get("status") == "error")
+    error_count = sum(1 for p in projects if p.get("status") != "ok")
     percent = round(completed_count * 100 / total_count) if total_count > 0 else (100 if data.get("status") != "running" else 0)
 
     now_ts = time.time()

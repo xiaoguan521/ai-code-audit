@@ -61,6 +61,10 @@ def configure_settings(settings: dict, env: dict) -> dict:
     if not isinstance(fast_mode, bool):
         raise ValueError("fast_mode 必须是 true/false")
     settings["fast_mode"] = _env_bool(env, "AUDIT_FAST_MODE", fast_mode)
+    validation_mode = (env.get("AUDIT_VALIDATION_MODE") or settings.get("validation_mode") or "lenient").strip().lower()
+    if validation_mode not in {"lenient", "strict"}:
+        raise ValueError("AUDIT_VALIDATION_MODE 必须是 lenient 或 strict")
+    settings["validation_mode"] = validation_mode
     adaptive_timeout = settings.get("adaptive_timeout", True)
     if not isinstance(adaptive_timeout, bool):
         raise ValueError("adaptive_timeout 必须是 true/false")

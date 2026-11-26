@@ -272,5 +272,82 @@ class MarkdownPipelineTest(unittest.TestCase):
         self.assertIn("(p2.md)", text)
 
 
+class LenientValidationTest(unittest.TestCase):
+    """验证宽松模式（默认）与灵活解析：非模板标题/中文风险词的 64 项报告正常落盘，空壳与密钥泄露仍硬拦截。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.settings = {"workdir": str(self.root / "work"), "output_dir": str(self.root / "out"),
+                         "prescan_tools": [], "summary": {"enabled": False}, "fast_mode": True,
+                         "agent": {"type": "deepseek-harness", "launcher": "local"}}
+        self.repo = Path(self.settings["workdir"]) / "p1" / "repo"
+        (self.repo / "src").mkdir(parents=True)
+        (self.repo / "src" / "a.py").write_text("line 1\n", encoding="utf-8")
+        self.project = {"project_id": "p1", "project_name": "micbb"}
+        self.args = types.SimpleNamespace(force_full=True, dry_run=False, run_id="run-1")
+        self.checklist = scoring.load_checklist()
+
+    def _micbb_style_report(self) -> str:
+        lines = [
+            "# micbb 八性代码审查报告",
+            "",
+            "## 二、64 项检查结论（快速巡检）",
+            "",
+            "说明：快速模式不输出逐项证据与行号；风险等级：高危/中低/无。",
+            "",
+            "### 维度一：功能适合性",
+            "| # | 检查项 | 结果 | 风险 | 一句话结论 |",
+            "|---|---|---|---|---|",
+        ]
+        for idx, item in enumerate(self.checklist["items"]):
+            if idx % 10 == 0:
+                res, risk = "FAIL", "高危"
+            elif idx % 4 == 0:
+                res, risk = "WARN", "中低"
+            else:
+                res, risk = "PASS", "无"
+            lines.append(f"| {item['id']} | {item['name']} | {res} | {risk} | 示例结论 |")
+        return "\n".join(lines) + "\n"
+
+    def test_micbb_format_lands_in_default_lenient_mode(self):
+        text = self._micbb_style_report()
+        response = {"raw_text": text, "event_log": [{"type": "final"}], "session_id": "s1"}
+        with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
+             mock.patch.object(run_daily, "call_agent", return_value=response):
+            rec = run_daily.scan_project(self.project, self.settings, "2026-11-26", self.args)
+        self.assertEqual(rec["status"], "ok")
+        self.assertEqual(rec["report_validation"]["items_count"], 64)
+        self.assertEqual(rec["report_validation"]["mode"], "lenient")
+        self.assertFalse(rec["report_validation"]["ok"])
+        self.assertTrue(rec["report_validation"]["problems"])
+        self.assertIsNotNone(rec["report_scores"]["total"])
+        self.assertTrue(Path(rec["report_path"]).is_file())
+        self.assertTrue((self.root / "out" / "state" / "p1.json").is_file())
+
+    def test_strict_mode_blocks_micbb_format_and_saves_rejected_draft(self):
+        text = self._micbb_style_report()
+        response = {"raw_text": text, "event_log": [], "session_id": "s1"}
+        strict_settings = dict(self.settings, validation_mode="strict")
+        with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
+             mock.patch.object(run_daily, "call_agent", return_value=response):
+            rec = run_daily.scan_project(self.project, strict_settings, "2026-11-26", self.args)
+        self.assertEqual(rec["status"], "error")
+        self.assertNotIn("report_path", rec)
+        self.assertTrue(Path(rec["rejected_report_path"]).is_file())
+
+    def test_secret_leak_is_always_blocked_even_in_lenient_mode(self):
+        text = self._micbb_style_report() + "\n泄漏密钥 AKIAIOSFODNN7EXAMPLE\n"
+        response = {"raw_text": text, "event_log": [], "session_id": "s1"}
+        with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
+             mock.patch.object(run_daily, "call_agent", return_value=response):
+            rec = run_daily.scan_project(self.project, self.settings, "2026-11-26", self.args)
+        self.assertEqual(rec["status"], "error")
+        self.assertTrue(rec["secret_scan"]["blocked"])
+        self.assertNotIn("report_path", rec)
+        self.assertNotIn("rejected_report_path", rec)
+
+
 if __name__ == "__main__":
     unittest.main()

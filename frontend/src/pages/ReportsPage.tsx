@@ -1,73 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
 import { Check, ChevronLeft, ChevronRight, Download, Link2, Printer } from "lucide-react";
-import { Marked, Renderer } from "marked";
 import { api } from "../api";
 import type { ReportResponse, RunDetailResponse, RunSummary } from "../types";
-
-interface TocItem {
-  id: string;
-  depth: number;
-  text: string;
-}
-
-function escapeHtml(raw: string): string {
-  return raw.replace(/[&<>"']/g, (ch) => {
-    switch (ch) {
-      case "&": return "&amp;";
-      case "<": return "&lt;";
-      case ">": return "&gt;";
-      case '"': return "&quot;";
-      case "'": return "&#39;";
-      default: return ch;
-    }
-  });
-}
-
-function renderMarkdownWithToc(markdown: string): { html: string; toc: TocItem[] } {
-  const toc: TocItem[] = [];
-  const renderer = new Renderer();
-  renderer.html = ({ text }) => escapeHtml(text);
-  renderer.link = function (token) {
-    const href = (token.href || "").trim();
-    if (/^(javascript|vbscript|data):/i.test(href)) {
-      return escapeHtml(token.text || href);
-    }
-    return Renderer.prototype.link.call(this, token);
-  };
-  renderer.image = function (token) {
-    const href = (token.href || "").trim();
-    if (/^(javascript|vbscript|data):/i.test(href)) {
-      return escapeHtml(token.text || href);
-    }
-    return Renderer.prototype.image.call(this, token);
-  };
-  renderer.heading = function ({ tokens, depth, text }) {
-    const inner = this.parser.parseInline(tokens);
-    if (depth === 2 || depth === 3) {
-      const id = `sec-${toc.length}`;
-      toc.push({ id, depth, text: text.replace(/[`*_#]/g, "").trim() });
-      return `<h${depth} id="${id}">${inner}</h${depth}>\n`;
-    }
-    return `<h${depth}>${inner}</h${depth}>\n`;
-  };
-  try {
-    const instance = new Marked({ gfm: true, breaks: false, renderer });
-    const html = instance.parse(markdown) as string;
-    return { html, toc };
-  } catch {
-    return { html: `<pre>${escapeHtml(markdown)}</pre>`, toc: [] };
-  }
-}
-
-function downloadBlob(filename: string, content: string, mime: string) {
-  const blob = new Blob([content], { type: mime });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
+import {
+  downloadBlob,
+  downloadMarkdown,
+  escapeHtml,
+  exportHtmlToPdf,
+  renderMarkdownWithToc,
+  type TocItem,
+} from "../utils/markdown";
 
 function csvCell(v: string): string {
   const s = String(v ?? "");
@@ -173,13 +115,27 @@ export function ReportsPage({ initialTarget, onTargetChange }: Props) {
     navigator.clipboard?.writeText(url).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 1800);
-    }).catch(() => {});
+    }).catch(() => { });
   };
 
   const handleDownloadMd = () => {
     if (!report?.markdown) return;
-    const fname = `${date}_${target === "_summary" ? "summary" : target}.md`;
-    downloadBlob(fname, report.markdown, "text/markdown;charset=utf-8");
+    downloadMarkdown(`${date}_${target === "_summary" ? "summary" : target}`, report.markdown);
+  };
+
+  const handleExportPdf = () => {
+    if (!report?.markdown) return;
+    const base = `${date}_${target === "_summary" ? "summary" : target}`;
+    let banner = "";
+    if (report.type === "project") {
+      const totalStr = report.scores?.total != null ? report.scores.total.toFixed(1) : "暂不评分";
+      const secStr = report.scores?.security_score != null ? report.scores.security_score.toFixed(1) : "—";
+      const gradeStr = report.scores?.grade || "—";
+      banner = `<div class="pdf-meta-banner"><b>${escapeHtml(report.project_id || target)}</b> · 批次 ${escapeHtml(
+        `${date} / ${runId}`
+      )} · 总评分 ${escapeHtml(totalStr)}（${escapeHtml(gradeStr)}） · 安全评分 ${escapeHtml(secStr)}</div>`;
+    }
+    exportHtmlToPdf(base, banner + html);
   };
 
   const handleExportIssuesCsv = () => {
@@ -261,16 +217,16 @@ export function ReportsPage({ initialTarget, onTargetChange }: Props) {
           {report && (
             <>
               <button className="btn" onClick={handleDownloadMd}>
-                <Download size={14} /> 下载 .md
+                <Download size={14} /> 下载 Markdown
+              </button>
+              <button className="btn" onClick={handleExportPdf}>
+                <Printer size={14} /> 导出 PDF
               </button>
               {report.type === "project" && (report.issues?.length ?? 0) > 0 && (
                 <button className="btn" onClick={handleExportIssuesCsv}>
                   <Download size={14} /> 导出问题 CSV
                 </button>
               )}
-              <button className="btn" onClick={() => window.print()}>
-                <Printer size={14} /> 打印 / PDF
-              </button>
             </>
           )}
 

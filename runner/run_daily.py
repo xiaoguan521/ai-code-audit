@@ -679,6 +679,8 @@ def build_prompt(p: dict, commit: str, settings: dict, scan_type: str,
         "待补充信息、八维得分、总分、安全分、覆盖率和评分依据。无法判断或证据不足时如实标记 NEED_INFO。",
         "按 Skill 的评分规则计算；自行使用只读计算工具辅助算术并核对，不修改项目代码。",
         "完成前在当前会话自行核对覆盖、结论及分数；发现错误只补查并修正对应部分，不要重新审查整个项目。",
+        "请保持关键二级标题与模板一致（`## 评分总览`、`## 风险问题清单`、`## 分维度检查结果`），"
+        "风险等级统一使用 `P0`/`P1`/`P2`/`P3`（无风险留空或写 `-`），以便自动核算得分与展示。",
         "直接返回完整 Markdown 报告，不写入文件。",
     ])
     if fast:
@@ -1100,36 +1102,54 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
             raw = out.get("raw_text")
             if not isinstance(raw, str) or not raw.strip():
                 raise AgentCallError("Harness 没有返回报告", agent_status="failed")
-            # 落盘前最小机器校验：解析报告表格、重算分数、核验 WARN/FAIL 证据
-            # 路径存在性。失败只记 error、不落盘、不更新 state，绝不重跑。
+            # 落盘前最小机器校验：解析报告表格、重算分数、核验 WARN/FAIL 证据路径存在性。
+            # validation_mode="lenient"（默认）：只要解析出 >= 32 个检查项即允许落盘，
+            # 格式/自洽性偏差记为非阻塞告警（report_validation.problems）；
+            # 空壳/非报告输出（< 32 项）及高置信密钥泄露始终硬拦截，不落盘、不更新 state。
             weights = scoring.parse_weights(p.get("weights"), checklist)
             validation = report_validate.validate_report(raw, repo, checklist, weights, report_mode)
-            rec["report_validation"] = {"ok": not validation["problems"], "problems": validation["problems"]}
+            validation_mode = str(settings.get("validation_mode", "lenient")).strip().lower()
+            if validation_mode not in ("lenient", "strict"):
+                validation_mode = "lenient"
+            items_count = int(validation.get("items_count") or 0)
+            rec["report_validation"] = {
+                "ok": not validation["problems"],
+                "problems": validation["problems"],
+                "mode": validation_mode,
+                "items_count": items_count,
+            }
             if validation["scores"] is not None:
                 rec["report_scores"] = validation["scores"]
-            if validation["problems"]:
-                # 若未命中高置信密钥，将未通过校验的原始草稿另存到 results/<日期>/<run_id>/<pid>.rejected.md
-                # 便于排查原因；绝不写入 reports/，也绝不更新 state。
-                if not scan_report_for_secrets(raw):
-                    try:
-                        _check_abort(settings)
-                        result_dir.mkdir(parents=True, exist_ok=True)
-                        rejected_path = result_dir / f"{pid}.rejected.md"
-                        write_text_atomic(rejected_path, raw, mode=0o600)
-                        rec["rejected_report_path"] = str(rejected_path)
-                        if out.get("event_log"):
-                            write_text_atomic(result_dir / f"{pid}.events.jsonl", "".join(
-                                json.dumps(event, ensure_ascii=False) + "\n" for event in out.get("event_log", [])
-                            ), mode=0o600)
-                    except OSError:
-                        pass
-                raise RuntimeError("报告校验未通过，已拦截落盘")
-            # 脱敏复核：命中高置信密钥模式即拦截落盘；只记 error、不写 state，
-            # 上次好报告继续当基线，绝不重跑。
+
+            # 脱敏复核：无论 lenient 还是 strict，命中高置信密钥模式一律拦截落盘且不保留草稿。
             secret_hits = scan_report_for_secrets(raw)
             if secret_hits:
                 rec["secret_scan"] = {"blocked": True, "patterns": secret_hits}
                 raise RuntimeError("报告脱敏检查未通过，已拦截落盘")
+
+            should_block = bool(
+                validation["problems"]
+                and (validation_mode == "strict" or items_count < 32)
+            )
+            if should_block:
+                # 若未命中高置信密钥，将未通过校验的原始草稿另存到 results/<日期>/<run_id>/<pid>.rejected.md
+                # 便于排查原因；绝不写入 reports/，也绝不更新 state。
+                try:
+                    _check_abort(settings)
+                    result_dir.mkdir(parents=True, exist_ok=True)
+                    rejected_path = result_dir / f"{pid}.rejected.md"
+                    write_text_atomic(rejected_path, raw, mode=0o600)
+                    rec["rejected_report_path"] = str(rejected_path)
+                    if out.get("event_log"):
+                        write_text_atomic(result_dir / f"{pid}.events.jsonl", "".join(
+                            json.dumps(event, ensure_ascii=False) + "\n" for event in out.get("event_log", [])
+                        ), mode=0o600)
+                except OSError:
+                    pass
+                raise RuntimeError("报告校验未通过，已拦截落盘")
+            if validation["problems"]:
+                log(f"{pid}: 报告存在 {len(validation['problems'])} 条格式提示（已解析 {items_count}/64 项），"
+                    f"lenient 模式已允许落盘")
             # 批次超时作废点：校验与脱敏之后、落盘之前。若批次已超时，本轮
             # 该项目记 error（外层 except），不落盘、不写 state。
             _check_abort(settings)

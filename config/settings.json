@@ -15,6 +15,7 @@
     "large": 5400
   },
   "fast_mode": false,
+  "validation_mode": "lenient",
   "snapshot_at": "",
   "clone_depth": 200,
   "default_scope_out": [

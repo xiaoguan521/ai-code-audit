@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, ChevronDown, ChevronRight, RefreshCw, RotateCcw, Square } from "lucide-react";
 import { api } from "../api";
+import { DraftModal } from "../components/DraftModal";
 import type {
   LiveProgressResponse,
   RunProgressItem,
@@ -101,7 +102,7 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
   const [activeTask, setActiveTask] = useState<ScanTask | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
-  const [draftModal, setDraftModal] = useState<{ title: string; markdown: string } | null>(null);
+  const [draftModal, setDraftModal] = useState<{ title: string; markdown: string; filenameBase: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const logBoxRef = useRef<HTMLDivElement | null>(null);
 
@@ -212,7 +213,11 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
     setError(null);
     try {
       const res = await api.rejectedDraft(date, runId, pid);
-      setDraftModal({ title: `${name}（${pid}）被拦截的原始输出`, markdown: res.markdown });
+      setDraftModal({
+        title: `${name}（${pid}）被拦截的原始输出`,
+        markdown: res.markdown,
+        filenameBase: `${date}_${pid}_draft`,
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载拦截草稿失败");
     }
@@ -525,7 +530,21 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
                             </td>
                             <td style={{ whiteSpace: "normal", maxWidth: 340 }}>
                               {it.state === "ok" ? (
-                                <b>{it.total != null ? `${it.total.toFixed(1)} 分` : "已完成"}</b>
+                                <div>
+                                  <b>{it.total != null ? `${it.total.toFixed(1)} 分` : "已完成"}</b>
+                                  {(it.validation_problems?.length ?? 0) > 0 && (
+                                    <details style={{ marginTop: 4, fontSize: 12 }}>
+                                      <summary style={{ cursor: "pointer", color: "var(--warning)" }}>
+                                        格式提示（{it.validation_problems!.length} 条，已落盘）
+                                      </summary>
+                                      <ul style={{ margin: "4px 0 0 16px", padding: 0, color: "var(--text-2)" }}>
+                                        {it.validation_problems!.map((prob, i) => (
+                                          <li key={`w-${i}`}>{prob}</li>
+                                        ))}
+                                      </ul>
+                                    </details>
+                                  )}
+                                </div>
                               ) : it.state === "error" ? (
                                 <div>
                                   <span style={{ color: "var(--critical)" }} title={it.error || ""}>
@@ -760,34 +779,12 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
       </div>
 
       {draftModal && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.48)",
-            display: "grid",
-            placeItems: "center",
-            padding: 20,
-            zIndex: 60,
-          }}
-          onClick={() => setDraftModal(null)}
-        >
-          <div
-            className="card"
-            style={{ width: "min(920px, 95vw)", maxHeight: "85vh", display: "flex", flexDirection: "column" }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="card-title">
-              <span>{draftModal.title}</span>
-              <button className="btn" onClick={() => setDraftModal(null)}>
-                关闭
-              </button>
-            </div>
-            <pre className="log-box" style={{ maxHeight: "70vh", margin: 0 }}>
-              {draftModal.markdown}
-            </pre>
-          </div>
-        </div>
+        <DraftModal
+          title={draftModal.title}
+          markdown={draftModal.markdown}
+          filenameBase={draftModal.filenameBase}
+          onClose={() => setDraftModal(null)}
+        />
       )}
     </div>
   );

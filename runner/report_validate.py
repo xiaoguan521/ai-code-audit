@@ -22,6 +22,24 @@ RESULT_RE = re.compile(
 ITEM_ID_RE = re.compile(r"\b(\d+\.\d+)\b")
 REF_RE = re.compile(r"([\w./-]+):(\d+)(?:-(\d+))?")
 LEVEL_RE = re.compile(r"\b(P[0-3])\b")
+CHINESE_LEVEL_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("致命", "极高", "严重高危"), "P0"),
+    (("高危", "高风险", "严重"), "P1"),
+    (("中危", "中低", "中风险", "中等"), "P2"),
+    (("低危", "低风险", "轻微"), "P3"),
+)
+ITEM_SECTION_KEYWORDS: tuple[str, ...] = (
+    "分维度检查", "64 项", "64项", "检查结论", "检查结果", "逐项检查",
+)
+OVERVIEW_SECTION_KEYWORDS: tuple[str, ...] = (
+    "评分总览", "维度评分", "得分总览", "质量评分", "八维得分", "八维评分",
+)
+ISSUE_SECTION_KEYWORDS: tuple[str, ...] = (
+    "风险问题清单", "高危与重点问题", "重点风险问题", "问题清单",
+)
+SKIP_FALLBACK_SECTION_KEYWORDS: tuple[str, ...] = (
+    "评分总览", "维度评分", "得分总览", "风险问题清单", "问题清单", "待补充信息",
+)
 MAX_PROBLEMS = 30
 DIMENSION_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("1", ("功能适合性", "FS")),
@@ -61,11 +79,26 @@ def _sections(text: str) -> list[tuple[str, list[str]]]:
     return sections
 
 
-def _find_section(text: str, keyword: str) -> list[str]:
+def _find_section_any(text: str, keywords: tuple[str, ...]) -> list[str]:
     for title, lines in _sections(text):
-        if keyword in title:
+        if any(keyword in title for keyword in keywords):
             return lines
     return []
+
+
+def _find_section(text: str, keyword: str) -> list[str]:
+    return _find_section_any(text, (keyword,))
+
+
+def _parse_level(cell: str) -> str | None:
+    match = LEVEL_RE.search(cell)
+    if match:
+        return match.group(1)
+    cleaned = _strip_md(cell)
+    for keywords, level in CHINESE_LEVEL_RULES:
+        if any(kw in cleaned for kw in keywords):
+            return level
+    return None
 
 
 def _table_rows(lines: list[str]) -> tuple[list[str] | None, list[list[str]]]:
@@ -107,43 +140,56 @@ def _extract_refs(cell: str) -> list[dict]:
     return refs
 
 
-def _parse_items(text: str) -> tuple[list[dict], list[str]]:
-    """解析“分维度检查结果”小节的逐项表。返回 (items, problems)。"""
-    lines = _find_section(text, "分维度检查")
-    if not lines:
-        return [], ["未找到“分维度检查结果”小节"]
-    header, rows = _table_rows(lines)
-    columns = {name: index for index, name in enumerate(header or [])}
-    result_col = columns.get("结果", 2)
-    level_col = columns.get("等级")
+def _columns_from_header(header: list[str]) -> tuple[int, int | None, int | None, int | None]:
+    columns = {_strip_md(name): index for index, name in enumerate(header)}
+    result_col = next((i for name, i in columns.items() if "结果" in name), 2)
+    level_col = next((i for name, i in columns.items() if any(k in name for k in ("等级", "风险", "级别"))), None)
     evidence_col = next((i for name, i in columns.items() if "证据" in name), None)
-    conclusion_col = next((i for name, i in columns.items() if name in ("结论", "说明与建议")), None)
+    conclusion_col = next((i for name, i in columns.items() if any(k in name for k in ("结论", "说明与建议", "说明"))), None)
+    return result_col, level_col, evidence_col, conclusion_col
+
+
+def _parse_item_rows(lines: list[str], require_result: bool = False) -> tuple[list[dict], list[str]]:
+    """从一组 Markdown 行中解析逐项检查表（支持同一节内多张分维度子表）。"""
     items: list[dict] = []
     seen: set[str] = set()
     problems: list[str] = []
-    for cells in rows:
-        if not cells:
+    result_col, level_col, evidence_col, conclusion_col = 2, None, None, None
+    in_fence = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
             continue
-        item_id = _strip_md(cells[0])
-        if not re.fullmatch(r"\d+\.\d+", item_id):
+        if in_fence or not stripped.startswith("|"):
             continue
-        if item_id in seen:
-            problems.append(f"检查项重复：{item_id}")
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if not cells or all(re.fullmatch(r"[:\- ]+", cell) for cell in cells if cell):
             continue
-        seen.add(item_id)
+        first = _strip_md(cells[0])
+        if not re.fullmatch(r"\d+\.\d+", first):
+            if any(k in "".join(cells) for k in ("检查项", "结果", "风险", "等级", "结论")):
+                result_col, level_col, evidence_col, conclusion_col = _columns_from_header(cells)
+            continue
+        item_id = first
         result_cell = cells[result_col] if result_col < len(cells) else ""
         result = _result_token(result_cell)
         if result is None:
             # 表头可能与 §11 不一致时，退化为整行搜索。
             result = _result_token(" ".join(cells))
         if result is None:
-            problems.append(f"{item_id} 结果无法识别")
+            if not require_result:
+                problems.append(f"{item_id} 结果无法识别")
             continue
+        if item_id in seen:
+            problems.append(f"检查项重复：{item_id}")
+            continue
+        seen.add(item_id)
         level = "none"
         if level_col is not None and level_col < len(cells):
-            level_match = LEVEL_RE.search(cells[level_col])
-            if level_match:
-                level = level_match.group(1)
+            parsed_level = _parse_level(cells[level_col])
+            if parsed_level:
+                level = parsed_level
         refs = _extract_refs(cells[evidence_col]) if evidence_col is not None and evidence_col < len(cells) else []
         conclusion = cells[conclusion_col] if conclusion_col is not None and conclusion_col < len(cells) else ""
         items.append({
@@ -154,15 +200,40 @@ def _parse_items(text: str) -> tuple[list[dict], list[str]]:
     return items, problems
 
 
+def _parse_items(text: str) -> tuple[list[dict], list[str]]:
+    """解析“分维度检查结果”小节的逐项表；未命中标准标题时兜底扫描全文非总览/清单表格。"""
+    lines = _find_section_any(text, ITEM_SECTION_KEYWORDS)
+    if lines:
+        items, problems = _parse_item_rows(lines)
+        if items:
+            return items, problems
+    # 兜底：扫描全文所有非评分总览/风险清单/待补充信息小节，提取形如 | 1.1 | ... | PASS/WARN/FAIL/NEED_INFO | 的行
+    fallback_lines: list[str] = []
+    sections = _sections(text)
+    if sections:
+        for title, sec_lines in sections:
+            if any(kw in title for kw in SKIP_FALLBACK_SECTION_KEYWORDS):
+                continue
+            fallback_lines.extend(sec_lines)
+    else:
+        fallback_lines = text.splitlines()
+    items, problems = _parse_item_rows(fallback_lines, require_result=True)
+    if items:
+        if not lines:
+            problems.insert(0, "未找到标准“分维度检查结果”小节（已从全文表格兜底解析）")
+        return items, problems
+    return [], ["未找到“分维度检查结果”小节"]
+
+
 def _parse_issues(text: str) -> list[dict]:
     """解析“风险问题清单”小节；无问题时写“无”，返回空列表。"""
-    lines = _find_section(text, "风险问题清单")
+    lines = _find_section_any(text, ISSUE_SECTION_KEYWORDS)
     if not lines:
         return []
     header, rows = _table_rows(lines)
     columns = {_strip_md(name): index for index, name in enumerate(header or [])}
     item_col = next((i for name, i in columns.items() if "检查项" in name or "维度" in name), None)
-    level_col = next((i for name, i in columns.items() if "等级" in name or "级别" in name), None)
+    level_col = next((i for name, i in columns.items() if any(k in name for k in ("等级", "级别", "风险"))), None)
     evidence_col = next((i for name, i in columns.items() if "证据" in name), None)
     title_col = next((i for name, i in columns.items() if "标题" in name), None)
     issues: list[dict] = []
@@ -178,7 +249,7 @@ def _parse_issues(text: str) -> list[dict]:
                 continue
             item_ids = [m.group(1)]
         level_src = cells[level_col] if level_col is not None and level_col < len(cells) else joined
-        level_match = LEVEL_RE.search(level_src) or LEVEL_RE.search(joined)
+        parsed_level = _parse_level(level_src) or _parse_level(joined) or "P3"
         evidence_cell = cells[evidence_col] if evidence_col is not None and evidence_col < len(cells) else joined
         title = cells[title_col] if title_col is not None and title_col < len(cells) else ""
         raw_id = _strip_md(cells[0]) if cells else ""
@@ -187,7 +258,7 @@ def _parse_issues(text: str) -> list[dict]:
         for item_id in item_ids:
             issues.append({
                 "item_id": item_id,
-                "level": level_match.group(1) if level_match else "P3",
+                "level": parsed_level,
                 "title": title,
                 "evidence": refs,
                 "impact": "", "suggestion": "", "effort": "M",
@@ -213,7 +284,7 @@ def _match_dimension_id(cell: str) -> str | None:
 
 def _parse_overview(text: str) -> tuple[dict[str, dict], list[str]]:
     """解析“评分总览”小节。返回 ({维度编号: {score, coverage, counts}}, problems)。"""
-    lines = _find_section(text, "评分总览")
+    lines = _find_section_any(text, OVERVIEW_SECTION_KEYWORDS)
     if not lines:
         return {}, ["未找到“评分总览”小节"]
     _header, rows = _table_rows(lines)
@@ -259,7 +330,7 @@ def _parse_declaration(text: str, keywords: tuple[str, ...], formula_tail: bool 
     def pattern(keyword: str) -> str:
         return rf"{re.escape(keyword)}\s*[=：:﹕]?\s*(\d+(?:\.\d+)?|n/a|暂不评分)"
 
-    overview_text = "\n".join(_find_section(text, "评分总览"))
+    overview_text = "\n".join(_find_section_any(text, OVERVIEW_SECTION_KEYWORDS))
     for keyword in keywords:
         match = re.search(pattern(keyword), overview_text, re.IGNORECASE)
         if match:
@@ -424,4 +495,4 @@ def validate_report(text: str, repo: Path, checklist: dict, weights: dict,
         total = len(problems)
         problems = problems[:MAX_PROBLEMS]
         problems.append(f"……共 {total} 条问题，仅列出前 {MAX_PROBLEMS} 条")
-    return {"problems": problems, "scores": scores}
+    return {"problems": problems, "scores": scores, "items_count": len(items)}
