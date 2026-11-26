@@ -19,7 +19,16 @@ import scoring
 RESULT_RE = re.compile(
     r"(NEED_INFO-运行数据|NEED_INFO-补充材料|NEED_INFO-证据不足|NEED_INFO|PASS|WARN|FAIL|N/A)"
 )
+CHINESE_RESULT_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("不通过", "未通过", "失败", "严重缺失"), "FAIL"),
+    (("部分通过", "警告", "存在风险", "需改进", "待改进"), "WARN"),
+    (("不适用", "无需评估"), "N/A"),
+    (("待补充", "证据不足", "无法判断", "信息不足", "未提供"), "NEED_INFO-证据不足"),
+    (("通过", "符合", "达标", "正常"), "PASS"),
+)
 ITEM_ID_RE = re.compile(r"\b(\d+\.\d+)\b")
+ITEM_ID_HEAD_RE = re.compile(r"^(\d+\.\d+)(?:\s|$|[:：、\-—（(])")
+ITEM_LINE_RE = re.compile(r"^\s*(?:[-*+]|\#{2,6})\s*[*_`]*([1-8]\.\d{1,2})(?:\s|[:：、\-—（(]|$)(.+)")
 REF_RE = re.compile(r"([\w./-]+):(\d+)(?:-(\d+))?")
 LEVEL_RE = re.compile(r"\b(P[0-3])\b")
 CHINESE_LEVEL_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
@@ -119,12 +128,23 @@ def _table_rows(lines: list[str]) -> tuple[list[str] | None, list[list[str]]]:
     return header, rows
 
 
-def _result_token(cell: str) -> str | None:
+def _result_token(cell: str, allow_chinese: bool = False) -> str | None:
     match = RESULT_RE.search(cell)
-    if not match:
-        return None
-    token = match.group(1)
-    return "NEED_INFO-证据不足" if token == "NEED_INFO" else token
+    if match:
+        token = match.group(1)
+        return "NEED_INFO-证据不足" if token == "NEED_INFO" else token
+    if allow_chinese:
+        cleaned = _strip_md(cell)
+        for keywords, mapped in CHINESE_RESULT_RULES:
+            if any(kw in cleaned for kw in keywords):
+                return mapped
+    return None
+
+
+def _extract_item_id(cell: str) -> str | None:
+    cleaned = _strip_md(cell)
+    match = ITEM_ID_HEAD_RE.match(cleaned)
+    return match.group(1) if match else None
 
 
 def _extract_refs(cell: str) -> list[dict]:
@@ -150,7 +170,7 @@ def _columns_from_header(header: list[str]) -> tuple[int, int | None, int | None
 
 
 def _parse_item_rows(lines: list[str], require_result: bool = False) -> tuple[list[dict], list[str]]:
-    """从一组 Markdown 行中解析逐项检查表（支持同一节内多张分维度子表）。"""
+    """从一组 Markdown 行中解析逐项检查表（支持同一节内多张分维度子表、编号与名称合并列、前置维度/序号列）。"""
     items: list[dict] = []
     seen: set[str] = set()
     problems: list[str] = []
@@ -166,17 +186,18 @@ def _parse_item_rows(lines: list[str], require_result: bool = False) -> tuple[li
         cells = [cell.strip() for cell in stripped.strip("|").split("|")]
         if not cells or all(re.fullmatch(r"[:\- ]+", cell) for cell in cells if cell):
             continue
-        first = _strip_md(cells[0])
-        if not re.fullmatch(r"\d+\.\d+", first):
+        item_id = _extract_item_id(cells[0])
+        if item_id is None and len(cells) > 1:
+            item_id = _extract_item_id(cells[1])
+        if item_id is None:
             if any(k in "".join(cells) for k in ("检查项", "结果", "风险", "等级", "结论")):
                 result_col, level_col, evidence_col, conclusion_col = _columns_from_header(cells)
             continue
-        item_id = first
         result_cell = cells[result_col] if result_col < len(cells) else ""
-        result = _result_token(result_cell)
+        result = _result_token(result_cell, allow_chinese=True)
         if result is None:
-            # 表头可能与 §11 不一致时，退化为整行搜索。
-            result = _result_token(" ".join(cells))
+            # 表头可能与 §11 不一致时，退化为整行搜索标准英文结果 token。
+            result = _result_token(" ".join(cells), allow_chinese=False)
         if result is None:
             if not require_result:
                 problems.append(f"{item_id} 结果无法识别")
@@ -200,14 +221,47 @@ def _parse_item_rows(lines: list[str], require_result: bool = False) -> tuple[li
     return items, problems
 
 
+def _parse_item_lines(lines: list[str]) -> list[dict]:
+    """兜底解析非表格形式（无序列表或小标题）写出的检查项行，例如 `- **1.1 功能完整性**：PASS`。"""
+    items: list[dict] = []
+    seen: set[str] = set()
+    in_fence = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or stripped.startswith("|"):
+            continue
+        match = ITEM_LINE_RE.match(line)
+        if not match:
+            continue
+        item_id, rest = match.group(1), match.group(2)
+        result = _result_token(rest, allow_chinese=False)
+        if result is None or item_id in seen:
+            continue
+        seen.add(item_id)
+        level = _parse_level(rest) or "none"
+        items.append({
+            "id": item_id, "result": result, "risk": level,
+            "evidence": _extract_refs(rest), "conclusion": rest.strip(),
+            "conditional": False,
+        })
+    return items
+
+
 def _parse_items(text: str) -> tuple[list[dict], list[str]]:
-    """解析“分维度检查结果”小节的逐项表；未命中标准标题时兜底扫描全文非总览/清单表格。"""
+    """解析“分维度检查结果”小节的逐项表；未命中标准标题时兜底扫描全文表格及列表项。"""
     lines = _find_section_any(text, ITEM_SECTION_KEYWORDS)
     if lines:
         items, problems = _parse_item_rows(lines)
+        if len(items) < 16:
+            line_items = _parse_item_lines(lines)
+            if len(line_items) > len(items):
+                items, problems = line_items, []
         if items:
             return items, problems
-    # 兜底：扫描全文所有非评分总览/风险清单/待补充信息小节，提取形如 | 1.1 | ... | PASS/WARN/FAIL/NEED_INFO | 的行
+    # 兜底：扫描全文所有非评分总览/风险清单/待补充信息小节，提取表格或列表中的检查项
     fallback_lines: list[str] = []
     sections = _sections(text)
     if sections:
@@ -218,9 +272,13 @@ def _parse_items(text: str) -> tuple[list[dict], list[str]]:
     else:
         fallback_lines = text.splitlines()
     items, problems = _parse_item_rows(fallback_lines, require_result=True)
+    if len(items) < 16:
+        line_items = _parse_item_lines(fallback_lines)
+        if len(line_items) > len(items):
+            items, problems = line_items, []
     if items:
         if not lines:
-            problems.insert(0, "未找到标准“分维度检查结果”小节（已从全文表格兜底解析）")
+            problems.insert(0, "未找到标准“分维度检查结果”小节（已从全文兜底解析）")
         return items, problems
     return [], ["未找到“分维度检查结果”小节"]
 
@@ -283,37 +341,112 @@ def _match_dimension_id(cell: str) -> str | None:
 
 
 def _parse_overview(text: str) -> tuple[dict[str, dict], list[str]]:
-    """解析“评分总览”小节。返回 ({维度编号: {score, coverage, counts}}, problems)。"""
+    """解析“评分总览”小节（按表头动态定位维度/得分/覆盖率/计数列，兼容含权重列、拆分计数列、精简 2-3 列表）。"""
     lines = _find_section_any(text, OVERVIEW_SECTION_KEYWORDS)
     if not lines:
         return {}, ["未找到“评分总览”小节"]
-    _header, rows = _table_rows(lines)
+    header, rows = _table_rows(lines)
+    norm_header = [_strip_md(h) for h in (header or [])]
+    dim_col = next((i for i, h in enumerate(norm_header) if "维度" in h), 0)
+    weight_cols = {i for i, h in enumerate(norm_header) if "权重" in h}
+    score_col = next(
+        (i for i, h in enumerate(norm_header) if i != dim_col and any(k in h for k in ("得分", "评分", "分数"))),
+        None,
+    )
+    if score_col is None:
+        score_col = next((i for i in range(len(norm_header)) if i != dim_col and i not in weight_cols), 1)
+    coverage_col = next(
+        (i for i, h in enumerate(norm_header) if i not in (dim_col, score_col) and i not in weight_cols and "覆盖" in h),
+        None,
+    )
+    counts_col = next(
+        (
+            i
+            for i, h in enumerate(norm_header)
+            if i not in (dim_col, score_col, coverage_col)
+            and i not in weight_cols
+            and (any(k in h for k in ("计数", "统计", "分布")) or ("PASS" in h.upper() and "WARN" in h.upper()))
+        ),
+        None,
+    )
+    split_count_cols: list[int] | None = None
+    if counts_col is None and norm_header:
+        split_tokens = ("PASS", "WARN", "FAIL", "N/A", "NEED_INFO")
+        found_split: list[int] = []
+        for tok in split_tokens:
+            idx = next(
+                (
+                    i
+                    for i, h in enumerate(norm_header)
+                    if i not in (dim_col, score_col, coverage_col)
+                    and i not in weight_cols
+                    and tok in h.upper()
+                ),
+                None,
+            )
+            if idx is not None:
+                found_split.append(idx)
+        if len(found_split) == 5 and len(set(found_split)) == 5:
+            split_count_cols = found_split
+
     overview: dict[str, dict] = {}
     problems: list[str] = []
     for cells in rows:
         if not cells:
             continue
-        dim = _match_dimension_id(cells[0])
+        dim = _match_dimension_id(cells[dim_col] if dim_col < len(cells) else cells[0])
         if not dim:
             continue
-        score_cell = cells[1] if len(cells) > 1 else ""
-        if re.search(r"暂不评分|证据不足", score_cell):
+        score_cell = cells[score_col] if score_col < len(cells) else ""
+        if re.search(r"暂不评分|证据不足|n/a|—|-$", score_cell, re.IGNORECASE):
             score = None
         else:
             number = re.search(r"\d+(?:\.\d+)?", score_cell)
             score = float(number.group(0)) if number else None
             if score is None:
                 problems.append(f"维度 {dim} 的得分无法识别")
-        coverage_cell = cells[2] if len(cells) > 2 else ""
-        coverage_match = re.search(r"(\d+(?:\.\d+)?)\s*%", coverage_cell)
-        coverage = float(coverage_match.group(1)) if coverage_match else None
-        if coverage is None:
-            problems.append(f"维度 {dim} 的覆盖率无法识别")
-        counts_cell = cells[3] if len(cells) > 3 else ""
-        counts = [int(part) for part in re.findall(r"\d+", counts_cell)]
-        if len(counts) != 5:
-            problems.append(f"维度 {dim} 的计数无法识别：{counts_cell!r}")
-            counts = [0, 0, 0, 0, 0]
+
+        coverage: float | None = None
+        if coverage_col is not None:
+            coverage_cell = cells[coverage_col] if coverage_col < len(cells) else ""
+            coverage_match = re.search(r"(\d+(?:\.\d+)?)\s*%", coverage_cell)
+            coverage = float(coverage_match.group(1)) if coverage_match else None
+            if coverage is None:
+                problems.append(f"维度 {dim} 的覆盖率无法识别")
+        else:
+            for idx, cell in enumerate(cells):
+                if idx in (dim_col, score_col, counts_col) or idx in weight_cols:
+                    continue
+                m = re.search(r"(\d+(?:\.\d+)?)\s*%", cell)
+                if m:
+                    coverage = float(m.group(1))
+                    break
+
+        counts: list[int] | None = None
+        if counts_col is not None:
+            counts_cell = cells[counts_col] if counts_col < len(cells) else ""
+            parsed_counts = [int(part) for part in re.findall(r"\d+", counts_cell)]
+            if len(parsed_counts) != 5:
+                problems.append(f"维度 {dim} 的计数无法识别：{counts_cell!r}")
+                counts = [0, 0, 0, 0, 0]
+            else:
+                counts = parsed_counts
+        elif split_count_cols is not None:
+            vals: list[int] = []
+            for idx in split_count_cols:
+                m = re.search(r"\d+", cells[idx]) if idx < len(cells) else None
+                if m:
+                    vals.append(int(m.group(0)))
+            counts = vals if len(vals) == 5 else None
+        else:
+            for idx, cell in enumerate(cells):
+                if idx in (dim_col, score_col, coverage_col) or idx in weight_cols:
+                    continue
+                if re.search(r"\d+\s*/\s*\d+\s*/\s*\d+\s*/\s*\d+\s*/\s*\d+", cell):
+                    parsed_counts = [int(part) for part in re.findall(r"\d+", cell)]
+                    if len(parsed_counts) == 5:
+                        counts = parsed_counts
+                        break
         overview[dim] = {"score": score, "coverage": coverage, "counts": counts}
     return overview, problems
 
@@ -447,7 +580,7 @@ def validate_report(text: str, repo: Path, checklist: dict, weights: dict,
                     f"维度 {did} 覆盖率不一致：声明 {declared['coverage']}%，"
                     f"重算 {round(computed['coverage'] * 100, 1)}%")
             expected_counts = [computed["counts"][key] for key in ("PASS", "WARN", "FAIL", "N/A", "NEED_INFO")]
-            if declared["counts"] != expected_counts:
+            if declared["counts"] is not None and declared["counts"] != expected_counts:
                 problems.append(
                     f"维度 {did} 计数不一致：声明 {'/'.join(map(str, declared['counts']))}，"
                     f"重算 {'/'.join(map(str, expected_counts))}")
@@ -490,9 +623,48 @@ def validate_report(text: str, repo: Path, checklist: dict, weights: dict,
             problems.extend(evidence_module.verify(result, repo))
     else:
         problems.append("未解析出任何检查项")
+        if overview:
+            scored_dims = {did: d["score"] for did, d in overview.items() if d.get("score") is not None}
+            total_declared = _parse_declaration(text, ("总评分", "项目评分"), formula_tail=True)
+            total_val: float | None = None
+            if total_declared and total_declared.lower() not in ("n/a", "暂不评分"):
+                try:
+                    total_val = round(float(total_declared), 2)
+                except ValueError:
+                    total_val = None
+            if total_val is None and len(scored_dims) >= scoring.MIN_SCORED_DIMENSIONS:
+                w_sum = sum(weights.get(did, 0.0) for did in scored_dims)
+                if w_sum > 0:
+                    total_val = round(sum(scored_dims[did] * weights.get(did, 0.0) for did in scored_dims) / w_sum, 1)
+            sec_declared = _parse_declaration(text, ("安全评分",))
+            sec_val: float | None = None
+            if sec_declared and sec_declared.lower() not in ("n/a", "暂不评分"):
+                try:
+                    sec_val = round(float(sec_declared), 2)
+                except ValueError:
+                    sec_val = None
+            if sec_val is None and "6" in scored_dims:
+                sec_val = scored_dims["6"]
+            cov_vals = [d["coverage"] for d in overview.values() if d.get("coverage") is not None]
+            avg_cov = round(sum(cov_vals) / len(cov_vals) / 100.0, 3) if cov_vals else None
+            scores = {
+                "total": total_val,
+                "grade": scoring.grade(total_val, checklist),
+                "scored_dimensions": len(scored_dims),
+                "coverage": avg_cov,
+                "not_evaluated": None,
+                "security_score": sec_val,
+                "security_p0": None,
+                "security_p1": None,
+            }
 
     if len(problems) > MAX_PROBLEMS:
         total = len(problems)
         problems = problems[:MAX_PROBLEMS]
         problems.append(f"……共 {total} 条问题，仅列出前 {MAX_PROBLEMS} 条")
-    return {"problems": problems, "scores": scores, "items_count": len(items)}
+    return {
+        "problems": problems,
+        "scores": scores,
+        "items_count": len(items),
+        "overview_count": len(overview),
+    }

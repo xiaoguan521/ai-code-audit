@@ -348,6 +348,51 @@ class LenientValidationTest(unittest.TestCase):
         self.assertNotIn("report_path", rec)
         self.assertNotIn("rejected_report_path", rec)
 
+    def test_compact_overview_without_coverage_counts_and_combined_id_items(self):
+        """复现 asrfront 截图场景：评分总览只有 2-3 列（无覆盖率/计数列）且含权重列/合并编号列，或仅有总览无逐项表。"""
+        compact_overview_only = "\n".join([
+            "# asrfront 八性代码审查报告",
+            "",
+            "## 一、评分总览",
+            "| 维度 | 权重 | 得分 | 核心结论 |",
+            "|---|---|---|---|",
+            "| 1. 功能适合性 | 15% | 7.5 | 核心流程可用 |",
+            "| 2. 性能效率 | 12% | 6.8 | 存在重渲染 |",
+            "| 3. 可靠性 | 13% | 7.0 | 缺少重试 |",
+            "| 4. 稳定性 | 10% | 6.5 | 内存释放待查 |",
+            "| 5. 易用性 | 10% | 7.2 | 提示清晰 |",
+            "| 6. 安全性 | 20% | 6.0 | 需加强鉴权 |",
+            "| 7. 兼容性 | 10% | 7.4 | 现代浏览器 |",
+            "| 8. 可维护性 | 10% | 6.6 | 缺少单测 |",
+            "",
+            "总评分：6.8，安全评分：6.0",
+        ]) + "\n"
+        response = {"raw_text": compact_overview_only, "event_log": [], "session_id": "s2"}
+        with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
+             mock.patch.object(run_daily, "call_agent", return_value=response):
+            rec = run_daily.scan_project(self.project, self.settings, "2026-11-26", self.args)
+        self.assertEqual(rec["status"], "ok")
+        self.assertEqual(rec["report_validation"]["overview_count"], 8)
+        self.assertFalse(any("覆盖率无法识别" in p or "计数无法识别" in p for p in rec["report_validation"]["problems"]))
+        self.assertEqual(rec["report_scores"]["total"], 6.8)
+        self.assertEqual(rec["report_scores"]["security_score"], 6.0)
+        self.assertTrue(Path(rec["report_path"]).is_file())
+
+    def test_combined_item_id_and_bullet_list_items_parse_cleanly(self):
+        lines = ["# 项目审查", "", "## 详细评估", "| 检查项 | 结果 | 风险 | 说明 |", "|---|---|---|---|"]
+        for item in self.checklist["items"][:32]:
+            lines.append(f"| {item['id']} {item['name']} | PASS | 无 | OK |")
+        for item in self.checklist["items"][32:]:
+            lines.append(f"| 维度 | {item['id']} | WARN | 中危 | 注意 |")
+        text = "\n".join(lines) + "\n"
+        response = {"raw_text": text, "event_log": [], "session_id": "s3"}
+        with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
+             mock.patch.object(run_daily, "call_agent", return_value=response):
+            rec = run_daily.scan_project(self.project, self.settings, "2026-11-26", self.args)
+        self.assertEqual(rec["status"], "ok")
+        self.assertEqual(rec["report_validation"]["items_count"], 64)
+        self.assertIsNotNone(rec["report_scores"]["total"])
+
 
 if __name__ == "__main__":
     unittest.main()

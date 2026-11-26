@@ -1103,20 +1103,22 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
             if not isinstance(raw, str) or not raw.strip():
                 raise AgentCallError("Harness 没有返回报告", agent_status="failed")
             # 落盘前最小机器校验：解析报告表格、重算分数、核验 WARN/FAIL 证据路径存在性。
-            # validation_mode="lenient"（默认）：只要解析出 >= 32 个检查项即允许落盘，
+            # validation_mode="lenient"（默认）：只要解析出 >= 16 个检查项或 >= 4 个总览维度即允许落盘，
             # 格式/自洽性偏差记为非阻塞告警（report_validation.problems）；
-            # 空壳/非报告输出（< 32 项）及高置信密钥泄露始终硬拦截，不落盘、不更新 state。
+            # 空壳/非报告输出及高置信密钥泄露始终硬拦截，不落盘、不更新 state。
             weights = scoring.parse_weights(p.get("weights"), checklist)
             validation = report_validate.validate_report(raw, repo, checklist, weights, report_mode)
             validation_mode = str(settings.get("validation_mode", "lenient")).strip().lower()
             if validation_mode not in ("lenient", "strict"):
                 validation_mode = "lenient"
             items_count = int(validation.get("items_count") or 0)
+            overview_count = int(validation.get("overview_count") or 0)
             rec["report_validation"] = {
                 "ok": not validation["problems"],
                 "problems": validation["problems"],
                 "mode": validation_mode,
                 "items_count": items_count,
+                "overview_count": overview_count,
             }
             if validation["scores"] is not None:
                 rec["report_scores"] = validation["scores"]
@@ -1129,7 +1131,10 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
 
             should_block = bool(
                 validation["problems"]
-                and (validation_mode == "strict" or items_count < 32)
+                and (
+                    validation_mode == "strict"
+                    or (items_count < 16 and overview_count < 4)
+                )
             )
             if should_block:
                 # 若未命中高置信密钥，将未通过校验的原始草稿另存到 results/<日期>/<run_id>/<pid>.rejected.md
@@ -1148,8 +1153,8 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
                     pass
                 raise RuntimeError("报告校验未通过，已拦截落盘")
             if validation["problems"]:
-                log(f"{pid}: 报告存在 {len(validation['problems'])} 条格式提示（已解析 {items_count}/64 项），"
-                    f"lenient 模式已允许落盘")
+                log(f"{pid}: 报告存在 {len(validation['problems'])} 条格式提示"
+                    f"（已解析 {items_count}/64 项，总览 {overview_count}/8 维），lenient 模式已允许落盘")
             # 批次超时作废点：校验与脱敏之后、落盘之前。若批次已超时，本轮
             # 该项目记 error（外层 except），不落盘、不写 state。
             _check_abort(settings)
