@@ -171,7 +171,7 @@ export interface ScanTask {
   task_id: string;
   trigger?: "manual" | "schedule";
   command: string;
-  status: "running" | "completed" | "failed" | "cancelled";
+  status: "running" | "completed" | "failed" | "cancelled" | "interrupted";
   started_at: string;
   finished_at: string | null;
   returncode: number | null;
@@ -199,6 +199,21 @@ export interface ScheduleResponse {
   server_time: string;
 }
 
+export interface RunProgressProjectItem {
+  project_id: string;
+  project_name: string;
+  department: string;
+  owner: string;
+  state: "ok" | "error" | "scanning" | "queued";
+  status: string;
+  total: number | null;
+  error?: string | null;
+  duration_seconds: number | null;
+  elapsed_seconds: number | null;
+  eta_seconds: number | null;
+  timeout_remaining_seconds: number | null;
+}
+
 export interface RunProgressItem {
   date: string;
   run_id: string;
@@ -206,13 +221,21 @@ export interface RunProgressItem {
   report_mode: string;
   started_at: string | null;
   finished_at: string | null;
+  snapshot_at?: string | null;
   summary_status: string | null;
+  elapsed_seconds?: number | null;
+  avg_project_seconds?: number | null;
+  estimated_remaining_seconds?: number | null;
+  parallelism?: number;
   total_count: number;
   completed_count: number;
   ok_count: number;
   error_count: number;
+  scanning_count?: number;
+  queued_count?: number;
   pending_count: number;
   percent: number;
+  items?: RunProgressProjectItem[];
   completed_projects: {
     project_id: string;
     project_name: string;

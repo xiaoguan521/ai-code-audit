@@ -198,6 +198,12 @@ body {
   align-items: start;
 }
 
+.grid-2 > *,
+.grid-sidebar > *,
+.report-layout > * {
+  min-width: 0;
+}
+
 @media (max-width: 960px) {
   .grid-2,
   .grid-sidebar {
@@ -557,6 +563,102 @@ tbody tr.clickable:hover {
 
 .chip-dot.pulse {
   animation: pulse-dot 1.2s ease-in-out infinite;
+}
+
+.progress-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.progress-meta-box {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.progress-meta-label {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.progress-meta-value {
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  margin-top: 2px;
+}
+
+.dept-group {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-1);
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+
+.dept-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  cursor: pointer;
+  background: var(--bg-2);
+  user-select: none;
+  flex-wrap: wrap;
+}
+
+.dept-header:hover {
+  filter: brightness(0.98);
+}
+
+.dept-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.dept-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  flex-wrap: wrap;
+}
+
+.dept-mini-bar {
+  width: 72px;
+  height: 6px;
+  background: var(--grid);
+  border-radius: 999px;
+  overflow: hidden;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.dept-mini-bar span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.dept-table-wrap {
+  overflow-x: auto;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.dept-table-wrap table th,
+.dept-table-wrap table td {
+  padding: 6px 10px;
+  font-size: 12.5px;
 }
 
 .report-layout {

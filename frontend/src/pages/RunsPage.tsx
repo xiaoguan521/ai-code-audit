@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
-import { FileText, RefreshCw } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { AlertTriangle, FileText, RefreshCw, RotateCcw } from "lucide-react";
 import { api } from "../api";
 import type { RunDetailResponse, RunSummary } from "../types";
 
 interface Props {
   onOpenReport: (date: string, runId: string, target: string) => void;
+  onScanStarted?: (taskId: string) => void;
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -16,12 +17,46 @@ const STATUS_COLOR: Record<string, string> = {
   error: "var(--critical)",
 };
 
-export function RunsPage({ onOpenReport }: Props) {
+function fmtSec(sec: number): string {
+  if (!sec || sec <= 0) return "—";
+  const s = Math.round(sec);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return m < 60 ? `${m}m ${rem}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+function classifyError(raw: string | undefined): string {
+  const s = (raw || "").toLowerCase();
+  if (!s) return "其他错误";
+  if (s.includes("clone") || s.includes("branch") || s.includes("git") || s.includes("repository") || s.includes("权限")) {
+    return "Git 克隆 / 分支";
+  }
+  if (s.includes("timeout") || s.includes("超时") || s.includes("时限")) {
+    return "执行超时";
+  }
+  if (s.includes("校验") || s.includes("拦截") || s.includes("密钥")) {
+    return "报告校验拦截";
+  }
+  if (s.includes("api") || s.includes("model") || s.includes("http") || s.includes("connection") || s.includes("429") || s.includes("502") || s.includes("503")) {
+    return "模型 / 网络错误";
+  }
+  return "其他错误";
+}
+
+export function RunsPage({ onOpenReport, onScanStarted }: Props) {
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [selected, setSelected] = useState<{ date: string; run_id: string } | null>(null);
   const [detail, setDetail] = useState<RunDetailResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [actionBusy, setActionBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // 清册筛选状态
+  const [statusFilter, setStatusFilter] = useState<"" | "ok" | "error">("");
+  const [errCatFilter, setErrCatFilter] = useState("");
+  const [deptFilter, setDeptFilter] = useState("");
+  const [query, setQuery] = useState("");
 
   const loadRuns = async () => {
     setLoading(true);
@@ -48,6 +83,84 @@ export function RunsPage({ onOpenReport }: Props) {
     api.runDetail(selected.date, selected.run_id).then(setDetail).catch(() => setDetail(null));
   }, [selected]);
 
+  const projects = detail?.projects ?? [];
+
+  const departments = useMemo(() => {
+    const set = new Set<string>();
+    for (const p of projects) {
+      set.add((p.department || "").trim() || "未分组");
+    }
+    return [...set].sort((a, b) => a.localeCompare(b, "zh-CN"));
+  }, [projects]);
+
+  const failedProjects = useMemo(() => projects.filter((p) => p.status !== "ok"), [projects]);
+  const okCount = projects.length - failedProjects.length;
+  const errCount = failedProjects.length;
+
+  // 失败原因自动聚类
+  const errorClusters = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const p of failedProjects) {
+      const cat = classifyError(p.error);
+      counts.set(cat, (counts.get(cat) || 0) + 1);
+    }
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  }, [failedProjects]);
+
+  const filteredProjects = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return projects.filter((p) => {
+      const dept = (p.department || "").trim() || "未分组";
+      if (statusFilter === "ok" && p.status !== "ok") return false;
+      if (statusFilter === "error" && p.status === "ok") return false;
+      if (errCatFilter && (p.status === "ok" || classifyError(p.error) !== errCatFilter)) return false;
+      if (deptFilter && dept !== deptFilter) return false;
+      if (
+        q &&
+        !`${p.project_name || ""} ${p.project_id} ${dept} ${p.owner || ""} ${p.error || ""}`
+          .toLowerCase()
+          .includes(q)
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }, [projects, statusFilter, errCatFilter, deptFilter, query]);
+
+  const handleRetryProjects = async (pids: string[]) => {
+    if (pids.length === 0) return;
+    setActionBusy(true);
+    setError(null);
+    try {
+      const res = await api.startScan({
+        only: pids,
+        fast: detail?.report_mode === "fast",
+        dry_run: false,
+      });
+      if (onScanStarted) onScanStarted(res.task_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重跑失败");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleMarkAborted = async () => {
+    if (!detail) return;
+    setActionBusy(true);
+    setError(null);
+    try {
+      await api.markRunAborted(detail.date, detail.run_id);
+      await loadRuns();
+      const updated = await api.runDetail(detail.date, detail.run_id);
+      setDetail(updated);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "标记中断失败");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
   return (
     <div className="grid-sidebar">
       <div className="card">
@@ -71,7 +184,11 @@ export function RunsPage({ onOpenReport }: Props) {
               <div
                 key={`${r.date}-${r.run_id}`}
                 className={`list-item ${active ? "active" : ""}`}
-                onClick={() => setSelected({ date: r.date, run_id: r.run_id })}
+                onClick={() => {
+                  setSelected({ date: r.date, run_id: r.run_id });
+                  setDeptFilter("");
+                  setErrCatFilter("");
+                }}
               >
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   <b>{r.date}</b>
@@ -102,24 +219,142 @@ export function RunsPage({ onOpenReport }: Props) {
           </div>
         ) : (
           <div>
-            <div className="card-title">
+            <div className="card-title" style={{ flexWrap: "wrap" }}>
               <span>
                 批次详情：{detail.date} / {detail.run_id}
               </span>
-              {detail.has_summary && (
-                <button
-                  className="btn btn-primary"
-                  onClick={() => onOpenReport(detail.date, detail.run_id, "_summary")}
-                >
-                  <FileText size={14} /> 查看整体汇总 (_summary.md)
-                </button>
-              )}
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {detail.status === "running" && (
+                  <button
+                    className="btn btn-danger"
+                    disabled={actionBusy}
+                    title="若该批次已异常中断且无活跃进程，点击收尾为已中断状态"
+                    onClick={() => void handleMarkAborted()}
+                  >
+                    <AlertTriangle size={14} /> 标记为已中断
+                  </button>
+                )}
+                {failedProjects.length > 0 && (
+                  <button
+                    className="btn"
+                    disabled={actionBusy}
+                    onClick={() => void handleRetryProjects(failedProjects.map((p) => p.project_id))}
+                  >
+                    <RotateCcw size={14} /> 重跑失败项 ({failedProjects.length})
+                  </button>
+                )}
+                {detail.has_summary && (
+                  <button
+                    className="btn btn-primary"
+                    onClick={() => onOpenReport(detail.date, detail.run_id, "_summary")}
+                  >
+                    <FileText size={14} /> 查看整体汇总 (_summary.md)
+                  </button>
+                )}
+              </div>
             </div>
-            <div className="sub" style={{ marginBottom: 14 }}>
+            <div className="sub" style={{ marginBottom: 12 }}>
               状态：<b>{detail.status}</b> · 模式：{detail.report_mode || "—"} · 开始：
-              {detail.started_at?.slice(0, 19).replace("T", " ") || "—"} · 结束：
-              {detail.finished_at?.slice(0, 19).replace("T", " ") || "—"} · 汇总状态：
+              {detail.started_at?.slice(0, 19).replace("T", " ") || "—"}
+              {detail.snapshot_at ? ` · 快照：${detail.snapshot_at.slice(0, 19).replace("T", " ")}` : ""}
+              {" · "}结束：{detail.finished_at?.slice(0, 19).replace("T", " ") || "—"} · 汇总状态：
               {detail.summary_status || "—"}
+            </div>
+
+            {/* 失败原因聚类速览 */}
+            {errorClusters.length > 0 && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  gap: 6,
+                  marginBottom: 10,
+                  padding: "8px 10px",
+                  borderRadius: 8,
+                  background: "var(--bg-2)",
+                  border: "1px solid var(--border)",
+                  fontSize: 12,
+                }}
+              >
+                <span style={{ fontWeight: 600, color: "var(--critical)" }}>失败原因聚类：</span>
+                {errorClusters.map(([cat, cnt]) => (
+                  <button
+                    key={cat}
+                    type="button"
+                    className={`weekday-btn ${errCatFilter === cat ? "active" : ""}`}
+                    onClick={() => {
+                      const next = errCatFilter === cat ? "" : cat;
+                      setErrCatFilter(next);
+                      if (next) setStatusFilter("error");
+                    }}
+                  >
+                    {cat} ({cnt})
+                  </button>
+                ))}
+                {errCatFilter && (
+                  <button
+                    type="button"
+                    className="weekday-btn"
+                    onClick={() => {
+                      setErrCatFilter("");
+                      setStatusFilter("");
+                    }}
+                  >
+                    清除聚类筛选
+                  </button>
+                )}
+              </div>
+            )}
+
+            <div className="filters">
+              <button
+                type="button"
+                className={`weekday-btn ${statusFilter === "" && !errCatFilter ? "active" : ""}`}
+                onClick={() => {
+                  setStatusFilter("");
+                  setErrCatFilter("");
+                }}
+              >
+                全部 ({projects.length})
+              </button>
+              <button
+                type="button"
+                className={`weekday-btn ${statusFilter === "ok" ? "active" : ""}`}
+                onClick={() => {
+                  setStatusFilter("ok");
+                  setErrCatFilter("");
+                }}
+              >
+                成功 ({okCount})
+              </button>
+              <button
+                type="button"
+                className={`weekday-btn ${statusFilter === "error" ? "active" : ""}`}
+                onClick={() => setStatusFilter("error")}
+              >
+                失败 ({errCount})
+              </button>
+
+              <select value={deptFilter} onChange={(e) => setDeptFilter(e.target.value)}>
+                <option value="">全部部门 ({departments.length})</option>
+                {departments.map((d) => (
+                  <option key={d} value={d}>
+                    {d}
+                  </option>
+                ))}
+              </select>
+
+              <input
+                placeholder="搜索项目 / ID / 部门 / 负责人 / 报错"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                style={{ minWidth: 220 }}
+              />
+
+              <span className="muted" style={{ fontSize: 12, marginLeft: "auto" }}>
+                显示 {filteredProjects.length} / {projects.length} 项
+              </span>
             </div>
 
             <div className="table-wrap">
@@ -127,6 +362,7 @@ export function RunsPage({ onOpenReport }: Props) {
                 <thead>
                   <tr>
                     <th>项目</th>
+                    <th>部门</th>
                     <th>状态</th>
                     <th>扫描类型</th>
                     <th className="num">总分</th>
@@ -138,9 +374,11 @@ export function RunsPage({ onOpenReport }: Props) {
                   </tr>
                 </thead>
                 <tbody>
-                  {detail.projects.map((p) => {
+                  {filteredProjects.map((p) => {
                     const stages = p.metrics?.stages_seconds || {};
-                    const totalSec = Object.values(stages).reduce((a, b) => a + b, 0);
+                    const totalSec =
+                      (p.metrics as { total_seconds?: number } | undefined)?.total_seconds ??
+                      Object.values(stages).reduce((a, b) => a + b, 0);
                     return (
                       <tr key={p.project_id}>
                         <td>
@@ -149,6 +387,7 @@ export function RunsPage({ onOpenReport }: Props) {
                             {p.project_id}
                           </div>
                         </td>
+                        <td>{(p.department || "").trim() || "未分组"}</td>
                         <td>
                           <span className="chip">
                             <span
@@ -175,28 +414,45 @@ export function RunsPage({ onOpenReport }: Props) {
                         <td className="muted">{(p.commit || "").slice(0, 10) || "—"}</td>
                         <td style={{ whiteSpace: "normal", maxWidth: 260 }}>
                           {p.error ? (
-                            <span style={{ color: "var(--critical)", fontSize: 12 }}>{p.error}</span>
-                          ) : totalSec > 0 ? (
-                            <span className="muted" style={{ fontSize: 12 }}>
-                              {totalSec.toFixed(1)}s
+                            <span style={{ color: "var(--critical)", fontSize: 12 }} title={p.error}>
+                              {p.error.length > 120 ? `${p.error.slice(0, 120)}…` : p.error}
                             </span>
                           ) : (
-                            "—"
+                            <span className="muted" style={{ fontSize: 12 }}>
+                              {fmtSec(totalSec)}
+                            </span>
                           )}
                         </td>
                         <td>
-                          {p.status === "ok" && (
+                          {p.status === "ok" ? (
                             <button
                               className="btn"
+                              style={{ padding: "3px 9px", fontSize: 12 }}
                               onClick={() => onOpenReport(detail.date, detail.run_id, p.project_id)}
                             >
                               阅读报告
+                            </button>
+                          ) : (
+                            <button
+                              className="btn"
+                              style={{ padding: "3px 9px", fontSize: 12 }}
+                              disabled={actionBusy}
+                              onClick={() => void handleRetryProjects([p.project_id])}
+                            >
+                              <RotateCcw size={12} /> 重跑
                             </button>
                           )}
                         </td>
                       </tr>
                     );
                   })}
+                  {filteredProjects.length === 0 && (
+                    <tr>
+                      <td colSpan={10} className="muted" style={{ textAlign: "center", padding: 24 }}>
+                        没有符合筛选条件的项目
+                      </td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
             </div>

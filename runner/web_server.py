@@ -17,6 +17,10 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 import hmac
 import json
 import mimetypes
@@ -58,6 +62,8 @@ SESSIONS: dict[str, float] = {}
 LOGIN_FAILURES: dict[str, deque[float]] = {}
 SCHEDULE_LOCK = threading.Lock()
 TIME_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+ACTIVE_PROJECT_SEEN: dict[str, float] = {}
+ACTIVE_SEEN_LOCK = threading.Lock()
 
 
 def _default_schedule() -> dict:
@@ -186,7 +192,8 @@ def _schedule_tick(cfg: dict, now_dt: dt.datetime | None = None) -> dict | None:
             "summary_only": False,
         }
         res = _start_scan_task(
-            payload, ROOT, cfg["settings_path"], cfg["projects_csv"], trigger="schedule"
+            payload, ROOT, cfg["settings_path"], cfg["projects_csv"],
+            trigger="schedule", output_dir=output_dir,
         )
         if res.get("task_id"):
             sched["last_task_id"] = res["task_id"]
@@ -197,7 +204,72 @@ def _schedule_tick(cfg: dict, now_dt: dt.datetime | None = None) -> dict | None:
         return res
 
 
-def _build_run_progress(date_str: str, run_id: str, data: dict) -> dict:
+def _is_project_actively_scanning(workdir: Path | None, pid: str) -> tuple[bool, float | None]:
+    """通过非阻塞检查 <workdir>/.locks/<pid>.lock 判断项目是否正在扫描，并估算其开始时间戳。"""
+    if not workdir or fcntl is None:
+        return False, None
+    lock_path = workdir / ".locks" / f"{pid}.lock"
+    if not lock_path.is_file():
+        return False, None
+    locked = False
+    try:
+        with lock_path.open("r+") as fh:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            except BlockingIOError:
+                locked = True
+    except OSError:
+        return False, None
+    if not locked:
+        with ACTIVE_SEEN_LOCK:
+            ACTIVE_PROJECT_SEEN.pop(pid, None)
+        return False, None
+
+    now_ts = time.time()
+    # 优先使用最近重建的 <workdir>/<pid>/context 目录时间作为该项目的扫描开始时间
+    started_ts: float | None = None
+    ctx_dir = workdir / pid / "context"
+    try:
+        if ctx_dir.exists():
+            st = ctx_dir.stat().st_mtime
+            if 0 <= now_ts - st <= 86400:
+                started_ts = st
+    except OSError:
+        pass
+    with ACTIVE_SEEN_LOCK:
+        if started_ts is not None:
+            ACTIVE_PROJECT_SEEN[pid] = started_ts
+        else:
+            started_ts = ACTIVE_PROJECT_SEEN.setdefault(pid, now_ts)
+    return True, started_ts
+
+
+def _project_duration_seconds(rec: dict) -> float | None:
+    metrics = rec.get("metrics") or {}
+    total = metrics.get("total_seconds")
+    if isinstance(total, (int, float)) and total >= 0:
+        return float(total)
+    stages = metrics.get("stages_seconds") or {}
+    vals = [float(v) for v in stages.values() if isinstance(v, (int, float)) and v >= 0]
+    return sum(vals) if vals else None
+
+
+def _parse_iso_ts(raw: str | None) -> float | None:
+    if not raw:
+        return None
+    try:
+        return dt.datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _build_run_progress(date_str: str, run_id: str, data: dict,
+                        catalog: dict[str, dict] | None = None,
+                        workdir: Path | None = None,
+                        settings: dict | None = None) -> dict:
+    cat = catalog or {}
+    cfg_settings = settings or {}
     projects = data.get("projects") or []
     pending = [str(p) for p in (data.get("pending_projects") or [])]
     completed_count = len(projects)
@@ -205,6 +277,103 @@ def _build_run_progress(date_str: str, run_id: str, data: dict) -> dict:
     ok_count = sum(1 for p in projects if p.get("status") == "ok")
     error_count = sum(1 for p in projects if p.get("status") == "error")
     percent = round(completed_count * 100 / total_count) if total_count > 0 else (100 if data.get("status") != "running" else 0)
+
+    now_ts = time.time()
+    started_ts = _parse_iso_ts(data.get("started_at"))
+    finished_ts = _parse_iso_ts(data.get("finished_at"))
+    elapsed_seconds = (
+        max(0, round((finished_ts or now_ts) - started_ts))
+        if started_ts is not None else None
+    )
+
+    # 统计已完成项目的平均耗时（优先使用真实扫描时长，避免瞬间失败拉偏）
+    durations = [d for d in (_project_duration_seconds(p) for p in projects) if d is not None]
+    meaningful = [d for d in durations if d >= 10.0]
+    used_durations = meaningful or durations
+    configured_parallel = max(1, int(cfg_settings.get("max_parallel", 2) or 2))
+    per_project_timeout = float(cfg_settings.get("per_project_timeout_sec", 3600) or 3600)
+
+    # 检查 pending 项目中哪些正在扫描（持锁）
+    scanning_map: dict[str, float | None] = {}
+    if data.get("status") == "running" and pending:
+        for pid in pending:
+            active, proj_start = _is_project_actively_scanning(workdir, pid)
+            if active:
+                scanning_map[pid] = proj_start
+
+    effective_parallel = max(1, len(scanning_map) or configured_parallel)
+    avg_project_sec: float | None = None
+    if used_durations:
+        avg_project_sec = sum(used_durations) / len(used_durations)
+    elif completed_count > 0 and elapsed_seconds is not None and elapsed_seconds > 0:
+        avg_project_sec = (elapsed_seconds / completed_count) * effective_parallel
+
+    items: list[dict] = []
+    for p in projects:
+        pid = p.get("project_id", "")
+        meta = cat.get(pid, {})
+        dur = _project_duration_seconds(p)
+        items.append({
+            "project_id": pid,
+            "project_name": p.get("project_name") or meta.get("project_name") or pid,
+            "department": (p.get("department") or meta.get("department") or "").strip() or "未分组",
+            "owner": p.get("owner") or meta.get("owner") or "",
+            "state": "ok" if p.get("status") == "ok" else "error",
+            "status": p.get("status", "unknown"),
+            "total": (p.get("report_scores") or {}).get("total"),
+            "error": p.get("error"),
+            "duration_seconds": round(dur) if dur is not None else None,
+            "elapsed_seconds": None,
+            "eta_seconds": None,
+            "timeout_remaining_seconds": None,
+        })
+
+    scanning_etas: list[float] = []
+    queued_count = 0
+    for pid in pending:
+        meta = cat.get(pid, {})
+        is_scanning = pid in scanning_map
+        proj_elapsed = None
+        proj_eta = None
+        timeout_rem = None
+        if is_scanning:
+            p_start = scanning_map[pid]
+            proj_elapsed = max(0, round(now_ts - p_start)) if p_start is not None else 0
+            timeout_rem = max(0, round(per_project_timeout - proj_elapsed))
+            if avg_project_sec is not None:
+                proj_eta = max(0, round(avg_project_sec - proj_elapsed))
+                scanning_etas.append(float(proj_eta))
+            else:
+                # 尚未有已完成项目时，暂用超时上限的 40% 作为保守参考
+                fallback_est = per_project_timeout * 0.4
+                proj_eta = max(0, round(fallback_est - proj_elapsed))
+                scanning_etas.append(float(proj_eta))
+        else:
+            queued_count += 1
+        items.append({
+            "project_id": pid,
+            "project_name": meta.get("project_name") or pid,
+            "department": (meta.get("department") or "").strip() or "未分组",
+            "owner": meta.get("owner") or "",
+            "state": "scanning" if is_scanning else "queued",
+            "status": "scanning" if is_scanning else "queued",
+            "total": None,
+            "error": None,
+            "duration_seconds": None,
+            "elapsed_seconds": proj_elapsed,
+            "eta_seconds": proj_eta,
+            "timeout_remaining_seconds": timeout_rem,
+        })
+
+    estimated_remaining_seconds: int | None = None
+    if data.get("status") == "running" and pending:
+        if avg_project_sec is not None:
+            # 正在扫描的剩余工作量 + 排队项目工作量，按有效并发度折算为墙钟剩余秒数
+            remaining_work = sum(scanning_etas) + queued_count * avg_project_sec
+            estimated_remaining_seconds = max(0, round(remaining_work / effective_parallel))
+        elif completed_count > 0 and elapsed_seconds is not None and elapsed_seconds > 0:
+            estimated_remaining_seconds = max(0, round((elapsed_seconds / completed_count) * len(pending)))
+
     return {
         "date": data.get("date") or date_str,
         "run_id": data.get("run_id") or run_id,
@@ -212,13 +381,21 @@ def _build_run_progress(date_str: str, run_id: str, data: dict) -> dict:
         "report_mode": data.get("report_mode", ""),
         "started_at": data.get("started_at"),
         "finished_at": data.get("finished_at"),
+        "snapshot_at": data.get("snapshot_at"),
         "summary_status": data.get("summary_status"),
+        "elapsed_seconds": elapsed_seconds,
+        "avg_project_seconds": round(avg_project_sec) if avg_project_sec is not None else None,
+        "estimated_remaining_seconds": estimated_remaining_seconds,
+        "parallelism": effective_parallel,
         "total_count": total_count,
         "completed_count": completed_count,
         "ok_count": ok_count,
         "error_count": error_count,
+        "scanning_count": len(scanning_map),
+        "queued_count": queued_count,
         "pending_count": len(pending),
         "percent": percent,
+        "items": items,
         "completed_projects": [
             {
                 "project_id": p.get("project_id", ""),
@@ -233,7 +410,24 @@ def _build_run_progress(date_str: str, run_id: str, data: dict) -> dict:
     }
 
 
-def _build_live_progress(output_dir: Path) -> dict:
+def _resolve_workdir(output_dir: Path, settings: dict) -> Path:
+    env_data_dir = os.environ.get("AUDIT_DATA_DIR", "").strip()
+    if env_data_dir:
+        return (Path(env_data_dir) / "work").resolve()
+    if settings.get("workdir"):
+        cand = Path(settings["workdir"]).resolve()
+        if cand.exists():
+            return cand
+    return (output_dir.parent / "work").resolve()
+
+
+def _build_live_progress(output_dir: Path, projects_csv: Path | None = None,
+                         settings_path: Path | None = None) -> dict:
+    catalog = {p["project_id"]: p for p in _load_projects(projects_csv)} if projects_csv else {}
+    settings = (_read_json(settings_path) if settings_path else None) or {}
+    if not isinstance(settings, dict):
+        settings = {}
+    workdir = _resolve_workdir(output_dir, settings)
     runs = _discover_runs(output_dir)
     active_runs: list[dict] = []
     latest_run: dict | None = None
@@ -241,7 +435,7 @@ def _build_live_progress(output_dir: Path) -> dict:
         data = _read_json(_resolve_run_file(output_dir, r["date"], r["run_id"]))
         if not isinstance(data, dict):
             continue
-        item = _build_run_progress(r["date"], r["run_id"], data)
+        item = _build_run_progress(r["date"], r["run_id"], data, catalog=catalog, workdir=workdir, settings=settings)
         if idx == 0:
             latest_run = item
         if item["status"] == "running":
@@ -678,8 +872,102 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict) -> di
     }
 
 
+def _web_tasks_dir(output_dir: Path) -> Path:
+    return output_dir / "results" / "_web_tasks"
+
+
+def _persist_task_meta(output_dir: Path | None, task: dict) -> None:
+    if not output_dir:
+        return
+    try:
+        tdir = _web_tasks_dir(output_dir)
+        tdir.mkdir(parents=True, exist_ok=True)
+        meta = _serialize_task(task, include_logs=False)
+        target = tdir / f"{task['task_id']}.json"
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError:
+        pass
+
+
+def _append_task_log(output_dir: Path | None, task_id: str, line: str) -> None:
+    if not output_dir:
+        return
+    try:
+        tdir = _web_tasks_dir(output_dir)
+        tdir.mkdir(parents=True, exist_ok=True)
+        with (tdir / f"{task_id}.log").open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+def _hydrate_persisted_tasks(output_dir: Path) -> None:
+    """服务启动时从 results/_web_tasks/ 恢复最近 30 条 Web/定时任务记录与日志。"""
+    tdir = _web_tasks_dir(output_dir)
+    if not tdir.is_dir():
+        return
+    files = sorted(tdir.glob("*.json"), key=lambda p: p.stat().st_mtime)[-30:]
+    with SCAN_LOCK:
+        for mf in files:
+            meta = _read_json(mf)
+            if not isinstance(meta, dict) or not meta.get("task_id"):
+                continue
+            tid = str(meta["task_id"])
+            if tid in SCAN_TASKS:
+                continue
+            if meta.get("status") == "running":
+                meta["status"] = "interrupted"
+                if not meta.get("finished_at"):
+                    meta["finished_at"] = dt.datetime.now().isoformat()
+            log_file = tdir / f"{tid}.log"
+            logs: deque[str] = deque(maxlen=500)
+            if log_file.is_file():
+                try:
+                    for raw in log_file.read_text(encoding="utf-8", errors="replace").splitlines()[-500:]:
+                        logs.append(raw)
+                except OSError:
+                    pass
+            meta["logs"] = logs
+            meta["_proc"] = None
+            meta["_cancelled"] = False
+            SCAN_TASKS[tid] = meta
+
+
+def _mark_run_aborted(output_dir: Path, date_str: str, run_id: str,
+                      settings_path: Path | None = None) -> dict:
+    """将已滞留且无活跃进程持锁的 running 批次收尾标记为已中断。"""
+    run_file = _resolve_run_file(output_dir, date_str, run_id)
+    data = _read_json(run_file)
+    if not isinstance(data, dict):
+        return {"not_found": True, "error": "未找到该批次运行记录"}
+    if data.get("status") != "running":
+        return {"conflict": True, "error": f"该批次当前状态为 {data.get('status')}，无需标记中断"}
+
+    settings = (_read_json(settings_path) if settings_path else None) or {}
+    workdir = _resolve_workdir(output_dir, settings if isinstance(settings, dict) else {})
+    pending = [str(p) for p in (data.get("pending_projects") or [])]
+    active_pids = [pid for pid in pending if _is_project_actively_scanning(workdir, pid)[0]]
+    if active_pids:
+        return {
+            "conflict": True,
+            "error": f"检测到项目 {', '.join(active_pids[:3])} 仍持有扫描锁，请先等待或中止扫描进程",
+        }
+
+    projects = data.get("projects") or []
+    ok_count = sum(1 for p in projects if p.get("status") == "ok")
+    data["status"] = "partial_failed" if ok_count > 0 else "failed"
+    data["finished_at"] = dt.datetime.now().isoformat()
+    data["aborted_manually"] = True
+    tmp = run_file.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, run_file)
+    return {"ok": True, "date": date_str, "run_id": run_id, "status": data["status"]}
+
+
 def _start_scan_task(payload: dict, root: Path, settings_path: Path, projects_csv: Path,
-                     trigger: str = "manual") -> dict:
+                     trigger: str = "manual", output_dir: Path | None = None) -> dict:
     task_id = dt.datetime.now().strftime("%H%M%S") + "-" + uuid.uuid4().hex[:8]
     compose_ep = root / "docker" / "compose_entrypoint.py"
     use_compose = bool(os.environ.get("AUDIT_DATA_DIR", "").strip()) and compose_ep.is_file()
@@ -746,8 +1034,10 @@ def _start_scan_task(payload: dict, root: Path, settings_path: Path, projects_cs
                     proc.terminate()
             assert proc.stdout is not None
             for line in proc.stdout:
+                clean = line.rstrip("\n")
                 with SCAN_LOCK:
-                    task["logs"].append(line.rstrip("\n"))
+                    task["logs"].append(clean)
+                _append_task_log(output_dir, task_id, clean)
             rc = proc.wait()
             with SCAN_LOCK:
                 task["_proc"] = None
@@ -757,18 +1047,23 @@ def _start_scan_task(payload: dict, root: Path, settings_path: Path, projects_cs
                 else:
                     task["status"] = "completed" if rc == 0 else "failed"
                 task["finished_at"] = dt.datetime.now().isoformat()
+                _persist_task_meta(output_dir, task)
         except Exception as exc:
+            msg = f"[web_server] 启动失败: {exc}"
             with SCAN_LOCK:
                 task["_proc"] = None
-                task["logs"].append(f"[web_server] 启动失败: {exc}")
+                task["logs"].append(msg)
                 task["returncode"] = -1
                 task["status"] = "failed"
                 task["finished_at"] = dt.datetime.now().isoformat()
+                _persist_task_meta(output_dir, task)
+            _append_task_log(output_dir, task_id, msg)
 
     with SCAN_LOCK:
         if any(t["status"] == "running" for t in SCAN_TASKS.values()):
             return {"conflict": True, "error": "已有扫描任务正在运行中，请等待当前任务完成"}
         SCAN_TASKS[task_id] = task
+        _persist_task_meta(output_dir, task)
     threading.Thread(target=runner_thread, daemon=True).start()
     return {"task_id": task_id, "status": "running", "command": task["command"]}
 
@@ -924,6 +1219,15 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return self._send_json(404, {"error": "未找到该批次运行记录"})
             rep_dir = _resolve_report_dir(output_dir, date_str, run_id)
             data["has_summary"] = (rep_dir / "_summary.md").is_file()
+            catalog = {p["project_id"]: p for p in _load_projects(projects_csv)}
+            for p in data.get("projects") or []:
+                meta = catalog.get(p.get("project_id", ""), {})
+                if not p.get("department") and meta.get("department"):
+                    p["department"] = meta["department"]
+                if not p.get("owner") and meta.get("owner"):
+                    p["owner"] = meta["owner"]
+                if not p.get("project_name") and meta.get("project_name"):
+                    p["project_name"] = meta["project_name"]
             return self._send_json(200, data)
 
         if path.startswith("/api/reports/"):
@@ -986,7 +1290,7 @@ class AuditHandler(BaseHTTPRequestHandler):
             })
 
         if path == "/api/scans/progress":
-            return self._send_json(200, _build_live_progress(output_dir))
+            return self._send_json(200, _build_live_progress(output_dir, projects_csv, self.cfg["settings_path"]))
 
         if path == "/api/scans":
             with SCAN_LOCK:
@@ -1061,6 +1365,18 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return self._send_json(400, {"error": res["error"]})
             return self._send_json(200, res)
 
+        if path.startswith("/api/runs/") and path.endswith("/mark-aborted"):
+            inner = path[len("/api/runs/"):-len("/mark-aborted")]
+            segs = [urllib.parse.unquote(s) for s in inner.split("/") if s]
+            if len(segs) != 2 or not all(_is_safe_segment(s) for s in segs):
+                return self._send_json(400, {"error": "无效的批次路径"})
+            res = _mark_run_aborted(self.cfg["output_dir"], segs[0], segs[1], self.cfg["settings_path"])
+            if res.get("not_found"):
+                return self._send_json(404, {"error": res["error"]})
+            if res.get("conflict"):
+                return self._send_json(409, {"error": res["error"]})
+            return self._send_json(200, res)
+
         if path.startswith("/api/scans/") and path.endswith("/cancel"):
             task_id = urllib.parse.unquote(path[len("/api/scans/"):-len("/cancel")])
             res = _cancel_scan_task(task_id)
@@ -1076,7 +1392,10 @@ class AuditHandler(BaseHTTPRequestHandler):
         if payload is None:
             return self._send_json(400, {"error": "无效的 JSON 请求体"})
 
-        res = _start_scan_task(payload, ROOT, self.cfg["settings_path"], self.cfg["projects_csv"])
+        res = _start_scan_task(
+            payload, ROOT, self.cfg["settings_path"], self.cfg["projects_csv"],
+            output_dir=self.cfg["output_dir"],
+        )
         if res.get("bad_request"):
             return self._send_json(400, {"error": res["error"]})
         if res.get("conflict"):
@@ -1120,6 +1439,7 @@ def main() -> int:
         "dist_dir": dist_dir,
         "auth_token": auth_token,
     }
+    _hydrate_persisted_tasks(output_dir)
     stop_event = threading.Event()
 
     def scheduler_worker() -> None:

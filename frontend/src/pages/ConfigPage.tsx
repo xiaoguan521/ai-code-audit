@@ -1,17 +1,10 @@
-import { useEffect, useRef, useState } from "react";
-import { CalendarClock, Check, Play, RefreshCw, Save, Square, Stethoscope } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { CalendarClock, Check, Play, RefreshCw, Save, Stethoscope } from "lucide-react";
 import { api } from "../api";
-import type {
-  CatalogProject,
-  DoctorReport,
-  LiveProgressResponse,
-  RunProgressItem,
-  ScanTask,
-  ScheduleResponse,
-} from "../types";
+import type { CatalogProject, DoctorReport, ScheduleResponse } from "../types";
 
 interface Props {
-  onOpenReport?: (date: string, runId: string, target: string) => void;
+  onScanStarted?: (taskId: string) => void;
 }
 
 const DOCTOR_COLOR: Record<string, string> = {
@@ -30,36 +23,19 @@ const WEEKDAY_LABELS: [number, string][] = [
   [7, "周日"],
 ];
 
-function formatElapsed(startIso: string | null, endIso: string | null): string {
-  if (!startIso) return "—";
-  const start = Date.parse(startIso);
-  const end = endIso ? Date.parse(endIso) : Date.now();
-  if (Number.isNaN(start) || Number.isNaN(end) || end < start) return "—";
-  const sec = Math.floor((end - start) / 1000);
-  if (sec < 60) return `${sec}s`;
-  const min = Math.floor(sec / 60);
-  const rem = sec % 60;
-  return min < 60 ? `${min}m ${rem}s` : `${Math.floor(min / 60)}h ${min % 60}m`;
-}
-
-export function ScansPage({ onOpenReport }: Props) {
+export function ConfigPage({ onScanStarted }: Props) {
   const [projects, setProjects] = useState<CatalogProject[]>([]);
   const [scanStatuses, setScanStatuses] = useState<string[]>(["在研"]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [deptFilter, setDeptFilter] = useState("");
+  const [query, setQuery] = useState("");
   const [fast, setFast] = useState(false);
   const [forceFull, setForceFull] = useState(false);
   const [resume, setResume] = useState(false);
   const [dryRun, setDryRun] = useState(true);
   const [summaryOnly, setSummaryOnly] = useState(false);
   const [snapshotAt, setSnapshotAt] = useState("");
-
-  // 实时进度与任务日志
-  const [progress, setProgress] = useState<LiveProgressResponse | null>(null);
-  const [tasks, setTasks] = useState<ScanTask[]>([]);
-  const [activeTask, setActiveTask] = useState<ScanTask | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [cancelling, setCancelling] = useState(false);
-  const logBoxRef = useRef<HTMLDivElement | null>(null);
 
   // 定时扫描配置
   const [schedMeta, setSchedMeta] = useState<ScheduleResponse | null>(null);
@@ -92,43 +68,17 @@ export function ScansPage({ onOpenReport }: Props) {
     setSchedScope(only.length > 0 ? "selected" : "all");
   };
 
-  const refreshProgress = async () => {
-    const prog = await api.scanProgress();
-    setProgress(prog);
-    setTasks(prog.tasks);
-    if (prog.running_task) {
-      setActiveTask((prev) =>
-        !prev || prev.task_id === prog.running_task!.task_id || prev.status !== "running"
-          ? prog.running_task
-          : prev
-      );
-    }
-    return prog;
-  };
-
   const loadAll = async () => {
     setError(null);
     try {
-      const [pRes, progRes, scRes] = await Promise.all([
-        api.projects(),
-        api.scanProgress(),
-        api.schedule(),
-      ]);
+      const [pRes, scRes] = await Promise.all([api.projects(), api.schedule()]);
       setProjects(pRes.projects);
       if (pRes.scan_statuses && pRes.scan_statuses.length > 0) {
         setScanStatuses(pRes.scan_statuses);
       }
-      setProgress(progRes);
-      setTasks(progRes.tasks);
       applyScheduleState(scRes);
-      if (progRes.running_task) {
-        setActiveTask(progRes.running_task);
-      } else if (!activeTask && progRes.tasks.length > 0) {
-        const detail = await api.scanDetail(progRes.tasks[0].task_id);
-        setActiveTask(detail);
-      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "加载项目、进度与定时配置失败");
+      setError(err instanceof Error ? err.message : "加载项目清单与定时配置失败");
     }
   };
 
@@ -136,32 +86,48 @@ export function ScansPage({ onOpenReport }: Props) {
     void loadAll();
   }, []);
 
-  // 动态轮询：有运行中任务或运行中批次时 2s 轮询，空闲时 10s 轮询（可感知 CLI 触发的批次）
-  const isBusy = Boolean(
-    activeTask?.status === "running" ||
-      progress?.running_task ||
-      (progress?.active_runs && progress.active_runs.length > 0)
+  const departments = useMemo(() => {
+    const s = new Set<string>();
+    for (const p of projects) s.add((p.department || "").trim() || "未分组");
+    return [...s].sort((a, b) => a.localeCompare(b, "zh-CN"));
+  }, [projects]);
+
+  const scannableProjects = useMemo(
+    () => projects.filter((p) => scanStatuses.includes((p.status || "").trim())),
+    [projects, scanStatuses]
   );
 
-  useEffect(() => {
-    const intervalMs = isBusy ? 2000 : 10000;
-    const timer = setInterval(() => {
-      refreshProgress().catch(() => {});
-      if (activeTask && activeTask.status === "running") {
-        api.scanDetail(activeTask.task_id).then(setActiveTask).catch(() => {});
+  const filteredProjects = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return projects.filter((p) => {
+      const dept = (p.department || "").trim() || "未分组";
+      if (deptFilter && dept !== deptFilter) return false;
+      if (
+        q &&
+        !`${p.project_id} ${p.project_name} ${dept} ${p.owner || ""} ${p.branch || ""} ${p.tech_stack || ""}`
+          .toLowerCase()
+          .includes(q)
+      ) {
+        return false;
       }
-    }, intervalMs);
-    return () => clearInterval(timer);
-  }, [isBusy, activeTask?.task_id, activeTask?.status]);
-
-  useEffect(() => {
-    if (activeTask?.status === "running" && logBoxRef.current) {
-      logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
-    }
-  }, [activeTask?.logs?.length]);
+      return true;
+    });
+  }, [projects, deptFilter, query]);
 
   const toggleId = (pid: string) => {
     setSelectedIds((prev) => (prev.includes(pid) ? prev.filter((x) => x !== pid) : [...prev, pid]));
+  };
+
+  const toggleSelectFiltered = () => {
+    const eligible = filteredProjects
+      .filter((p) => scanStatuses.includes((p.status || "").trim()))
+      .map((p) => p.project_id);
+    const allSelected = eligible.length > 0 && eligible.every((id) => selectedIds.includes(id));
+    if (allSelected) {
+      setSelectedIds((prev) => prev.filter((id) => !eligible.includes(id)));
+    } else {
+      setSelectedIds((prev) => [...new Set([...prev, ...eligible])]);
+    }
   };
 
   const toggleSchedDay = (day: number) => {
@@ -211,30 +177,11 @@ export function ScansPage({ onOpenReport }: Props) {
         summary_only: summaryOnly,
         snapshot_at: snapshotAt.trim() || undefined,
       });
-      const detail = await api.scanDetail(res.task_id);
-      setActiveTask(detail);
-      await refreshProgress();
+      if (onScanStarted) onScanStarted(res.task_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "触发扫描失败");
     } finally {
       setSubmitting(false);
-    }
-  };
-
-  const handleCancel = async (taskId?: string) => {
-    const id = taskId || activeTask?.task_id;
-    if (!id) return;
-    setCancelling(true);
-    setError(null);
-    try {
-      await api.cancelScan(id);
-      const detail = await api.scanDetail(id);
-      setActiveTask(detail);
-      await refreshProgress();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "中止任务失败");
-    } finally {
-      setCancelling(false);
     }
   };
 
@@ -251,85 +198,6 @@ export function ScansPage({ onOpenReport }: Props) {
     }
   };
 
-  const renderProgressBlock = (run: RunProgressItem, isRunning: boolean) => {
-    const fillClass = isRunning
-      ? "progress-fill"
-      : run.error_count > 0
-      ? "progress-fill warn"
-      : "progress-fill done";
-    return (
-      <div
-        key={`${run.date}/${run.run_id}`}
-        style={{
-          padding: 12,
-          borderRadius: 8,
-          border: "1px solid var(--border)",
-          background: "var(--bg-2)",
-          marginBottom: 8,
-        }}
-      >
-        <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span className="chip">
-              <span
-                className={`chip-dot ${isRunning ? "pulse" : ""}`}
-                style={{
-                  background: isRunning
-                    ? "var(--accent)"
-                    : run.error_count > 0
-                    ? "var(--warning)"
-                    : "var(--good)",
-                }}
-              />
-              {isRunning ? "扫描进行中" : run.status}
-            </span>
-            <b>
-              {run.date} / {run.run_id}
-            </b>
-            <span className="muted" style={{ fontSize: 12 }}>
-              {run.report_mode || "standard"} · 耗时 {formatElapsed(run.started_at, run.finished_at)}
-            </span>
-          </div>
-          <div style={{ fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>
-            {run.completed_count} / {run.total_count} 个项目（{run.percent}%）
-          </div>
-        </div>
-
-        <div className="progress-track">
-          <div className={fillClass} style={{ width: `${run.percent}%` }} />
-        </div>
-
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-          {run.completed_projects.map((p) => {
-            const ok = p.status === "ok";
-            return (
-              <span
-                key={p.project_id}
-                className="chip"
-                style={{ cursor: ok && onOpenReport ? "pointer" : "default" }}
-                title={ok ? "点击查看项目报告" : p.error || "扫描失败"}
-                onClick={() => ok && onOpenReport && onOpenReport(run.date, run.run_id, p.project_id)}
-              >
-                <span className="chip-dot" style={{ background: ok ? "var(--good)" : "var(--critical)" }} />
-                {p.project_name}
-                {ok && p.total != null ? ` (${p.total.toFixed(1)})` : ok ? " (完成)" : " (失败)"}
-              </span>
-            );
-          })}
-          {run.pending_projects.map((pid) => (
-            <span key={pid} className="chip" title="等待中或正在扫描">
-              <span className="chip-dot pulse" style={{ background: "var(--accent)" }} />
-              {pid} (进行中)
-            </span>
-          ))}
-        </div>
-      </div>
-    );
-  };
-
-  const scannableProjects = projects.filter((p) => scanStatuses.includes((p.status || "").trim()));
-  const runningTask = progress?.running_task;
-
   return (
     <div style={{ display: "grid", gap: 14 }}>
       {error && (
@@ -338,64 +206,7 @@ export function ScansPage({ onOpenReport }: Props) {
         </div>
       )}
 
-      {/* 1. 实时扫描进度面板（同时感知 Web、定时与 CLI 触发的批次） */}
-      <div className="card">
-        <div className="card-title">
-          <span>
-            实时扫描进度{" "}
-            {isBusy && (
-              <span className="sub" style={{ fontWeight: 400, marginLeft: 6 }}>
-                （每 2 秒自动刷新）
-              </span>
-            )}
-          </span>
-          <div style={{ display: "flex", gap: 8 }}>
-            {runningTask && (
-              <button
-                className="btn btn-danger"
-                onClick={() => void handleCancel(runningTask.task_id)}
-                disabled={cancelling}
-              >
-                <Square size={13} /> {cancelling ? "中止中…" : "中止当前任务"}
-              </button>
-            )}
-            <button className="btn" onClick={() => void refreshProgress()}>
-              <RefreshCw size={14} /> 刷新进度
-            </button>
-          </div>
-        </div>
-
-        {runningTask && (
-          <div className="sub" style={{ marginBottom: 10 }}>
-            运行中任务：<code>{runningTask.task_id}</code>（
-            {runningTask.trigger === "schedule" ? "定时触发" : "手动触发"}）
-            {runningTask.latest_log && (
-              <span style={{ marginLeft: 10 }}>
-                最新动态：<code>{runningTask.latest_log}</code>
-              </span>
-            )}
-          </div>
-        )}
-
-        {progress?.active_runs && progress.active_runs.length > 0 ? (
-          progress.active_runs.map((r) => renderProgressBlock(r, true))
-        ) : runningTask ? (
-          <div className="sub" style={{ padding: "8px 0" }}>
-            扫描进程已启动，正在初始化批次记录…
-          </div>
-        ) : progress?.latest_run ? (
-          <>
-            <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
-              当前无正在运行的批次，最近一次批次完成情况：
-            </div>
-            {renderProgressBlock(progress.latest_run, false)}
-          </>
-        ) : (
-          <div className="muted">当前无正在运行或历史扫描批次，可在下方手动触发或配置定时扫描。</div>
-        )}
-      </div>
-
-      {/* 2. 可视化定时扫描配置 */}
+      {/* 1. 可视化定时扫描配置 */}
       <div className="card">
         <div className="card-title">
           <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
@@ -507,7 +318,7 @@ export function ScansPage({ onOpenReport }: Props) {
         </div>
 
         {schedScope === "selected" && (
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+          <div style={{ maxHeight: 160, overflow: "auto", display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
             {scannableProjects.map((p) => (
               <label key={p.project_id} className="chip" style={{ cursor: "pointer" }}>
                 <input
@@ -536,10 +347,10 @@ export function ScansPage({ onOpenReport }: Props) {
         </div>
       </div>
 
-      {/* 3. 项目清单与手动触发 + 环境自检 */}
+      {/* 2. 项目清单与手动触发 + 环境自检 */}
       <div className="card">
         <div className="card-title">
-          <span>项目清单与手动触发扫描</span>
+          <span>项目清单与手动触发扫描（共 {projects.length} 项）</span>
           <div style={{ display: "flex", gap: 8 }}>
             <button className="btn" onClick={() => void handleDoctor()} disabled={checkingDoctor}>
               <Stethoscope size={14} /> {checkingDoctor ? "检查中…" : "环境自检"}
@@ -657,7 +468,36 @@ export function ScansPage({ onOpenReport }: Props) {
           </button>
         </div>
 
-        <div className="table-wrap">
+        {/* 清单筛选条 */}
+        <div className="filters">
+          <select value={deptFilter} onChange={(e) => setDeptFilter(e.target.value)}>
+            <option value="">全部部门 ({departments.length})</option>
+            {departments.map((d) => (
+              <option key={d} value={d}>
+                {d}
+              </option>
+            ))}
+          </select>
+          <input
+            placeholder="搜索项目 ID / 名称 / 负责人 / 分支 / 技术栈"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            style={{ minWidth: 260 }}
+          />
+          <button type="button" className="btn" onClick={toggleSelectFiltered}>
+            全选/取消当前筛选
+          </button>
+          {selectedIds.length > 0 && (
+            <button type="button" className="btn" onClick={() => setSelectedIds([])}>
+              清空已选 ({selectedIds.length})
+            </button>
+          )}
+          <span className="muted" style={{ fontSize: 12, marginLeft: "auto" }}>
+            显示 {filteredProjects.length} / {projects.length} 项
+          </span>
+        </div>
+
+        <div className="table-wrap" style={{ maxHeight: 540, overflowY: "auto" }}>
           <table>
             <thead>
               <tr>
@@ -672,7 +512,7 @@ export function ScansPage({ onOpenReport }: Props) {
               </tr>
             </thead>
             <tbody>
-              {projects.map((p) => {
+              {filteredProjects.map((p) => {
                 const scannable = scanStatuses.includes((p.status || "").trim());
                 return (
                   <tr key={p.project_id} style={{ opacity: scannable ? 1 : 0.6 }}>
@@ -697,7 +537,7 @@ export function ScansPage({ onOpenReport }: Props) {
                       {p.department || "—"} / {p.owner || "—"}
                     </td>
                     <td>{p.branch || "main"}</td>
-                    <td style={{ whiteSpace: "normal", maxWidth: 260 }}>{p.tech_stack || "—"}</td>
+                    <td style={{ whiteSpace: "normal", maxWidth: 240 }}>{p.tech_stack || "—"}</td>
                     <td>
                       <span className="chip">{p.status}</span>
                     </td>
@@ -709,65 +549,15 @@ export function ScansPage({ onOpenReport }: Props) {
                   </tr>
                 );
               })}
+              {filteredProjects.length === 0 && (
+                <tr>
+                  <td colSpan={8} className="muted" style={{ textAlign: "center", padding: 24 }}>
+                    没有符合筛选条件的项目
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
-        </div>
-      </div>
-
-      {/* 4. 任务记录与实时日志 */}
-      <div className="grid-sidebar">
-        <div className="card">
-          <div className="card-title">触发任务记录 ({tasks.length})</div>
-          {tasks.length === 0 ? (
-            <div className="muted">尚未由页面或定时任务触发过扫描</div>
-          ) : (
-            tasks.map((t) => (
-              <div
-                key={t.task_id}
-                className={`list-item ${activeTask?.task_id === t.task_id ? "active" : ""}`}
-                onClick={() => api.scanDetail(t.task_id).then(setActiveTask).catch(() => {})}
-              >
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <b>{t.task_id}</b>
-                  <span className="chip">{t.status}</span>
-                </div>
-                <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
-                  {t.trigger === "schedule" ? "定时触发" : "手动触发"} ·{" "}
-                  {t.started_at.slice(0, 19).replace("T", " ")}
-                </div>
-              </div>
-            ))
-          )}
-        </div>
-
-        <div className="card">
-          <div className="card-title">
-            <span>
-              实时日志{" "}
-              {activeTask
-                ? `· ${activeTask.task_id} (${activeTask.trigger === "schedule" ? "定时" : "手动"} / ${activeTask.status})`
-                : ""}
-            </span>
-            {activeTask?.status === "running" && (
-              <button className="btn btn-danger" onClick={() => void handleCancel()} disabled={cancelling}>
-                <Square size={13} /> {cancelling ? "中止中…" : "中止扫描"}
-              </button>
-            )}
-          </div>
-          {activeTask ? (
-            <>
-              <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
-                $ {activeTask.command}
-              </div>
-              <div className="log-box" ref={logBoxRef}>
-                {activeTask.logs && activeTask.logs.length > 0
-                  ? activeTask.logs.join("\n")
-                  : "等待输出…"}
-              </div>
-            </>
-          ) : (
-            <div className="muted">点击左侧任务查看运行日志，或点击上方按钮触发扫描。</div>
-          )}
         </div>
       </div>
     </div>

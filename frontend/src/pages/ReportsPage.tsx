@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Check, Download, Link2, Printer } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, Download, Link2, Printer } from "lucide-react";
 import { Marked, Renderer } from "marked";
 import { api } from "../api";
 import type { ReportResponse, RunDetailResponse, RunSummary } from "../types";
@@ -91,6 +91,7 @@ export function ReportsPage({ initialTarget, onTargetChange }: Props) {
 
   const [levelFilter, setLevelFilter] = useState("");
   const [issueQuery, setIssueQuery] = useState("");
+  const [projectSearch, setProjectSearch] = useState("");
   const [tab, setTab] = useState<"markdown" | "issues">("markdown");
 
   useEffect(() => {
@@ -153,6 +154,19 @@ export function ReportsPage({ initialTarget, onTargetChange }: Props) {
   }, [report?.issues, levelFilter, issueQuery]);
 
   const okProjects = (runDetail?.projects ?? []).filter((p) => p.status === "ok");
+  const visibleProjects = useMemo(() => {
+    const q = projectSearch.trim().toLowerCase();
+    if (!q) return okProjects;
+    return okProjects.filter((p) =>
+      `${p.project_name || ""} ${p.project_id} ${p.department || ""}`.toLowerCase().includes(q)
+    );
+  }, [okProjects, projectSearch]);
+
+  const targetOrder = useMemo(
+    () => ["_summary", ...visibleProjects.map((p) => p.project_id)],
+    [visibleProjects]
+  );
+  const currentIdx = targetOrder.indexOf(target);
 
   const handleCopyLink = () => {
     const url = window.location.href;
@@ -203,14 +217,42 @@ export function ReportsPage({ initialTarget, onTargetChange }: Props) {
             ))}
           </select>
 
-          <select value={target} onChange={(e) => setTarget(e.target.value)}>
+          <input
+            placeholder="筛选报告项目…"
+            value={projectSearch}
+            onChange={(e) => setProjectSearch(e.target.value)}
+            style={{ width: 150 }}
+          />
+
+          <select value={target} onChange={(e) => setTarget(e.target.value)} style={{ maxWidth: 280 }}>
             <option value="_summary">跨项目汇总报告 (_summary.md)</option>
-            {okProjects.map((p) => (
+            {visibleProjects.map((p) => (
               <option key={p.project_id} value={p.project_id}>
                 {p.project_name || p.project_id} ({p.project_id})
               </option>
             ))}
           </select>
+
+          <button
+            className="btn"
+            style={{ padding: "6px 8px" }}
+            disabled={currentIdx <= 0}
+            title="上一份报告"
+            onClick={() => currentIdx > 0 && setTarget(targetOrder[currentIdx - 1])}
+          >
+            <ChevronLeft size={14} />
+          </button>
+          <button
+            className="btn"
+            style={{ padding: "6px 8px" }}
+            disabled={currentIdx < 0 || currentIdx >= targetOrder.length - 1}
+            title="下一份报告"
+            onClick={() =>
+              currentIdx >= 0 && currentIdx < targetOrder.length - 1 && setTarget(targetOrder[currentIdx + 1])
+            }
+          >
+            <ChevronRight size={14} />
+          </button>
 
           <button className="btn" onClick={handleCopyLink} title="复制当前报告直达链接">
             {copied ? <Check size={14} /> : <Link2 size={14} />} {copied ? "已复制" : "复制链接"}

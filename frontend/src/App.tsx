@@ -1,20 +1,37 @@
 import { FormEvent, useEffect, useState } from "react";
-import { Activity, BarChart3, FileText, History, Lock, LogOut, Moon, RefreshCw, ShieldCheck, Sun } from "lucide-react";
+import {
+  Activity,
+  BarChart3,
+  FileText,
+  History,
+  Lock,
+  LogOut,
+  Moon,
+  RefreshCw,
+  Settings,
+  ShieldCheck,
+  Sun,
+} from "lucide-react";
 import { api, setUnauthorizedHandler } from "./api";
+import { ConfigPage } from "./pages/ConfigPage";
 import { DashboardPage } from "./pages/DashboardPage";
+import { ProgressPage } from "./pages/ProgressPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { RunsPage } from "./pages/RunsPage";
-import { ScansPage } from "./pages/ScansPage";
 import type { OverviewResponse } from "./types";
 
-type Page = "dashboard" | "runs" | "reports" | "scans";
+type Page = "dashboard" | "progress" | "runs" | "reports" | "config";
 type ReportTarget = { date: string; runId: string; target: string };
 
 function parseHash(): { page: Page; reportTarget: ReportTarget | null } {
   const raw = window.location.hash.replace(/^#\/?/, "");
   const [pathPart, queryPart] = raw.split("?");
-  const page: Page =
-    pathPart === "runs" || pathPart === "reports" || pathPart === "scans" ? pathPart : "dashboard";
+  let page: Page = "dashboard";
+  if (pathPart === "progress" || pathPart === "scans") page = "progress";
+  else if (pathPart === "runs") page = "runs";
+  else if (pathPart === "reports") page = "reports";
+  else if (pathPart === "config") page = "config";
+
   if (page === "reports" && queryPart) {
     const params = new URLSearchParams(queryPart);
     const date = params.get("date") || "";
@@ -54,6 +71,7 @@ export function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [reportTarget, setReportTarget] = useState<ReportTarget | null>(initial.reportTarget);
+  const [focusTaskId, setFocusTaskId] = useState<string | null>(null);
 
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? "dark" : "light";
@@ -155,6 +173,11 @@ export function App() {
     window.location.hash = buildHash(nextPage, nextPage === "reports" ? reportTarget : null);
   };
 
+  const handleScanStarted = (taskId: string) => {
+    setFocusTaskId(taskId);
+    navigate("progress");
+  };
+
   if (!authChecked) {
     return (
       <div className="app-shell" style={{ alignItems: "center", justifyContent: "center" }}>
@@ -221,6 +244,12 @@ export function App() {
               <BarChart3 size={15} /> 质量看板
             </button>
             <button
+              className={`nav-tab ${page === "progress" ? "active" : ""}`}
+              onClick={() => navigate("progress")}
+            >
+              <Activity size={15} /> 实时进度
+            </button>
+            <button
               className={`nav-tab ${page === "runs" ? "active" : ""}`}
               onClick={() => navigate("runs")}
             >
@@ -233,10 +262,10 @@ export function App() {
               <FileText size={15} /> 报告阅读
             </button>
             <button
-              className={`nav-tab ${page === "scans" ? "active" : ""}`}
-              onClick={() => navigate("scans")}
+              className={`nav-tab ${page === "config" ? "active" : ""}`}
+              onClick={() => navigate("config")}
             >
-              <Activity size={15} /> 扫描与配置
+              <Settings size={15} /> 扫描配置
             </button>
           </nav>
 
@@ -266,11 +295,20 @@ export function App() {
         {page === "dashboard" && (
           <DashboardPage data={overview} loading={loading} onOpenReport={openReport} />
         )}
-        {page === "runs" && <RunsPage onOpenReport={openReport} />}
+        {page === "progress" && (
+          <ProgressPage
+            initialTaskId={focusTaskId}
+            onOpenReport={openReport}
+            onScanStarted={handleScanStarted}
+          />
+        )}
+        {page === "runs" && (
+          <RunsPage onOpenReport={openReport} onScanStarted={handleScanStarted} />
+        )}
         {page === "reports" && (
           <ReportsPage initialTarget={reportTarget} onTargetChange={setReportTarget} />
         )}
-        {page === "scans" && <ScansPage onOpenReport={openReport} />}
+        {page === "config" && <ConfigPage onScanStarted={handleScanStarted} />}
       </main>
     </div>
   );

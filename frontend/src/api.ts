@@ -48,6 +48,11 @@ export const api = {
   runs: () => request<{ runs: RunSummary[] }>("/api/runs"),
   runDetail: (date: string, runId: string) =>
     request<RunDetailResponse>(`/api/runs/${encodeURIComponent(date)}/${encodeURIComponent(runId)}`),
+  markRunAborted: (date: string, runId: string) =>
+    request<{ ok: boolean; status: string }>(
+      `/api/runs/${encodeURIComponent(date)}/${encodeURIComponent(runId)}/mark-aborted`,
+      { method: "POST" }
+    ),
   report: (date: string, runId: string, target: string) =>
     request<ReportResponse>(
       `/api/reports/${encodeURIComponent(date)}/${encodeURIComponent(runId)}/${encodeURIComponent(target)}`

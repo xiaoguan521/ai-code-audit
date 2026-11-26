@@ -1,5 +1,11 @@
 import { useMemo, useState } from "react";
+import { Download } from "lucide-react";
 import type { OverviewResponse, ProjectRow } from "../types";
+
+function csvCell(v: string | number | null | undefined): string {
+  const s = String(v ?? "");
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
 
 interface Props {
   data: OverviewResponse | null;
@@ -24,6 +30,7 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
   const [search, setSearch] = useState("");
   const [sortKey, setSortKey] = useState<keyof ProjectRow>("total");
   const [sortAsc, setSortAsc] = useState(true);
+  const [viewMode, setViewMode] = useState<"projects" | "departments">("projects");
   const [tip, setTip] = useState<{ x: number; y: number; html: string } | null>(null);
 
   const rows = data?.rows ?? [];
@@ -65,6 +72,62 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
       secP0: sum("security_p0"),
     };
   }, [filtered]);
+
+  const deptSummary = useMemo(() => {
+    const map = new Map<string, ProjectRow[]>();
+    for (const r of rows) {
+      const key = (r.department || "").trim() || "未分组";
+      const list = map.get(key);
+      if (list) list.push(r);
+      else map.set(key, [r]);
+    }
+    return [...map.entries()]
+      .map(([department, list]) => {
+        const totals = list.map((x) => x.total).filter((v): v is number => v != null);
+        const secs = list.map((x) => x.security).filter((v): v is number => v != null);
+        return {
+          department,
+          count: list.length,
+          scored: totals.length,
+          avgTotal: totals.length ? totals.reduce((a, b) => a + b, 0) / totals.length : null,
+          avgSec: secs.length ? secs.reduce((a, b) => a + b, 0) / secs.length : null,
+          p0: list.reduce((a, x) => a + (x.P0 || 0), 0),
+          p1: list.reduce((a, x) => a + (x.P1 || 0), 0),
+          failed: list.filter((x) => x.status === "error").length,
+        };
+      })
+      .sort((a, b) => {
+        if (a.avgTotal == null && b.avgTotal == null) return b.count - a.count;
+        if (a.avgTotal == null) return 1;
+        if (b.avgTotal == null) return -1;
+        return a.avgTotal - b.avgTotal;
+      });
+  }, [rows]);
+
+  const handleExportCsv = () => {
+    const header = [
+      "项目ID", "项目名称", "部门", "负责人", "总评分", "较上次", "档位",
+      "安全评分", "覆盖率", "P0", "P1", "P2", "P3", "最近日期", "提交",
+    ];
+    const lines = [
+      header.join(","),
+      ...filtered.map((r) =>
+        [
+          r.project_id, r.project_name, r.department, r.owner,
+          r.total ?? "", r.delta_total ?? "", r.grade,
+          r.security ?? "", r.coverage != null ? `${Math.round(r.coverage * 100)}%` : "",
+          r.P0, r.P1, r.P2, r.P3, r.date || "", r.commit || "",
+        ].map(csvCell).join(",")
+      ),
+    ];
+    const blob = new Blob(["\ufeff" + lines.join("\n")], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `audit_dashboard_${data?.latest_run?.date || "latest"}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   const toggleSort = (k: keyof ProjectRow) => {
     if (sortKey === k) setSortAsc(!sortAsc);
@@ -225,12 +288,91 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
       </div>
 
       <div className="card">
-        <div className="card-title">
-          <span>项目质量排行（点击行查看报告）</span>
-          <span className="sub">共 {filtered.length} 个项目</span>
+        <div className="card-title" style={{ flexWrap: "wrap" }}>
+          <span>
+            {viewMode === "projects"
+              ? "项目质量排行（点击行查看报告）"
+              : "部门质量汇总（点击行下钻该项目列表）"}
+          </span>
+          <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+            <button
+              className={`btn ${viewMode === "projects" ? "btn-primary" : ""}`}
+              style={{ padding: "4px 10px", fontSize: 12 }}
+              onClick={() => setViewMode("projects")}
+            >
+              项目排行 ({filtered.length})
+            </button>
+            <button
+              className={`btn ${viewMode === "departments" ? "btn-primary" : ""}`}
+              style={{ padding: "4px 10px", fontSize: 12 }}
+              onClick={() => setViewMode("departments")}
+            >
+              按部门汇总 ({deptSummary.length})
+            </button>
+            <button
+              className="btn"
+              style={{ padding: "4px 10px", fontSize: 12 }}
+              onClick={handleExportCsv}
+              disabled={filtered.length === 0}
+            >
+              <Download size={13} /> 导出 CSV
+            </button>
+          </div>
         </div>
 
-        <div className="filters">
+        {viewMode === "departments" ? (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>部门</th>
+                  <th className="num">项目数</th>
+                  <th className="num">已评分</th>
+                  <th className="num">平均总评分</th>
+                  <th className="num">平均安全分</th>
+                  <th className="num">P0</th>
+                  <th className="num">P1</th>
+                  <th className="num">最近失败</th>
+                </tr>
+              </thead>
+              <tbody>
+                {deptSummary.map((d) => (
+                  <tr
+                    key={d.department}
+                    className="clickable"
+                    onClick={() => {
+                      setDept(d.department === "未分组" ? "" : d.department);
+                      setViewMode("projects");
+                    }}
+                  >
+                    <td>
+                      <b>{d.department}</b>
+                    </td>
+                    <td className="num">{d.count}</td>
+                    <td className="num">{d.scored}</td>
+                    <td className="num">
+                      <b>{fmt1(d.avgTotal)}</b>
+                    </td>
+                    <td className="num">
+                      <b>{fmt1(d.avgSec)}</b>
+                    </td>
+                    <td className="num" style={{ color: d.p0 > 0 ? "var(--critical)" : undefined }}>
+                      {d.p0}
+                    </td>
+                    <td className="num" style={{ color: d.p1 > 0 ? "var(--serious)" : undefined }}>
+                      {d.p1}
+                    </td>
+                    <td className="num" style={{ color: d.failed > 0 ? "var(--critical)" : undefined }}>
+                      {d.failed}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <>
+            <div className="filters">
           <select value={dept} onChange={(e) => setDept(e.target.value)}>
             <option value="">全部部门</option>
             {depts.map((d) => (
@@ -361,6 +503,8 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
             </tbody>
           </table>
         </div>
+          </>
+        )}
       </div>
 
       {tip && (
