@@ -27,21 +27,19 @@ function renderMarkdownWithToc(markdown: string): { html: string; toc: TocItem[]
   const toc: TocItem[] = [];
   const renderer = new Renderer();
   renderer.html = ({ text }) => escapeHtml(text);
-  const origLink = renderer.link.bind(renderer);
-  renderer.link = (token) => {
+  renderer.link = function (token) {
     const href = (token.href || "").trim();
     if (/^(javascript|vbscript|data):/i.test(href)) {
       return escapeHtml(token.text || href);
     }
-    return origLink(token);
+    return Renderer.prototype.link.call(this, token);
   };
-  const origImage = renderer.image.bind(renderer);
-  renderer.image = (token) => {
+  renderer.image = function (token) {
     const href = (token.href || "").trim();
     if (/^(javascript|vbscript|data):/i.test(href)) {
       return escapeHtml(token.text || href);
     }
-    return origImage(token);
+    return Renderer.prototype.image.call(this, token);
   };
   renderer.heading = function ({ tokens, depth, text }) {
     const inner = this.parser.parseInline(tokens);
@@ -52,9 +50,13 @@ function renderMarkdownWithToc(markdown: string): { html: string; toc: TocItem[]
     }
     return `<h${depth}>${inner}</h${depth}>\n`;
   };
-  const instance = new Marked({ gfm: true, breaks: false, renderer });
-  const html = instance.parse(markdown) as string;
-  return { html, toc };
+  try {
+    const instance = new Marked({ gfm: true, breaks: false, renderer });
+    const html = instance.parse(markdown) as string;
+    return { html, toc };
+  } catch {
+    return { html: `<pre>${escapeHtml(markdown)}</pre>`, toc: [] };
+  }
 }
 
 function downloadBlob(filename: string, content: string, mime: string) {
@@ -366,7 +368,19 @@ export function ReportsPage({ initialTarget, onTargetChange }: Props) {
               </aside>
             )}
             <div className="card">
-              <div className="markdown-body" dangerouslySetInnerHTML={{ __html: html }} />
+              <div
+                className="markdown-body"
+                dangerouslySetInnerHTML={{ __html: html }}
+                onClick={(e) => {
+                  const anchor = (e.target as HTMLElement).closest("a");
+                  const href = anchor?.getAttribute("href") || "";
+                  const m = href.match(/^([A-Za-z0-9._-]+)\.md$/);
+                  if (m) {
+                    e.preventDefault();
+                    setTarget(m[1]);
+                  }
+                }}
+              />
             </div>
           </div>
         )
