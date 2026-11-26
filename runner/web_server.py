@@ -31,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 import uuid
 from collections import deque
@@ -667,16 +668,17 @@ def _parse_markdown_report(md_path: Path, checklist: dict, weights: dict | None 
         for d in checklist["dimensions"]:
             did = str(d["id"])
             ov = overview.get(did)
+            ov_counts = ov.get("counts") if isinstance(ov, dict) else None
             dims_out.append({
                 "id": did,
                 "name": d["name"],
                 "score": ov["score"] if ov else None,
                 "coverage": (ov["coverage"] / 100.0) if ov and ov.get("coverage") is not None else None,
                 "counts": {
-                    "PASS": ov["counts"][0], "WARN": ov["counts"][1],
-                    "FAIL": ov["counts"][2], "N/A": ov["counts"][3],
-                    "NEED_INFO": ov["counts"][4],
-                } if ov else None,
+                    "PASS": ov_counts[0], "WARN": ov_counts[1],
+                    "FAIL": ov_counts[2], "N/A": ov_counts[3],
+                    "NEED_INFO": ov_counts[4],
+                } if isinstance(ov_counts, list) and len(ov_counts) == 5 else None,
                 "top_risk": "-",
             })
 
@@ -1235,6 +1237,16 @@ class AuditHandler(BaseHTTPRequestHandler):
         self._send_json(204, {})
 
     def do_GET(self) -> None:
+        try:
+            self._handle_get()
+        except Exception as exc:  # noqa: BLE001
+            traceback.print_exc()
+            try:
+                self._send_json(500, {"error": f"服务器内部错误：{type(exc).__name__}: {exc}"})
+            except OSError:
+                pass
+
+    def _handle_get(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         output_dir: Path = self.cfg["output_dir"]
@@ -1392,6 +1404,16 @@ class AuditHandler(BaseHTTPRequestHandler):
         return self._send_json(404, {"error": "Not Found"})
 
     def do_POST(self) -> None:
+        try:
+            self._handle_post()
+        except Exception as exc:  # noqa: BLE001
+            traceback.print_exc()
+            try:
+                self._send_json(500, {"error": f"服务器内部错误：{type(exc).__name__}: {exc}"})
+            except OSError:
+                pass
+
+    def _handle_post(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 

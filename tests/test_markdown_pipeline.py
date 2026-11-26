@@ -377,6 +377,12 @@ class LenientValidationTest(unittest.TestCase):
         self.assertEqual(rec["report_scores"]["total"], 6.8)
         self.assertEqual(rec["report_scores"]["security_score"], 6.0)
         self.assertTrue(Path(rec["report_path"]).is_file())
+        # 验证 web_server 解析无计数列的精简总览报告不会触发 TypeError
+        import web_server
+        parsed = web_server._parse_markdown_report(Path(rec["report_path"]), self.checklist)
+        self.assertEqual(len(parsed["dimensions"]), 8)
+        self.assertEqual(parsed["dimensions"][0]["score"], 7.5)
+        self.assertIsNone(parsed["dimensions"][0]["counts"])
 
     def test_combined_item_id_and_bullet_list_items_parse_cleanly(self):
         lines = ["# 项目审查", "", "## 详细评估", "| 检查项 | 结果 | 风险 | 说明 |", "|---|---|---|---|"]
