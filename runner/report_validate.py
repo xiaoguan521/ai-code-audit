@@ -62,12 +62,40 @@ DIMENSION_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+OUTER_FENCE_OPEN_RE = re.compile(r"^```(?:markdown|md|txt)?[ \t]*$", re.IGNORECASE)
+
+
+def unwrap_outer_markdown_fence(text: str) -> str:
+    """若整份报告被最外层 ```markdown ... ``` 包裹，剥离外层围栏以便正常解析标题与表格。"""
+    stripped = text.strip()
+    lines = stripped.splitlines()
+    if len(lines) < 3:
+        return text
+    if not OUTER_FENCE_OPEN_RE.match(lines[0].strip()) or lines[-1].strip() != "```":
+        return text
+    inner_lines = lines[1:-1]
+    depth = 0
+    for line in inner_lines:
+        s = line.strip()
+        if s.startswith("```"):
+            if depth == 0 and s == "```":
+                return text
+            depth = 0 if (depth > 0 and s == "```") else depth + 1
+    if depth != 0:
+        return text
+    inner = "\n".join(inner_lines)
+    if re.search(r"^#{1,3}\s+", inner, re.M) or "|" in inner:
+        return inner.strip() + "\n"
+    return text
+
+
 def _strip_md(cell: str) -> str:
     return re.sub(r"[*`_]", "", cell).strip()
 
 
 def _sections(text: str) -> list[tuple[str, list[str]]]:
-    """按二级标题切分（忽略代码块内部）；返回 [(标题, 行列表)]。"""
+    """按二级标题切分（忽略代码块内部；先剥离整篇外层 markdown 围栏）；返回 [(标题, 行列表)]。"""
+    text = unwrap_outer_markdown_fence(text)
     sections: list[tuple[str, list[str]]] = []
     current: tuple[str, list[str]] | None = None
     in_fence = False
@@ -350,7 +378,7 @@ def _parse_overview(text: str) -> tuple[dict[str, dict], list[str]]:
     dim_col = next((i for i, h in enumerate(norm_header) if "维度" in h), 0)
     weight_cols = {i for i, h in enumerate(norm_header) if "权重" in h}
     score_col = next(
-        (i for i, h in enumerate(norm_header) if i != dim_col and any(k in h for k in ("得分", "评分", "分数"))),
+        (i for i, h in enumerate(norm_header) if i != dim_col and any(k in h for k in ("得分", "评分", "分数", "维度分"))),
         None,
     )
     if score_col is None:
@@ -403,6 +431,9 @@ def _parse_overview(text: str) -> tuple[dict[str, dict], list[str]]:
         else:
             number = re.search(r"\d+(?:\.\d+)?", score_cell)
             score = float(number.group(0)) if number else None
+            if score is not None and 10.0 < score <= 100.0:
+                # 兼容偶发 100 分制输出（如 69 / 83 / 25），自动归一为 10 分制
+                score = round(score / 10.0, 1)
             if score is None:
                 problems.append(f"维度 {dim} 的得分无法识别")
 
@@ -509,6 +540,7 @@ def summarize_scores(scores: dict) -> dict:
 def validate_report(text: str, repo: Path, checklist: dict, weights: dict,
                     report_mode: str) -> dict:
     """校验报告原文；返回 {"problems": [...], "scores": {...}|None}。"""
+    text = unwrap_outer_markdown_fence(text)
     problems: list[str] = []
     items, item_problems = _parse_items(text)
     problems.extend(item_problems)

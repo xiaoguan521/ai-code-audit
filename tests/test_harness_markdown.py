@@ -233,6 +233,35 @@ class HarnessAdapterTest(unittest.TestCase):
             self.assertIsNone(harness._configured_model({}, "docker", {
                 "OPENAI_BASE_URL": "http://not-passed/v1", "OPENAI_MODEL": "not-passed"}))
 
+    def test_unwraps_outer_markdown_fence_and_recovers_earlier_full_report(self):
+        full_body = (
+            "# indicatordisplay 八性代码质量审查报告\n\n"
+            "## 评分总览\n\n"
+            "| 维度 | 维度分 |\n|---|---|\n| 1 功能适合性 | 69 |\n| 6 安全性 | 25 |\n\n"
+            "## 分维度检查结果\n\n"
+            "| # | 检查项 | 结果 | 等级 | 结论 |\n|---|---|---|---|---|\n"
+            + "\n".join(f"| 1.{i} | 检查项{i} | PASS | - | 正常通过检查说明文字示例 |" for i in range(1, 25))
+            + "\n"
+        )
+        fenced = f"```markdown\n{full_body}```\n"
+        self.assertEqual(harness.unwrap_outer_markdown_fence(fenced).strip(), full_body.strip())
+
+        two_blocks = "```python\nx = 1\n```\n正文\n```python\ny = 2\n```"
+        self.assertEqual(harness.unwrap_outer_markdown_fence(two_blocks), two_blocks)
+
+        stdout = "\n".join([
+            json.dumps({"type": "assistant_message", "role": "assistant", "text": fenced}),
+            json.dumps({"type": "final", "reason": {"kind": "completed"},
+                        "text": "审查已全部完成，报告已在上一条完整输出。总分 5.4。"}),
+        ]) + "\n"
+        completed = subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+        with mock.patch.object(harness.subprocess, "run", return_value=completed):
+            out = harness.run("audit", Path("."), Path("."), {
+                "agent": {"launcher": "local", "command": ["dsh"]},
+            }, 30)
+        self.assertIn("## 评分总览", out["raw_text"])
+        self.assertNotIn("```markdown", out["raw_text"])
+
 
 class IntegrationContractTest(unittest.TestCase):
     def test_harness_cannot_enable_runner_dimension_split(self):

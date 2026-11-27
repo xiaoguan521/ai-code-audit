@@ -39,6 +39,57 @@ class SummaryTest(unittest.TestCase):
                 out = summary.generate_batch(records, root, settings, "run")
             self.assertEqual(out["status"], "completed")
             self.assertIn("报告日期 2026-11-23", out["text"])
+            self.assertIn("# 代码检查分析报告汇总", out["text"])
+            self.assertIn("## 一、总体概览", out["text"])
+            self.assertIn("## 二、板块维度汇总", out["text"])
+            self.assertIn("## 三、风险问题清单专项", out["text"])
+            self.assertIn("## 六、各项目代码检查结果明细", out["text"])
+
+    def test_structured_word_template_aggregation_with_departments_and_issues(self):
+        import scoring
+        from report_fixture import readable_report
+        ck = scoring.load_checklist()
+        results = {item["id"]: ("PASS", "none", [("src/a.py", 1)]) for item in ck["items"]}
+        results["6.4"] = ("FAIL", "P0", [("src/a.py", 10)])
+        results["3.1"] = ("WARN", "P1", [("src/a.py", 20)])
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            r1 = root / "p1.md"
+            r1.write_text(readable_report(ck, results, report_mode="fast"), encoding="utf-8")
+            records = [
+                {
+                    "project_id": "p1",
+                    "project_name": "数据应用工具研发项目 / indicatordisplay",
+                    "department": "技术研发",
+                    "owner": "张三",
+                    "report_mode": "fast",
+                    "scan_type": "full",
+                    "status": "ok",
+                    "report_path": str(r1),
+                },
+                {
+                    "project_id": "p2",
+                    "project_name": "数据应用工具研发项目 / sxhx-pc",
+                    "department": "技术研发",
+                    "owner": "李四",
+                    "status": "error",
+                },
+            ]
+            out = summary.generate_batch(records, root, {"summary": {"enabled": False}}, "run-1")
+            text = out["text"]
+            self.assertEqual(out["status"], "disabled")
+            self.assertIn("### 1.1 评分总览", text)
+            self.assertIn("### 1.2 风险问题清单（等级分布）", text)
+            self.assertIn("### 1.3 八个质量维度横向评分（均值）", text)
+            self.assertIn("### 2.1 各板块质量八性维度评分对比", text)
+            self.assertIn("### 3.1 全局共性问题 TOP 10", text)
+            self.assertIn("### 3.2 P0 致命问题高发报告（前 15）", text)
+            self.assertIn("## 四、八个质量维度深度分析", text)
+            self.assertIn("## 五、总结与整改建议", text)
+            self.assertIn("### 5.2 四级整改路线图", text)
+            self.assertIn("### 【技术研发】", text)
+            self.assertIn("#### ├─ 项目：数据应用工具研发项目-张三", text)
+            self.assertIn("[indicatordisplay](p1.md)", text)
 
 
 if __name__ == "__main__":

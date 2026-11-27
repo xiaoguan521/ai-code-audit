@@ -680,8 +680,9 @@ def build_prompt(p: dict, commit: str, settings: dict, scan_type: str,
         "按 Skill 的评分规则计算；自行使用只读计算工具辅助算术并核对，不修改项目代码。",
         "完成前在当前会话自行核对覆盖、结论及分数；发现错误只补查并修正对应部分，不要重新审查整个项目。",
         "请保持关键二级标题与模板一致（`## 评分总览`、`## 风险问题清单`、`## 分维度检查结果`），"
-        "风险等级统一使用 `P0`/`P1`/`P2`/`P3`（无风险留空或写 `-`），以便自动核算得分与展示。",
-        "直接返回完整 Markdown 报告，不写入文件。",
+        "风险等级统一使用 `P0`/`P1`/`P2`/`P3`（无风险留空或写 `-`），所有维度分与总分统一使用 10 分制（0–10）。",
+        "最后一条回复必须直接输出完整 Markdown 报告正文：禁止用 ```markdown 代码块包裹全文，"
+        "也禁止在输出完报告后再补发“报告已完成/已在上一条输出”等简短确认消息，不写入文件。",
     ])
     if fast:
         lines.append("本次是快速巡检：不生成逐项证据、文件路径行号、代码片段或证据表；"
@@ -1102,6 +1103,7 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
             raw = out.get("raw_text")
             if not isinstance(raw, str) or not raw.strip():
                 raise AgentCallError("Harness 没有返回报告", agent_status="failed")
+            raw = report_validate.unwrap_outer_markdown_fence(raw)
             # 落盘前最小机器校验：解析报告表格、重算分数、核验 WARN/FAIL 证据路径存在性。
             # validation_mode="lenient"（默认）：只要解析出 >= 16 个检查项或 >= 4 个总览维度即允许落盘，
             # 格式/自洽性偏差记为非阻塞告警（report_validation.problems）；

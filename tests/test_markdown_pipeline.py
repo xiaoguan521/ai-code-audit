@@ -399,6 +399,37 @@ class LenientValidationTest(unittest.TestCase):
         self.assertEqual(rec["report_validation"]["items_count"], 64)
         self.assertIsNotNone(rec["report_scores"]["total"])
 
+    def test_outer_markdown_fence_and_100_scale_overview_lands_cleanly(self):
+        """复现 indicatordisplay 截图：整份报告被 ```markdown 包裹且总览用 100 分制“维度分”列。"""
+        fenced_report = "\n".join([
+            "```markdown",
+            "# indicatordisplay 八性代码质量审查报告",
+            "",
+            "## 评分总览",
+            "",
+            "| 维度 | 维度分 |",
+            "|---|---|",
+            "| 1 功能适合性 | 69 |",
+            "| 2 性能效率 | 69 |",
+            "| 3 可靠性 | 60 |",
+            "| 4 稳定性 | 67 |",
+            "| 5 易用性 | 83 |",
+            "| 6 安全性 | 25 |",
+            "| 7 兼容性 | 70 |",
+            "| 8 可维护性 | 60 |",
+            "```",
+            "",
+        ])
+        response = {"raw_text": fenced_report, "event_log": [], "session_id": "s4"}
+        with mock.patch.object(run_daily, "sync_repo", return_value="c" * 40), \
+             mock.patch.object(run_daily, "call_agent", return_value=response):
+            rec = run_daily.scan_project(self.project, self.settings, "2026-11-27", self.args)
+        self.assertEqual(rec["status"], "ok")
+        self.assertEqual(rec["report_validation"]["overview_count"], 8)
+        self.assertEqual(rec["report_scores"]["security_score"], 2.5)
+        self.assertIsNotNone(rec["report_scores"]["total"])
+        self.assertTrue(5.5 <= rec["report_scores"]["total"] <= 6.5)
+
 
 if __name__ == "__main__":
     unittest.main()

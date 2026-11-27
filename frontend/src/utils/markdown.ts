@@ -25,7 +25,28 @@ export function escapeHtml(raw: string): string {
   });
 }
 
+export function unwrapOuterMarkdownFence(markdown: string): string {
+  const lines = markdown.trim().split(/\r?\n/);
+  if (lines.length < 3) return markdown;
+  if (!/^```(?:markdown|md|txt)?[ \t]*$/i.test(lines[0].trim()) || lines[lines.length - 1].trim() !== "```") {
+    return markdown;
+  }
+  const innerLines = lines.slice(1, -1);
+  let depth = 0;
+  for (const line of innerLines) {
+    const s = line.trim();
+    if (s.startsWith("```")) {
+      if (depth === 0 && s === "```") return markdown;
+      depth = depth > 0 && s === "```" ? 0 : depth + 1;
+    }
+  }
+  if (depth !== 0) return markdown;
+  const inner = innerLines.join("\n");
+  return /^#{1,3}\s+/m.test(inner) || inner.includes("|") ? inner : markdown;
+}
+
 export function renderMarkdownWithToc(markdown: string): { html: string; toc: TocItem[] } {
+  const source = unwrapOuterMarkdownFence(markdown);
   const toc: TocItem[] = [];
   const renderer = new Renderer();
   renderer.html = ({ text }) => escapeHtml(text);
@@ -54,10 +75,10 @@ export function renderMarkdownWithToc(markdown: string): { html: string; toc: To
   };
   try {
     const instance = new Marked({ gfm: true, breaks: false, renderer });
-    const html = instance.parse(markdown) as string;
+    const html = instance.parse(source) as string;
     return { html, toc };
   } catch {
-    return { html: `<pre>${escapeHtml(markdown)}</pre>`, toc: [] };
+    return { html: `<pre>${escapeHtml(source)}</pre>`, toc: [] };
   }
 }
 

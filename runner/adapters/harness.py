@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -23,6 +24,98 @@ DEFAULT_COMMAND = [
 DEFAULT_SUCCESS_REASONS = {"completed", "success", "done", "stop", "end_turn", "finish"}
 DEFAULT_FAILURE_REASONS = {"error", "failed", "failure", "timeout", "cancelled", "aborted"}
 FINAL_TYPES = {"final", "final_answer", "result", "done", "complete"}
+IGNORED_EVENT_TYPES = {
+    "tool_call", "tool_result", "tool_execution_start", "tool_execution_end",
+    "tool_use", "tool_output", "user", "user_message", "system", "status",
+    "heartbeat", "thinking", "reasoning", "thought", "turn_start", "turn_end",
+}
+DELTA_EVENT_TYPES = {
+    "delta", "text_delta", "content_delta", "assistant_delta", "message_delta",
+    "output_delta", "chunk",
+}
+OUTER_FENCE_OPEN_RE = re.compile(r"^```(?:markdown|md|txt)?[ \t]*$", re.IGNORECASE)
+
+
+def unwrap_outer_markdown_fence(text: str) -> str:
+    """若整份报告被最外层 ```markdown ... ``` 包裹，安全剥离外层围栏。"""
+    stripped = text.strip()
+    lines = stripped.splitlines()
+    if len(lines) < 3:
+        return text
+    if not OUTER_FENCE_OPEN_RE.match(lines[0].strip()) or lines[-1].strip() != "```":
+        return text
+    inner_lines = lines[1:-1]
+    # 确认开头的围栏没有在文末之前提前闭合（即内部围栏成对出现且不在中途降回 0 层）。
+    depth = 0
+    for line in inner_lines:
+        s = line.strip()
+        if s.startswith("```"):
+            if depth == 0 and s == "```":
+                # 说明首行围栏在此处就闭合了，正文包含多段代码块而非整篇被包在围栏里
+                return text
+            depth = 0 if (depth > 0 and s == "```") else depth + 1
+    if depth != 0:
+        return text
+    inner = "\n".join(inner_lines)
+    if re.search(r"^#{1,3}\s+", inner, re.M) or "|" in inner:
+        return inner.strip() + "\n"
+    return text
+
+
+def _looks_like_full_report(text: str) -> bool:
+    if len(text) < 800:
+        return False
+    has_heading = bool(re.search(r"^#{1,3}\s+", text, re.M))
+    has_table = bool(re.search(r"^\|.+\|$", text, re.M))
+    return has_heading and has_table
+
+
+def _recover_report_from_events(events: list[dict], final_answer: str) -> str:
+    """当 final 事件仅输出“报告已在上一条输出/报告已完成”等简短确认语时，从前序助手事件找回完整报告。"""
+    cleaned_final = unwrap_outer_markdown_fence(final_answer)
+    if _looks_like_full_report(cleaned_final):
+        return cleaned_final
+
+    candidates: list[str] = []
+    delta_buf: list[str] = []
+
+    def flush_delta() -> None:
+        if delta_buf:
+            joined = "".join(delta_buf).strip()
+            if joined:
+                candidates.append(joined)
+            delta_buf.clear()
+
+    for event in events:
+        if _is_final(event):
+            flush_delta()
+            continue
+        kind = str(event.get("type") or event.get("event") or "").lower()
+        role = str(event.get("role") or (event.get("message") or {}).get("role") or "").lower() \
+            if isinstance(event.get("message"), dict) else str(event.get("role") or "").lower()
+        if kind in IGNORED_EVENT_TYPES or role in {"user", "system", "tool"}:
+            flush_delta()
+            continue
+        if kind in DELTA_EVENT_TYPES:
+            piece = event.get("delta") or event.get("text") or event.get("content")
+            if isinstance(piece, str):
+                delta_buf.append(piece)
+            elif isinstance(piece, dict):
+                sub = piece.get("text") or piece.get("content")
+                if isinstance(sub, str):
+                    delta_buf.append(sub)
+            continue
+        flush_delta()
+        text = _answer(event)
+        if text:
+            candidates.append(text)
+    flush_delta()
+
+    for raw_candidate in reversed(candidates):
+        unwrapped = unwrap_outer_markdown_fence(raw_candidate)
+        if _looks_like_full_report(unwrapped) and len(unwrapped) >= max(1000, len(cleaned_final) * 2):
+            return unwrapped
+    return cleaned_final
 
 
 class HarnessError(RuntimeError):
@@ -349,6 +442,7 @@ def run(prompt: str, repo, ctx, settings: dict, timeout: int) -> dict:
     answer = _answer(final)
     if not answer:
         raise HarnessError("Harness 最终事件没有 Markdown 答案", "failed", stats)
+    answer = _recover_report_from_events(events, answer)
     session_id = final.get("session_id") or final.get("sessionId")
     model = _configured_model(agent, launcher, env)
     return {
