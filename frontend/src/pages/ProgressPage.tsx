@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, ChevronDown, ChevronRight, Download, RefreshCw, RotateCcw, Square } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight, Download, Pause, Play, RefreshCw, RotateCcw, Square } from "lucide-react";
 import { api } from "../api";
 import { DraftModal } from "../components/DraftModal";
 import type {
@@ -276,6 +276,23 @@ export function ProgressPage({ currentUser, initialTaskId, onOpenReport, onScanS
       await api.downloadReportDocx(date, runId, "_summary", true);
     } catch (err) {
       setError(err instanceof Error ? err.message : "导出 Word 汇总失败");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleTogglePause = async (currentlyPaused: boolean) => {
+    setActionBusy(true);
+    setError(null);
+    try {
+      if (currentlyPaused) {
+        await api.resumeScan();
+      } else {
+        await api.pauseScan("页面手动暂停（避峰）");
+      }
+      await refreshProgress();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "切换暂停状态失败");
     } finally {
       setActionBusy(false);
     }
@@ -899,12 +916,50 @@ export function ProgressPage({ currentUser, initialTaskId, onOpenReport, onScanS
   };
 
   const runningTask = progress?.running_task;
+  const pauseState = progress?.pause_state;
+  const isPaused = Boolean(pauseState?.paused);
 
   return (
     <div style={{ display: "grid", gap: 14 }}>
       {error && (
         <div className="card" style={{ borderColor: "var(--critical)", color: "var(--critical)" }}>
           {error}
+        </div>
+      )}
+
+      {isPaused && (
+        <div
+          className="card"
+          style={{
+            borderColor: "var(--warning)",
+            background: "rgba(245, 158, 11, 0.08)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            flexWrap: "wrap",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Pause size={16} style={{ color: "var(--warning)" }} />
+            <div>
+              <b style={{ color: "var(--warning)" }}>扫描队列已暂停</b>
+              <span className="sub" style={{ marginLeft: 8 }}>
+                {pauseState?.paused_at ? `暂停于 ${pauseState.paused_at.replace("T", " ")}` : ""}
+                {pauseState?.paused_by ? `（操作人：${pauseState.paused_by}）` : ""}
+                {" · "}当前运行中的项目完成后将自动挂起剩余队列，暂停期间不扣批次总时限。
+              </span>
+            </div>
+          </div>
+          {isAdmin && (
+            <button
+              className="btn btn-primary"
+              disabled={actionBusy}
+              onClick={() => void handleTogglePause(true)}
+            >
+              <Play size={14} /> 继续扫描
+            </button>
+          )}
         </div>
       )}
 
@@ -919,7 +974,26 @@ export function ProgressPage({ currentUser, initialTaskId, onOpenReport, onScanS
               </span>
             )}
           </span>
-          <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {isAdmin && (
+              <button
+                className={isPaused ? "btn btn-primary" : "btn"}
+                style={!isPaused ? { borderColor: "var(--warning)", color: "var(--warning)" } : undefined}
+                disabled={actionBusy}
+                title={isPaused ? "恢复挂起的扫描队列" : "优雅暂停：运行中项目完成后挂起剩余队列，不扣批次时限"}
+                onClick={() => void handleTogglePause(isPaused)}
+              >
+                {isPaused ? (
+                  <>
+                    <Play size={13} /> 继续扫描
+                  </>
+                ) : (
+                  <>
+                    <Pause size={13} /> 暂停扫描
+                  </>
+                )}
+              </button>
+            )}
             {runningTask && (
               <button
                 className="btn btn-danger"

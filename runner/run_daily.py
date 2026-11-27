@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import code_map  # noqa: E402
 import facts  # noqa: E402
 import incremental  # noqa: E402
+import platform_db  # noqa: E402
 import report_validate  # noqa: E402
 import scoring  # noqa: E402
 from adapters import harness as harness_adapter  # noqa: E402
@@ -928,6 +929,7 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
     if snapshot_at is not None:
         rec["snapshot_at"] = snapshot_text(snapshot_at)
     try:
+        _wait_while_paused(output, settings, pid)
         with project_lock(settings, pid):
             repo = work / "repo"
             with git_sync_lock(settings):
@@ -1111,6 +1113,12 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
             )
             log(f"{pid}: scan_type={scan_type}，report_mode={report_mode}，"
                 f"scale={project_scale}(files={indexed_files}, loc={cloc_loc})，timeout={project_timeout}s")
+            try:
+                code_stats = platform_db.collect_repo_metrics(repo, ctx / "prescan" / "cloc.json")
+                rec["code_stats"] = code_stats
+            except Exception:
+                code_stats = None
+            _wait_while_paused(output, settings, pid)
             log(f"{pid}: 等待模型并发名额")
             session_settings = dict(settings, _progress_callback=progress_logger(pid))
             with measure(metrics["stages_seconds"], "model"):
@@ -1204,6 +1212,7 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
                      "weights": p.get("weights") or "", "materials_hash": materials_hash,
                      "model": out.get("agent_model"),
                      "scores": rec.get("report_scores"),
+                     "code_stats": rec.get("code_stats"),
                      "last_full_date": last_full_date, "incremental_streak": incremental_streak}
             rec["incremental_streak"] = incremental_streak
             rec["last_full_date"] = last_full_date
@@ -1222,6 +1231,32 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
     finally:
         metrics["total_seconds"] = round(time.perf_counter() - started, 4)
     return rec
+
+
+def _pause_flag_path(outdir: Path) -> Path:
+    return outdir / "state" / "pause.flag"
+
+
+def _is_paused(outdir: Path) -> bool:
+    return _pause_flag_path(outdir).is_file()
+
+
+def _wait_while_paused(outdir: Path, settings: dict, label: str = "") -> None:
+    """优雅暂停检查点：若存在 pause.flag 则挂起等待手动继续，期间不占模型名额、不计入批次总时限。"""
+    if not _is_paused(outdir):
+        return
+    poll = max(0.05, min(2.0, float(settings.get("_pause_poll_sec", 1.5))))
+    logged = False
+    while _is_paused(outdir):
+        _check_abort(settings)
+        if not logged:
+            prefix = f"{label}: " if label else ""
+            log(f"{prefix}扫描已暂停，挂起等待手动继续…")
+            logged = True
+        time.sleep(poll)
+    if logged:
+        prefix = f"{label}: " if label else ""
+        log(f"{prefix}收到继续信号，恢复扫描")
 
 
 def _check_abort(settings: dict) -> None:
@@ -1459,8 +1494,36 @@ def main() -> int:
         executor = DaemonThreadPoolExecutor(max_workers=parallel)
         scheduled_projects = _order_projects_lpt(projects, outdir)
         jobs = {executor.submit(scan_project, p, settings, run_date, args, snapshot_at): p for p in scheduled_projects}
-        try:
-            for job in cf.as_completed(jobs, timeout=batch_timeout):
+        pending_jobs = set(jobs.keys())
+        active_elapsed = 0.0
+        last_tick = time.monotonic()
+        last_paused = False
+        poll_interval = max(0.05, min(2.0, float(settings.get("_pause_poll_sec", 1.5))))
+        while pending_jobs:
+            paused_now = _is_paused(outdir)
+            now_mono = time.monotonic()
+            if not paused_now and not last_paused:
+                active_elapsed += (now_mono - last_tick)
+            last_tick = now_mono
+            if paused_now != last_paused:
+                last_paused = paused_now
+                progress["paused"] = paused_now
+                write_json_atomic(runlog, progress, mode=0o600)
+                log("批次已进入暂停状态（当前运行中项目完成后将挂起队列，不计入批次总时限）" if paused_now else "批次已恢复执行")
+            if not paused_now and active_elapsed >= batch_timeout:
+                batch_timed_out = True
+                abort_event.set()
+                log(f"批次总时限到（{batch_timeout} 秒），未完成项目记为失败，不再等待")
+                for p in projects:
+                    if p["project_id"] not in completed:
+                        completed[p["project_id"]] = {"project_id": p["project_id"],
+                                                      "project_name": p.get("project_name", ""),
+                                                      "status": "error", "error": "批次总时限到"}
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+            wait_sec = poll_interval if paused_now else min(poll_interval, max(0.05, batch_timeout - active_elapsed))
+            done, pending_jobs = cf.wait(pending_jobs, timeout=wait_sec, return_when=cf.FIRST_COMPLETED)
+            for job in done:
                 p = jobs[job]
                 try:
                     rec = job.result()
@@ -1472,18 +1535,9 @@ def main() -> int:
                 progress["projects"] = [completed[pid] for pid in ids if pid in completed]
                 progress["pending_projects"] = [pid for pid in ids if pid not in completed]
                 write_json_atomic(runlog, progress, mode=0o600)
-        except TimeoutError:
-            batch_timed_out = True
-            abort_event.set()
-            log(f"批次总时限到（{batch_timeout} 秒），未完成项目记为失败，不再等待")
-            for p in projects:
-                if p["project_id"] not in completed:
-                    completed[p["project_id"]] = {"project_id": p["project_id"],
-                                                  "project_name": p.get("project_name", ""),
-                                                  "status": "error", "error": "批次总时限到"}
-            executor.shutdown(wait=False, cancel_futures=True)
         else:
             executor.shutdown(wait=True)
+        progress["paused"] = False
         progress["projects"] = [completed[pid] for pid in ids if pid in completed]
         progress["pending_projects"] = [pid for pid in ids if pid not in completed]
         write_json_atomic(runlog, progress, mode=0o600)

@@ -5,14 +5,17 @@
 from __future__ import annotations
 
 import contextlib
+import csv
 import datetime as dt
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
 import secrets
 import sqlite3
+import subprocess
 import threading
 from pathlib import Path
 
@@ -21,6 +24,35 @@ EMAIL_NOTIFY_MODES = ("batch", "risk_only", "off")
 SESSION_TTL_SEC = 24 * 3600
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{2,64}$")
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+VALID_PROJECT_STATUSES = ("在研", "停用", "归档")
+PROJECT_CSV_FIELDS = (
+    "project_id",
+    "project_name",
+    "department",
+    "owner",
+    "git_url",
+    "branch",
+    "status",
+    "tech_stack",
+    "project_type",
+    "core_flows",
+    "scope_out",
+    "materials_dir",
+    "weights",
+    "notes",
+)
+_EXT_LANG_MAP: dict[str, str] = {
+    ".java": "Java", ".kt": "Kotlin", ".scala": "Scala", ".groovy": "Groovy",
+    ".ts": "TypeScript", ".tsx": "TypeScript", ".js": "JavaScript", ".jsx": "JavaScript",
+    ".vue": "Vue", ".py": "Python", ".go": "Go", ".rs": "Rust",
+    ".c": "C", ".h": "C/C++", ".cpp": "C++", ".cc": "C++", ".hpp": "C++",
+    ".cs": "C#", ".php": "PHP", ".rb": "Ruby", ".swift": "Swift", ".dart": "Dart",
+    ".sql": "SQL", ".sh": "Shell", ".bash": "Shell",
+    ".html": "HTML", ".htm": "HTML", ".css": "CSS", ".scss": "SCSS", ".less": "Less",
+    ".xml": "XML", ".yml": "YAML", ".yaml": "YAML", ".json": "JSON",
+}
+_SKIP_DIR_PARTS = {"node_modules", "dist", "build", "target", "vendor", ".git", ".idea", ".vscode", "__pycache__", "out"}
 
 # GB2312 一级汉字（3755 个常用字）按拼音顺序编码的边界码表（GBK 两字节整数 -> 拼音）
 _GB2312_PINYIN_BOUNDARIES: tuple[tuple[int, str], ...] = (
@@ -406,6 +438,36 @@ class PlatformDB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
                 CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(id DESC);
+                CREATE TABLE IF NOT EXISTS projects (
+                    project_id TEXT PRIMARY KEY,
+                    project_name TEXT NOT NULL DEFAULT '',
+                    department TEXT NOT NULL DEFAULT '',
+                    owner TEXT NOT NULL DEFAULT '',
+                    git_url TEXT NOT NULL DEFAULT '',
+                    branch TEXT NOT NULL DEFAULT 'main',
+                    status TEXT NOT NULL DEFAULT '在研',
+                    tech_stack TEXT NOT NULL DEFAULT '',
+                    project_type TEXT NOT NULL DEFAULT '',
+                    core_flows TEXT NOT NULL DEFAULT '',
+                    scope_out TEXT NOT NULL DEFAULT '',
+                    materials_dir TEXT NOT NULL DEFAULT '',
+                    weights TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    loc_total INTEGER,
+                    file_count INTEGER,
+                    languages_json TEXT NOT NULL DEFAULT '{}',
+                    last_commit_at TEXT,
+                    last_commit_author TEXT NOT NULL DEFAULT '',
+                    last_commit_subject TEXT NOT NULL DEFAULT '',
+                    metrics_updated_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS platform_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
 
@@ -704,3 +766,503 @@ class PlatformDB:
                 "SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?", (lim,)
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ---------- 平台配置键值 ----------
+
+    def get_setting(self, key: str, default: object = None) -> object:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT value FROM platform_settings WHERE key = ?", (key,)).fetchone()
+            if not row:
+                return default
+            try:
+                return json.loads(row["value"])
+            except ValueError:
+                return row["value"]
+
+    def set_setting(self, key: str, value: object) -> None:
+        raw = json.dumps(value, ensure_ascii=False)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO platform_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (key, raw, _now_iso()),
+            )
+
+    def get_stale_thresholds(self) -> dict[str, int]:
+        raw = self.get_setting("stale_thresholds")
+        warn_days, crit_days = 90, 180
+        if isinstance(raw, dict):
+            try:
+                w = int(raw.get("warn_days", 90))
+                c = int(raw.get("critical_days", 180))
+                if 7 <= w < c <= 3650:
+                    warn_days, crit_days = w, c
+            except (TypeError, ValueError):
+                pass
+        return {"warn_days": warn_days, "critical_days": crit_days}
+
+    def set_stale_thresholds(self, warn_days: int, critical_days: int) -> dict[str, int]:
+        try:
+            w = int(warn_days)
+            c = int(critical_days)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("长期未维护阈值必须为整数天数") from exc
+        if w < 7 or c <= w or c > 3650:
+            raise ValueError("预警天数须满足 7 <= 黄色预警天数 < 红色预警天数 <= 3650")
+        data = {"warn_days": w, "critical_days": c}
+        self.set_setting("stale_thresholds", data)
+        return data
+
+    # ---------- 项目管理与 CSV 双向同步 ----------
+
+    @staticmethod
+    def _row_to_project(row: sqlite3.Row) -> dict:
+        try:
+            langs = json.loads(row["languages_json"] or "{}")
+            if not isinstance(langs, dict):
+                langs = {}
+        except ValueError:
+            langs = {}
+        out = {field: (row[field] or "") for field in PROJECT_CSV_FIELDS}
+        out.update({
+            "loc_total": row["loc_total"],
+            "file_count": row["file_count"],
+            "languages": langs,
+            "last_commit_at": row["last_commit_at"],
+            "last_commit_author": row["last_commit_author"] or "",
+            "last_commit_subject": row["last_commit_subject"] or "",
+            "metrics_updated_at": row["metrics_updated_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        })
+        return out
+
+    @staticmethod
+    def validate_project_payload(data: dict) -> dict[str, str]:
+        pid = str(data.get("project_id") or "").strip()
+        if not PROJECT_ID_RE.match(pid):
+            raise ValueError("project_id 仅允许字母/数字开头，包含字母、数字、点、横线或下划线（1-128 位）")
+        git_url = validate_git_url(str(data.get("git_url") or data.get("repo_url") or ""))
+        branch = str(data.get("branch") or "main").strip() or "main"
+        if branch.startswith("-") or any(ch.isspace() for ch in branch) or ".." in branch:
+            raise ValueError(f"分支名格式无效：{branch}")
+        status = str(data.get("status") or "在研").strip() or "在研"
+        if status not in VALID_PROJECT_STATUSES:
+            raise ValueError(f"状态必须是 {' / '.join(VALID_PROJECT_STATUSES)}")
+        cleaned = {field: str(data.get(field) or "").strip() for field in PROJECT_CSV_FIELDS}
+        cleaned["project_id"] = pid
+        cleaned["project_name"] = cleaned["project_name"] or pid
+        cleaned["git_url"] = git_url
+        cleaned["branch"] = branch
+        cleaned["status"] = status
+        return cleaned
+
+    def export_projects_csv(self, target_csv: Path) -> None:
+        rows = self.list_projects()
+        target_csv.parent.mkdir(parents=True, exist_ok=True)
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=list(PROJECT_CSV_FIELDS), extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: r.get(k, "") for k in PROJECT_CSV_FIELDS})
+        tmp = target_csv.with_suffix(".csv.tmp")
+        tmp.write_text(buf.getvalue(), encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, target_csv)
+
+    def seed_projects_from_csv(self, source_csv: Path, managed_csv: Path) -> int:
+        """首次升级时把只读挂载的 projects.csv 迁移进 SQLite，并生成可写 managed CSV。"""
+        with self._lock, self._connect() as conn:
+            existing_cnt = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+        if existing_cnt > 0:
+            if not managed_csv.is_file():
+                self.export_projects_csv(managed_csv)
+            return 0
+        if not source_csv.is_file():
+            return 0
+        imported = 0
+        now = _now_iso()
+        with source_csv.open(encoding="utf-8-sig", newline="") as fh:
+            reader = csv.DictReader(fh)
+            with self._lock, self._connect() as conn:
+                for row in reader:
+                    pid = str(row.get("project_id") or "").strip()
+                    if not pid or pid.startswith("#"):
+                        continue
+                    git_url = str(row.get("git_url") or row.get("repo_url") or "").strip()
+                    vals = [
+                        pid,
+                        str(row.get("project_name") or pid).strip(),
+                        str(row.get("department") or "").strip(),
+                        str(row.get("owner") or "").strip(),
+                        git_url,
+                        str(row.get("branch") or "main").strip() or "main",
+                        str(row.get("status") or "在研").strip() or "在研",
+                        str(row.get("tech_stack") or "").strip(),
+                        str(row.get("project_type") or "").strip(),
+                        str(row.get("core_flows") or "").strip(),
+                        str(row.get("scope_out") or "").strip(),
+                        str(row.get("materials_dir") or "").strip(),
+                        str(row.get("weights") or "").strip(),
+                        str(row.get("notes") or "").strip(),
+                        now,
+                        now,
+                    ]
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO projects (
+                            project_id, project_name, department, owner, git_url, branch, status,
+                            tech_stack, project_type, core_flows, scope_out, materials_dir, weights, notes,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        vals,
+                    )
+                    imported += 1
+        if imported > 0:
+            self.export_projects_csv(managed_csv)
+        return imported
+
+    def list_projects(self) -> list[dict]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM projects ORDER BY CASE status WHEN '在研' THEN 0 WHEN '停用' THEN 1 ELSE 2 END, department ASC, project_id ASC"
+            ).fetchall()
+            return [self._row_to_project(r) for r in rows]
+
+    def get_project(self, project_id: str) -> dict | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+            return self._row_to_project(row) if row else None
+
+    def upsert_project(self, data: dict, *, create_only: bool = False,
+                       managed_csv: Path | None = None) -> dict:
+        cleaned = self.validate_project_payload(data)
+        now = _now_iso()
+        with self._lock, self._connect() as conn:
+            exists = conn.execute(
+                "SELECT project_id FROM projects WHERE project_id = ?", (cleaned["project_id"],)
+            ).fetchone()
+            if create_only and exists:
+                raise ValueError(f"项目 ID 已存在：{cleaned['project_id']}")
+            if exists:
+                conn.execute(
+                    """
+                    UPDATE projects
+                    SET project_name=?, department=?, owner=?, git_url=?, branch=?, status=?,
+                        tech_stack=?, project_type=?, core_flows=?, scope_out=?, materials_dir=?,
+                        weights=?, notes=?, updated_at=?
+                    WHERE project_id=?
+                    """,
+                    (
+                        cleaned["project_name"], cleaned["department"], cleaned["owner"],
+                        cleaned["git_url"], cleaned["branch"], cleaned["status"],
+                        cleaned["tech_stack"], cleaned["project_type"], cleaned["core_flows"],
+                        cleaned["scope_out"], cleaned["materials_dir"], cleaned["weights"],
+                        cleaned["notes"], now, cleaned["project_id"],
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO projects (
+                        project_id, project_name, department, owner, git_url, branch, status,
+                        tech_stack, project_type, core_flows, scope_out, materials_dir, weights, notes,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        cleaned["project_id"], cleaned["project_name"], cleaned["department"],
+                        cleaned["owner"], cleaned["git_url"], cleaned["branch"], cleaned["status"],
+                        cleaned["tech_stack"], cleaned["project_type"], cleaned["core_flows"],
+                        cleaned["scope_out"], cleaned["materials_dir"], cleaned["weights"],
+                        cleaned["notes"], now, now,
+                    ),
+                )
+            row = conn.execute("SELECT * FROM projects WHERE project_id = ?", (cleaned["project_id"],)).fetchone()
+            assert row is not None
+            proj = self._row_to_project(row)
+        if managed_csv is not None:
+            self.export_projects_csv(managed_csv)
+        return proj
+
+    def delete_project(self, project_id: str, *, managed_csv: Path | None = None) -> dict:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+            if not row:
+                raise KeyError(f"项目不存在：{project_id}")
+            proj = self._row_to_project(row)
+            conn.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
+        if managed_csv is not None:
+            self.export_projects_csv(managed_csv)
+        return proj
+
+    def import_projects_csv(self, csv_text: str, *, mode: str = "upsert",
+                            managed_csv: Path | None = None) -> dict:
+        if mode not in ("upsert", "replace"):
+            raise ValueError("mode 必须是 upsert 或 replace")
+        reader = csv.DictReader(io.StringIO((csv_text or "").lstrip("\ufeff")))
+        if not reader.fieldnames or "project_id" not in reader.fieldnames:
+            raise ValueError("CSV 缺少必需表头列：project_id")
+        parsed_rows: list[dict[str, str]] = []
+        errors: list[dict] = []
+        for idx, raw_row in enumerate(reader, start=2):
+            pid = str(raw_row.get("project_id") or "").strip()
+            if not pid or pid.startswith("#"):
+                continue
+            try:
+                parsed_rows.append(self.validate_project_payload(raw_row))
+            except ValueError as exc:
+                errors.append({"line": idx, "project_id": pid, "reason": str(exc)})
+        if not parsed_rows and errors:
+            raise ValueError(f"导入失败：{errors[0]['reason']}（第 {errors[0]['line']} 行）")
+        now = _now_iso()
+        created, updated = 0, 0
+        with self._lock, self._connect() as conn:
+            if mode == "replace":
+                conn.execute("DELETE FROM projects")
+            for cleaned in parsed_rows:
+                ex = conn.execute(
+                    "SELECT project_id FROM projects WHERE project_id = ?", (cleaned["project_id"],)
+                ).fetchone()
+                if ex:
+                    conn.execute(
+                        """
+                        UPDATE projects
+                        SET project_name=?, department=?, owner=?, git_url=?, branch=?, status=?,
+                            tech_stack=?, project_type=?, core_flows=?, scope_out=?, materials_dir=?,
+                            weights=?, notes=?, updated_at=?
+                        WHERE project_id=?
+                        """,
+                        (
+                            cleaned["project_name"], cleaned["department"], cleaned["owner"],
+                            cleaned["git_url"], cleaned["branch"], cleaned["status"],
+                            cleaned["tech_stack"], cleaned["project_type"], cleaned["core_flows"],
+                            cleaned["scope_out"], cleaned["materials_dir"], cleaned["weights"],
+                            cleaned["notes"], now, cleaned["project_id"],
+                        ),
+                    )
+                    updated += 1
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO projects (
+                            project_id, project_name, department, owner, git_url, branch, status,
+                            tech_stack, project_type, core_flows, scope_out, materials_dir, weights, notes,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            cleaned["project_id"], cleaned["project_name"], cleaned["department"],
+                            cleaned["owner"], cleaned["git_url"], cleaned["branch"], cleaned["status"],
+                            cleaned["tech_stack"], cleaned["project_type"], cleaned["core_flows"],
+                            cleaned["scope_out"], cleaned["materials_dir"], cleaned["weights"],
+                            cleaned["notes"], now, now,
+                        ),
+                    )
+                    created += 1
+        if managed_csv is not None:
+            self.export_projects_csv(managed_csv)
+        return {"created": created, "updated": updated, "errors": errors}
+
+    def update_project_metrics(self, project_id: str, *, loc_total: int | None,
+                               file_count: int | None, languages: dict[str, int] | None,
+                               last_commit_at: str | None, last_commit_author: str = "",
+                               last_commit_subject: str = "") -> None:
+        now = _now_iso()
+        lang_json = json.dumps(languages or {}, ensure_ascii=False)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE projects
+                SET loc_total = COALESCE(?, loc_total),
+                    file_count = COALESCE(?, file_count),
+                    languages_json = CASE WHEN ? != '{}' THEN ? ELSE languages_json END,
+                    last_commit_at = COALESCE(?, last_commit_at),
+                    last_commit_author = CASE WHEN ? != '' THEN ? ELSE last_commit_author END,
+                    last_commit_subject = CASE WHEN ? != '' THEN ? ELSE last_commit_subject END,
+                    metrics_updated_at = ?
+                WHERE project_id = ?
+                """,
+                (
+                    loc_total, file_count, lang_json, lang_json, last_commit_at,
+                    last_commit_author, last_commit_author, last_commit_subject, last_commit_subject,
+                    now, project_id,
+                ),
+            )
+
+
+def validate_git_url(raw_url: str) -> str:
+    """校验 Git 仓库地址，防止参数注入与 file:// 本地路径泄露。"""
+    url = (raw_url or "").strip()
+    if not url:
+        raise ValueError("Git 地址不能为空")
+    if url.startswith("-") or any(ch.isspace() for ch in url):
+        raise ValueError(f"Git 地址包含非法字符：{url}")
+    lower = url.lower()
+    if lower.startswith(("http://", "https://", "ssh://")) or url.startswith("git@"):
+        return url
+    raise ValueError("Git 地址仅支持 http://、https://、ssh:// 或 git@ 协议")
+
+
+def probe_git_remote(git_url: str, branch: str = "", timeout_sec: int = 15) -> dict:
+    """执行只读 git ls-remote --heads 校验连通性与分支是否存在。"""
+    url = validate_git_url(git_url)
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        proc = subprocess.run(
+            ["git", "ls-remote", "--heads", "--symref", url],
+            capture_output=True, text=True, timeout=timeout_sec, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "branches": [], "default_branch": "", "branch_exists": False, "error": f"连接 Git 仓库超时（>{timeout_sec}s）"}
+    except OSError as exc:
+        return {"ok": False, "branches": [], "default_branch": "", "branch_exists": False, "error": f"无法调用 git：{exc}"}
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "git ls-remote 失败").strip().splitlines()
+        return {"ok": False, "branches": [], "default_branch": "", "branch_exists": False, "error": " ".join(err[:2])[:300]}
+
+    branches: list[str] = []
+    default_branch = ""
+    for line in proc.stdout.splitlines():
+        if line.startswith("ref: refs/heads/"):
+            default_branch = line[len("ref: refs/heads/"):].split("\t", 1)[0].strip()
+        elif "\trefs/heads/" in line:
+            b = line.split("\trefs/heads/", 1)[1].strip()
+            if b:
+                branches.append(b)
+    branches = sorted(set(branches))
+    target_branch = (branch or "").strip()
+    return {
+        "ok": True,
+        "branches": branches,
+        "default_branch": default_branch or ("main" if "main" in branches else ("master" if "master" in branches else (branches[0] if branches else ""))),
+        "branch_exists": (target_branch in branches) if target_branch else bool(branches),
+        "error": "",
+    }
+
+
+def collect_repo_metrics(repo_dir: Path, cloc_json_path: Path | None = None) -> dict:
+    """零依赖快速采集本地 Git 仓库的代码行数、语言分布与最后提交时间。"""
+    out: dict = {
+        "loc_total": None,
+        "file_count": None,
+        "languages": {},
+        "last_commit_at": None,
+        "last_commit_author": "",
+        "last_commit_subject": "",
+    }
+    if not repo_dir.is_dir():
+        return out
+
+    # 1. 最后代码提交时间 / 作者 / 主题
+    try:
+        proc = subprocess.run(
+            ["git", "log", "-1", "--format=%cI\x1f%an\x1f%s"],
+            cwd=str(repo_dir), capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            parts = proc.stdout.strip().split("\x1f", 2)
+            out["last_commit_at"] = parts[0].strip() or None
+            if len(parts) > 1:
+                out["last_commit_author"] = parts[1].strip()[:80]
+            if len(parts) > 2:
+                out["last_commit_subject"] = parts[2].strip()[:140]
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    # 2. 代码行数与语言分布：优先读 cloc.json，否则快速遍历 git ls-files
+    if cloc_json_path and cloc_json_path.is_file():
+        try:
+            cloc_data = json.loads(cloc_json_path.read_text(encoding="utf-8"))
+            if isinstance(cloc_data, dict):
+                s = cloc_data.get("SUM")
+                if isinstance(s, dict):
+                    out["loc_total"] = int(s.get("code") or 0)
+                    out["file_count"] = int(s.get("nFiles") or 0)
+                langs: dict[str, int] = {}
+                for k, v in cloc_data.items():
+                    if k in ("header", "SUM") or not isinstance(v, dict):
+                        continue
+                    code = int(v.get("code") or 0)
+                    if code > 0:
+                        langs[str(k)] = code
+                if langs:
+                    top = sorted(langs.items(), key=lambda kv: kv[1], reverse=True)[:8]
+                    out["languages"] = dict(top)
+                if out["loc_total"] is not None:
+                    return out
+        except (OSError, ValueError, TypeError):
+            pass
+
+    try:
+        ls = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=str(repo_dir), capture_output=True, timeout=12,
+        )
+        if ls.returncode == 0:
+            rel_paths = [p.decode("utf-8", errors="ignore") for p in ls.stdout.split(b"\x00") if p]
+        else:
+            rel_paths = []
+    except (OSError, subprocess.TimeoutExpired):
+        rel_paths = []
+
+    if rel_paths:
+        total_loc = 0
+        total_files = 0
+        lang_counts: dict[str, int] = {}
+        for rel in rel_paths:
+            parts = Path(rel).parts
+            if any(pt in _SKIP_DIR_PARTS for pt in parts):
+                continue
+            ext = Path(rel).suffix.lower()
+            lang = _EXT_LANG_MAP.get(ext)
+            if not lang:
+                continue
+            fpath = repo_dir / rel
+            try:
+                st = fpath.stat()
+                if st.st_size > 1_048_576:
+                    continue
+                raw = fpath.read_bytes()
+                if b"\x00" in raw[:1024]:
+                    continue
+                loc = sum(1 for line in raw.splitlines() if line.strip())
+            except OSError:
+                continue
+            total_files += 1
+            total_loc += loc
+            lang_counts[lang] = lang_counts.get(lang, 0) + loc
+        out["loc_total"] = total_loc
+        out["file_count"] = total_files
+        top = sorted(lang_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        out["languages"] = dict(top)
+    return out
+
+
+def compute_stale_info(last_commit_at: str | None, warn_days: int = 90,
+                       critical_days: int = 180, now: dt.datetime | None = None) -> tuple[int | None, str]:
+    """根据最后代码提交时间计算未维护天数及预警级别（active / warning / critical / unknown）。"""
+    if not last_commit_at:
+        return None, "unknown"
+    try:
+        ts = dt.datetime.fromisoformat(str(last_commit_at).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None, "unknown"
+    ref = now or dt.datetime.now(ts.tzinfo or dt.timezone.utc)
+    if ts.tzinfo is None and ref.tzinfo is not None:
+        ref = ref.replace(tzinfo=None)
+    elif ts.tzinfo is not None and ref.tzinfo is None:
+        ref = ref.replace(tzinfo=ts.tzinfo)
+    days = max(0, int((ref - ts).total_seconds() // 86400))
+    if days >= critical_days:
+        return days, "critical"
+    if days >= warn_days:
+        return days, "warning"
+    return days, "active"

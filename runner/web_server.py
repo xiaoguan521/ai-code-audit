@@ -197,7 +197,7 @@ def _schedule_tick(cfg: dict, now_dt: dt.datetime | None = None) -> dict | None:
             "summary_only": False,
         }
         res = _start_scan_task(
-            payload, ROOT, cfg["settings_path"], cfg["projects_csv"],
+            payload, ROOT, cfg["settings_path"], _effective_projects_csv(cfg),
             trigger="schedule", output_dir=output_dir,
         )
         if res.get("task_id"):
@@ -451,13 +451,126 @@ def _resolve_workdir(output_dir: Path, settings: dict) -> Path:
     return (output_dir.parent / "work").resolve()
 
 
-def _allowed_pids_for_user(user: dict | None, projects_csv: Path | None) -> set[str] | None:
+def _managed_projects_csv(output_dir: Path) -> Path:
+    return output_dir / "state" / "projects.managed.csv"
+
+
+def _effective_projects_csv(cfg: dict) -> Path:
+    managed = _managed_projects_csv(cfg["output_dir"])
+    return managed if managed.is_file() else cfg["projects_csv"]
+
+
+def _pause_flag_path(output_dir: Path) -> Path:
+    return output_dir / "state" / "pause.flag"
+
+
+def _get_pause_state(output_dir: Path) -> dict:
+    flag = _pause_flag_path(output_dir)
+    if not flag.is_file():
+        return {"paused": False, "paused_at": None, "paused_by": "", "reason": ""}
+    data = _read_json(flag)
+    if isinstance(data, dict):
+        return {
+            "paused": True,
+            "paused_at": data.get("paused_at"),
+            "paused_by": data.get("paused_by") or "",
+            "reason": data.get("reason") or "",
+        }
+    return {"paused": True, "paused_at": None, "paused_by": "", "reason": ""}
+
+
+def _set_pause_state(output_dir: Path, paused: bool, actor: dict | None = None, reason: str = "") -> dict:
+    flag = _pause_flag_path(output_dir)
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    if paused:
+        info = {
+            "paused": True,
+            "paused_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "paused_by": (actor or {}).get("username", ""),
+            "reason": str(reason or "").strip()[:200],
+        }
+        tmp = flag.with_suffix(".flag.tmp")
+        tmp.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, flag)
+        return info
+    try:
+        flag.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return {"paused": False, "paused_at": None, "paused_by": "", "reason": ""}
+
+
+def _merge_project_code_metrics(meta: dict, st: dict, thresholds: dict[str, int]) -> dict:
+    """合并 SQLite 项目元数据与 state/<pid>.json 的代码量与最后提交时间，计算长期未维护预警。"""
+    cs = st.get("code_stats") if isinstance(st.get("code_stats"), dict) else {}
+    loc_total = cs.get("loc_total") if cs.get("loc_total") is not None else meta.get("loc_total")
+    file_count = cs.get("file_count") if cs.get("file_count") is not None else meta.get("file_count")
+    languages = cs.get("languages") or meta.get("languages") or {}
+    last_commit_at = cs.get("last_commit_at") or meta.get("last_commit_at") or None
+    last_commit_author = cs.get("last_commit_author") or meta.get("last_commit_author") or ""
+    last_commit_subject = cs.get("last_commit_subject") or meta.get("last_commit_subject") or ""
+    inactive_days, stale_level = platform_db.compute_stale_info(
+        last_commit_at,
+        warn_days=thresholds.get("warn_days", 90),
+        critical_days=thresholds.get("critical_days", 180),
+    )
+    return {
+        "loc_total": loc_total,
+        "file_count": file_count,
+        "languages": languages if isinstance(languages, dict) else {},
+        "last_commit_at": last_commit_at,
+        "last_commit_author": last_commit_author,
+        "last_commit_subject": last_commit_subject,
+        "inactive_days": inactive_days,
+        "stale_level": stale_level,
+    }
+
+
+def _refresh_projects_metrics(output_dir: Path, settings_path: Path | None,
+                              db: platform_db.PlatformDB,
+                              project_ids: list[str] | None = None) -> dict:
+    """扫描 workdir/<pid>/repo 已有本地仓库，刷新代码量、语言分布与最后提交时间（不调用模型）。"""
+    settings = (_read_json(settings_path) if settings_path else None) or {}
+    workdir = _resolve_workdir(output_dir, settings if isinstance(settings, dict) else {})
+    projects = db.list_projects()
+    target_set = set(project_ids) if project_ids else None
+    scanned, updated, missing_repo = 0, 0, 0
+    for p in projects:
+        pid = p["project_id"]
+        if target_set is not None and pid not in target_set:
+            continue
+        scanned += 1
+        repo_dir = workdir / pid / "repo"
+        if not repo_dir.is_dir():
+            missing_repo += 1
+            continue
+        cloc_cand = workdir / pid / "context" / "prescan" / "cloc.json"
+        metrics = platform_db.collect_repo_metrics(repo_dir, cloc_cand if cloc_cand.is_file() else None)
+        if metrics.get("loc_total") is not None or metrics.get("last_commit_at"):
+            db.update_project_metrics(
+                pid,
+                loc_total=metrics.get("loc_total"),
+                file_count=metrics.get("file_count"),
+                languages=metrics.get("languages"),
+                last_commit_at=metrics.get("last_commit_at"),
+                last_commit_author=metrics.get("last_commit_author") or "",
+                last_commit_subject=metrics.get("last_commit_subject") or "",
+            )
+            updated += 1
+    return {"scanned": scanned, "updated": updated, "missing_repo": missing_repo}
+
+
+def _allowed_pids_for_user(user: dict | None, projects_csv: Path | None,
+                           db: platform_db.PlatformDB | None = None) -> set[str] | None:
     """superadmin/admin 返回 None（不限）；普通用户返回其负责的 project_id 集合。"""
     if not user or user.get("role") in ("superadmin", "admin"):
         return None
-    if not projects_csv:
-        return set()
-    return {p["project_id"] for p in _load_projects(projects_csv) if platform_db.user_owns_project(user, p)}
+    catalog = _load_catalog(projects_csv, db=db)
+    return {p["project_id"] for p in catalog if platform_db.user_owns_project(user, p)}
 
 
 def _filter_run_progress(item: dict, allowed_pids: set[str]) -> dict:
@@ -490,9 +603,10 @@ def _filter_run_progress(item: dict, allowed_pids: set[str]) -> dict:
 
 def _build_live_progress(output_dir: Path, projects_csv: Path | None = None,
                          settings_path: Path | None = None,
-                         user: dict | None = None) -> dict:
-    allowed_pids = _allowed_pids_for_user(user, projects_csv)
-    catalog = {p["project_id"]: p for p in _load_projects(projects_csv)} if projects_csv else {}
+                         user: dict | None = None,
+                         db: platform_db.PlatformDB | None = None) -> dict:
+    allowed_pids = _allowed_pids_for_user(user, projects_csv, db=db)
+    catalog = {p["project_id"]: p for p in _load_catalog(projects_csv, db=db)}
     settings = (_read_json(settings_path) if settings_path else None) or {}
     if not isinstance(settings, dict):
         settings = {}
@@ -561,6 +675,7 @@ def _build_live_progress(output_dir: Path, projects_csv: Path | None = None,
         "latest_run": latest_run,
         "running_task": running_task,
         "tasks": all_tasks,
+        "pause_state": _get_pause_state(output_dir),
     }
 
 
@@ -648,6 +763,17 @@ def _load_projects(projects_csv: Path) -> list[dict]:
         return []
     with projects_csv.open(encoding="utf-8-sig") as f:
         return [dict(r) for r in csv.DictReader(f) if r.get("project_id")]
+
+
+def _load_catalog(projects_csv: Path | None, db: platform_db.PlatformDB | None = None) -> list[dict]:
+    """优先从 SQLite 管理端读取项目清册，否则回退到 CSV 文件。"""
+    if db is not None:
+        db_projs = db.list_projects()
+        if db_projs:
+            return db_projs
+    if projects_csv and projects_csv.is_file():
+        return _load_projects(projects_csv)
+    return []
 
 
 def _project_weights(meta: dict | None, checklist: dict) -> tuple[dict[str, float] | None, str]:
@@ -847,10 +973,11 @@ def _resolve_run_file(output_dir: Path, date_str: str, run_id: str) -> Path:
 
 
 def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict,
-                    user: dict | None = None) -> dict:
-    allowed_pids = _allowed_pids_for_user(user, projects_csv)
+                    user: dict | None = None, db: platform_db.PlatformDB | None = None) -> dict:
+    allowed_pids = _allowed_pids_for_user(user, projects_csv, db=db)
     runs = _discover_runs(output_dir, allowed_pids=allowed_pids)
-    catalog = {p["project_id"]: p for p in _load_projects(projects_csv)}
+    catalog = {p["project_id"]: p for p in _load_catalog(projects_csv, db=db)}
+    thresholds = db.get_stale_thresholds() if db is not None else {"warn_days": 90, "critical_days": 180}
 
     # 读取所有 state/<pid>.json 作为项目最新基线
     state_dir = output_dir / "state"
@@ -970,12 +1097,15 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict,
             if prev_entry and cur_sec is not None and prev_entry.get("security") is not None
             else None
         )
+        code_metrics = _merge_project_code_metrics(meta, st, thresholds)
         rows.append({
             "project_id": pid,
             "project_name": rec.get("project_name") or meta.get("project_name") or pid,
             "department": rec.get("department") or meta.get("department") or "",
             "owner": rec.get("owner") or meta.get("owner") or "",
             "tech_stack": meta.get("tech_stack") or "",
+            "branch": meta.get("branch") or st.get("branch") or "",
+            "catalog_status": meta.get("status") or "",
             "status": status,
             "error": rec.get("error"),
             "scan_type": rec.get("scan_type") or "",
@@ -994,6 +1124,7 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict,
             "security_p0": scores.get("security_p0", 0),
             "security_p1": scores.get("security_p1", 0),
             **issue_counts,
+            **code_metrics,
             "dim_scores": dim_scores,
         })
 
@@ -1014,6 +1145,7 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict,
         "rows": rows,
         "trend": list(trend_by_date.values()),
         "dims": dims_avg,
+        "stale_thresholds": thresholds,
     }
 
 
@@ -1635,7 +1767,8 @@ class AuditHandler(BaseHTTPRequestHandler):
             return self._send_json(401, {"error": "未登录或会话已过期，请先登录"})
 
         db: platform_db.PlatformDB = self.cfg["db"]
-        allowed_pids = _allowed_pids_for_user(cur_user, projects_csv) if cur_user else None
+        effective_csv = _effective_projects_csv(self.cfg)
+        allowed_pids = _allowed_pids_for_user(cur_user, effective_csv, db=db) if cur_user else None
 
         if path == "/api/me":
             return self._send_json(200, {"user": cur_user})
@@ -1666,7 +1799,7 @@ class AuditHandler(BaseHTTPRequestHandler):
             return self._send_json(200, {"logs": db.list_audit_logs(limit=limit)})
 
         if path == "/api/overview":
-            return self._send_json(200, _build_overview(output_dir, projects_csv, checklist, user=cur_user))
+            return self._send_json(200, _build_overview(output_dir, effective_csv, checklist, user=cur_user, db=db))
 
         if path == "/api/runs":
             return self._send_json(200, {"runs": _discover_runs(output_dir, allowed_pids=allowed_pids, user=cur_user)})
@@ -1701,7 +1834,7 @@ class AuditHandler(BaseHTTPRequestHandler):
             data["can_delete"] = _can_delete_run(cur_user, data)
             data.setdefault("triggered_by", "")
             data.setdefault("trigger", "")
-            catalog = {p["project_id"]: p for p in _load_projects(projects_csv)}
+            catalog = {p["project_id"]: p for p in _load_catalog(effective_csv, db=db)}
             visible_projects = []
             for p in data.get("projects") or []:
                 pid = str(p.get("project_id") or "")
@@ -1775,7 +1908,7 @@ class AuditHandler(BaseHTTPRequestHandler):
             md_file = rep_dir / f"{target}.md"
             if not md_file.is_file():
                 return self._send_json(404, {"error": f"未找到项目报告 {target}.md"})
-            catalog = {p["project_id"]: p for p in _load_projects(projects_csv)}
+            catalog = {p["project_id"]: p for p in _load_catalog(effective_csv, db=db)}
             proj_weights, weights_key = _project_weights(catalog.get(target), checklist)
             parsed_report = _parse_markdown_report(md_file, checklist, proj_weights, weights_key)
             parsed_report.update({
@@ -1786,28 +1919,49 @@ class AuditHandler(BaseHTTPRequestHandler):
             })
             return self._send_json(200, parsed_report)
 
+        if path == "/api/projects/export":
+            assert cur_user is not None
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            managed_csv = _managed_projects_csv(output_dir)
+            if db.list_projects():
+                db.export_projects_csv(managed_csv)
+            src = managed_csv if managed_csv.is_file() else effective_csv
+            raw_csv = src.read_text(encoding="utf-8-sig") if src.is_file() else (",".join(platform_db.PROJECT_CSV_FIELDS) + "\n")
+            data_bytes = ("\ufeff" + raw_csv).encode("utf-8")
+            return self._send_binary(data_bytes, "text/csv; charset=utf-8", "projects.csv")
+
         if path == "/api/projects":
-            projects = _load_projects(projects_csv)
+            projects = _load_catalog(effective_csv, db=db)
             if allowed_pids is not None:
                 projects = [p for p in projects if p["project_id"] in allowed_pids]
+            thresholds = db.get_stale_thresholds()
             state_dir = output_dir / "state"
+            enriched_projects = []
             for p in projects:
-                pid = p["project_id"]
+                item = dict(p)
+                pid = item["project_id"]
                 st = _read_json(state_dir / f"{pid}.json") if state_dir.is_dir() else None
                 if isinstance(st, dict):
-                    p["state"] = st
+                    item["state"] = st
+                item.update(_merge_project_code_metrics(item, st if isinstance(st, dict) else {}, thresholds))
+                enriched_projects.append(item)
             return self._send_json(200, {
-                "projects": projects,
+                "projects": enriched_projects,
+                "stale_thresholds": thresholds,
                 "scan_statuses": self.cfg.get("scan_statuses", ["在研"]),
                 "checklist_dimensions": checklist["dimensions"],
             })
+
+        if path == "/api/scans/pause":
+            return self._send_json(200, _get_pause_state(output_dir))
 
         if path == "/api/doctor":
             assert cur_user is not None
             if not self._require_role(cur_user, ("superadmin", "admin")):
                 return
             return self._send_json(200, doctor.run_checks(
-                ROOT, output_dir=output_dir, projects_csv=projects_csv, settings_path=self.cfg["settings_path"]
+                ROOT, output_dir=output_dir, projects_csv=effective_csv, settings_path=self.cfg["settings_path"]
             ))
 
         if path == "/api/schedule":
@@ -1825,7 +1979,7 @@ class AuditHandler(BaseHTTPRequestHandler):
 
         if path == "/api/scans/progress":
             return self._send_json(200, _build_live_progress(
-                output_dir, projects_csv, self.cfg["settings_path"], user=cur_user
+                output_dir, effective_csv, self.cfg["settings_path"], user=cur_user, db=db
             ))
 
         if path == "/api/scans":
@@ -1990,7 +2144,7 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return
             payload = self._read_json_body() or {}
             domain = str(payload.get("email_domain") or "shineyue.com").strip()
-            owners = [p.get("owner", "") for p in _load_projects(self.cfg["projects_csv"])]
+            owners = [p.get("owner", "") for p in _load_catalog(_effective_projects_csv(self.cfg), db=db)]
             items = db.preview_users_from_owners(owners, email_domain=domain)
             return self._send_json(200, {"items": items, "email_domain": domain})
 
@@ -2081,6 +2235,134 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return self._send_json(400, {"error": str(exc)})
             return self._send_json(404, {"error": "未知的用户操作"})
 
+        # 项目管理 CRUD / Git 分支探测 / CSV 导入 / 代码量刷新 / 长期未维护阈值（superadmin + admin）
+        if path == "/api/projects":
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            managed_csv = _managed_projects_csv(self.cfg["output_dir"])
+            try:
+                created = db.upsert_project(payload, create_only=True, managed_csv=managed_csv)
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            db.record_audit(cur_user, "create_project", target=created["project_id"],
+                            detail={"branch": created["branch"], "owner": created["owner"]}, client_ip=client_ip)
+            return self._send_json(201, {"project": created})
+
+        if path == "/api/projects/probe-git":
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            try:
+                res = platform_db.probe_git_remote(
+                    str(payload.get("git_url") or ""),
+                    branch=str(payload.get("branch") or ""),
+                )
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            return self._send_json(200, res)
+
+        if path == "/api/projects/import":
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            managed_csv = _managed_projects_csv(self.cfg["output_dir"])
+            try:
+                res = db.import_projects_csv(
+                    str(payload.get("csv_text") or ""),
+                    mode=str(payload.get("mode") or "upsert"),
+                    managed_csv=managed_csv,
+                )
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            db.record_audit(cur_user, "import_projects", target=str(payload.get("mode") or "upsert"),
+                            detail={"created": res["created"], "updated": res["updated"], "errors": len(res["errors"])},
+                            client_ip=client_ip)
+            return self._send_json(200, res)
+
+        if path == "/api/projects/refresh-metrics":
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            payload = self._read_json_body() or {}
+            pids = payload.get("project_ids")
+            pid_list = [str(x) for x in pids if _is_safe_segment(str(x))] if isinstance(pids, list) and pids else None
+            res = _refresh_projects_metrics(self.cfg["output_dir"], self.cfg["settings_path"], db, project_ids=pid_list)
+            db.record_audit(cur_user, "refresh_metrics", target=f"{res['updated']}/{res['scanned']}",
+                            detail=res, client_ip=client_ip)
+            return self._send_json(200, res)
+
+        if path == "/api/projects/stale-thresholds":
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            try:
+                saved = db.set_stale_thresholds(payload.get("warn_days", 90), payload.get("critical_days", 180))
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            db.record_audit(cur_user, "update_stale_thresholds", target="stale_thresholds",
+                            detail=saved, client_ip=client_ip)
+            return self._send_json(200, {"stale_thresholds": saved})
+
+        if path.startswith("/api/projects/"):
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            segs = [urllib.parse.unquote(s) for s in path[len("/api/projects/"):].split("/") if s]
+            if len(segs) != 2 or not _is_safe_segment(segs[0]):
+                return self._send_json(400, {"error": "无效的项目操作路径"})
+            target_pid, action = segs[0], segs[1]
+            managed_csv = _managed_projects_csv(self.cfg["output_dir"])
+            try:
+                if action == "update":
+                    payload = self._read_json_body()
+                    if payload is None:
+                        return self._send_json(400, {"error": "无效的 JSON 请求体"})
+                    existing = db.get_project(target_pid)
+                    if not existing:
+                        return self._send_json(404, {"error": f"项目不存在：{target_pid}"})
+                    merged = dict(existing)
+                    merged.update({k: v for k, v in payload.items() if k in platform_db.PROJECT_CSV_FIELDS})
+                    merged["project_id"] = target_pid
+                    updated = db.upsert_project(merged, create_only=False, managed_csv=managed_csv)
+                    db.record_audit(cur_user, "update_project", target=target_pid,
+                                    detail={"branch": updated["branch"], "owner": updated["owner"], "status": updated["status"]},
+                                    client_ip=client_ip)
+                    return self._send_json(200, {"project": updated})
+                if action == "delete":
+                    deleted = db.delete_project(target_pid, managed_csv=managed_csv)
+                    db.record_audit(cur_user, "delete_project", target=target_pid,
+                                    detail={"project_name": deleted.get("project_name")}, client_ip=client_ip)
+                    return self._send_json(200, {"ok": True, "project_id": target_pid})
+            except KeyError as exc:
+                return self._send_json(404, {"error": str(exc)})
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            return self._send_json(404, {"error": "未知的项目操作"})
+
+        # 扫描暂停 / 恢复（superadmin + admin）
+        if path == "/api/scans/pause":
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            payload = self._read_json_body() or {}
+            st = _set_pause_state(self.cfg["output_dir"], True, actor=cur_user, reason=str(payload.get("reason") or ""))
+            db.record_audit(cur_user, "pause_scan", target="pause.flag",
+                            detail={"reason": st.get("reason")}, client_ip=client_ip)
+            return self._send_json(200, st)
+
+        if path == "/api/scans/resume":
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            st = _set_pause_state(self.cfg["output_dir"], False, actor=cur_user)
+            db.record_audit(cur_user, "resume_scan", target="pause.flag", client_ip=client_ip)
+            return self._send_json(200, st)
+
         if path == "/api/schedule":
             if not self._require_role(cur_user, ("superadmin", "admin")):
                 return
@@ -2136,7 +2418,7 @@ class AuditHandler(BaseHTTPRequestHandler):
             if len(segs) != 2 or not all(_is_safe_segment(s) for s in segs):
                 return self._send_json(400, {"error": "无效的批次路径"})
             res = _generate_batch_summary_now(
-                self.cfg["output_dir"], segs[0], segs[1], self.cfg["projects_csv"]
+                self.cfg["output_dir"], segs[0], segs[1], _effective_projects_csv(self.cfg)
             )
             if res.get("not_found"):
                 return self._send_json(404, {"error": res["error"]})
@@ -2165,19 +2447,20 @@ class AuditHandler(BaseHTTPRequestHandler):
             return self._send_json(400, {"error": "无效的 JSON 请求体"})
 
         # 普通用户仅允许触发自己负责的项目，禁止全量触发与全局汇总
+        effective_csv = _effective_projects_csv(self.cfg)
         if cur_user.get("role") == "user":
             if payload.get("summary_only"):
                 return self._send_json(403, {"error": "普通用户无权生成全局汇总报告"})
             only = payload.get("only")
             if not isinstance(only, list) or not only:
                 return self._send_json(403, {"error": "普通用户必须勾选指定自己负责的项目进行扫描"})
-            allowed = _allowed_pids_for_user(cur_user, self.cfg["projects_csv"]) or set()
+            allowed = _allowed_pids_for_user(cur_user, effective_csv, db=db) or set()
             forbidden = [str(pid) for pid in only if str(pid) not in allowed]
             if forbidden:
                 return self._send_json(403, {"error": f"无权扫描非本人负责的项目：{', '.join(forbidden[:5])}"})
 
         res = _start_scan_task(
-            payload, ROOT, self.cfg["settings_path"], self.cfg["projects_csv"],
+            payload, ROOT, self.cfg["settings_path"], effective_csv,
             output_dir=self.cfg["output_dir"],
             triggered_by=cur_user.get("username", ""),
         )
@@ -2217,6 +2500,9 @@ def main() -> int:
     dist_dir = (ROOT / "frontend" / "dist").resolve()
     auth_token = (args.token if args.token is not None else os.environ.get("AUDIT_WEB_TOKEN", "")).strip()
     db = platform_db.PlatformDB(output_dir / "state" / "platform.db")
+    seeded = db.seed_projects_from_csv(projects_csv, _managed_projects_csv(output_dir))
+    if seeded:
+        print(f"[web_server] 已从 {projects_csv.name} 初始化导入 {seeded} 个项目到管理端数据库", flush=True)
     init_admin = db.ensure_initial_superadmin(legacy_token=auth_token)
     if init_admin:
         init_user, init_pass = init_admin

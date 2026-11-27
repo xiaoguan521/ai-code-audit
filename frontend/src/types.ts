@@ -52,12 +52,34 @@ export interface RunSummary {
   pending_count: number;
 }
 
+export interface StaleThresholds {
+  warn_days: number;
+  critical_days: number;
+}
+
+export interface PauseState {
+  paused: boolean;
+  paused_at?: string | null;
+  paused_by?: string;
+  reason?: string;
+}
+
+export interface GitProbeResult {
+  ok: boolean;
+  branches: string[];
+  default_branch: string;
+  branch_exists: boolean;
+  error: string;
+}
+
 export interface ProjectRow {
   project_id: string;
   project_name: string;
   department: string;
   owner: string;
   tech_stack: string;
+  branch?: string;
+  catalog_status?: string;
   status: string;
   error?: string | null;
   scan_type?: string;
@@ -79,6 +101,14 @@ export interface ProjectRow {
   P1: number;
   P2: number;
   P3: number;
+  loc_total?: number | null;
+  file_count?: number | null;
+  languages?: Record<string, number>;
+  last_commit_at?: string | null;
+  last_commit_author?: string;
+  last_commit_subject?: string;
+  inactive_days?: number | null;
+  stale_level?: "active" | "warning" | "critical" | "unknown";
   dim_scores?: Record<string, number | null>;
 }
 
@@ -103,6 +133,7 @@ export interface OverviewResponse {
   rows: ProjectRow[];
   trend: TrendPoint[];
   dims: DimAvg[];
+  stale_thresholds?: StaleThresholds;
 }
 
 export interface RunProjectRecord {
@@ -204,7 +235,19 @@ export interface CatalogProject {
   status: string;
   tech_stack: string;
   project_type?: string;
+  core_flows?: string;
+  scope_out?: string;
+  materials_dir?: string;
+  weights?: string;
   notes?: string;
+  loc_total?: number | null;
+  file_count?: number | null;
+  languages?: Record<string, number>;
+  last_commit_at?: string | null;
+  last_commit_author?: string;
+  last_commit_subject?: string;
+  inactive_days?: number | null;
+  stale_level?: "active" | "warning" | "critical" | "unknown";
   state?: {
     last_scan_date?: string;
     last_commit?: string;
@@ -304,6 +347,7 @@ export interface LiveProgressResponse {
   latest_run: RunProgressItem | null;
   running_task: ScanTask | null;
   tasks: ScanTask[];
+  pause_state?: PauseState;
 }
 
 export interface DoctorCheck {

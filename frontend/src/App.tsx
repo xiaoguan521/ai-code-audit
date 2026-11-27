@@ -3,6 +3,7 @@ import {
   Activity,
   BarChart3,
   FileText,
+  FolderGit2,
   History,
   LogOut,
   Moon,
@@ -19,12 +20,13 @@ import { ProfileModal } from "./components/ProfileModal";
 import { ConfigPage } from "./pages/ConfigPage";
 import { DashboardPage } from "./pages/DashboardPage";
 import { ProgressPage } from "./pages/ProgressPage";
+import { ProjectsPage } from "./pages/ProjectsPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { RunsPage } from "./pages/RunsPage";
 import { UsersPage } from "./pages/UsersPage";
 import type { AuthUser, OverviewResponse } from "./types";
 
-type Page = "dashboard" | "progress" | "runs" | "reports" | "config" | "users";
+type Page = "dashboard" | "progress" | "runs" | "reports" | "projects" | "config" | "users";
 type ReportTarget = { date: string; runId: string; target: string };
 
 const ROLE_BADGE: Record<AuthUser["role"], string> = {
@@ -40,6 +42,7 @@ function parseHash(): { page: Page; reportTarget: ReportTarget | null } {
   if (pathPart === "progress" || pathPart === "scans") page = "progress";
   else if (pathPart === "runs") page = "runs";
   else if (pathPart === "reports") page = "reports";
+  else if (pathPart === "projects") page = "projects";
   else if (pathPart === "config") page = "config";
   else if (pathPart === "users") page = "users";
 
@@ -250,10 +253,16 @@ export function App() {
               <FileText size={15} /> 报告阅读
             </button>
             <button
+              className={`nav-tab ${page === "projects" ? "active" : ""}`}
+              onClick={() => navigate("projects")}
+            >
+              <FolderGit2 size={15} /> {currentUser.role === "user" ? "我的项目" : "项目管理"}
+            </button>
+            <button
               className={`nav-tab ${page === "config" ? "active" : ""}`}
               onClick={() => navigate("config")}
             >
-              <Settings size={15} /> {currentUser.role === "user" ? "我的项目扫描" : "扫描配置"}
+              <Settings size={15} /> {currentUser.role === "user" ? "触发扫描" : "扫描配置"}
             </button>
             {(currentUser.role === "superadmin" || currentUser.role === "admin") && (
               <button
@@ -322,6 +331,7 @@ export function App() {
             onTargetChange={setReportTarget}
           />
         )}
+        {page === "projects" && <ProjectsPage currentUser={currentUser} />}
         {page === "config" && (
           <ConfigPage currentUser={currentUser} onScanStarted={handleScanStarted} />
         )}

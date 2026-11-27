@@ -3,14 +3,17 @@ import type {
   AuthUser,
   CatalogProject,
   DoctorReport,
+  GitProbeResult,
   LiveProgressResponse,
   OverviewResponse,
   OwnerPreviewItem,
+  PauseState,
   ReportResponse,
   RunDetailResponse,
   RunSummary,
   ScanTask,
   ScheduleResponse,
+  StaleThresholds,
   UserRole,
 } from "./types";
 
@@ -172,7 +175,80 @@ export const api = {
     request<ReportResponse>(
       `/api/reports/${encodeURIComponent(date)}/${encodeURIComponent(runId)}/${encodeURIComponent(target)}`
     ),
-  projects: () => request<{ projects: CatalogProject[]; scan_statuses?: string[] }>("/api/projects"),
+  projects: () =>
+    request<{ projects: CatalogProject[]; stale_thresholds?: StaleThresholds; scan_statuses?: string[] }>(
+      "/api/projects"
+    ),
+  ownersList: () =>
+    request<{ users: Array<{ id: number; username: string; display_name: string; role: UserRole; email: string }> }>(
+      "/api/users?scope=owners"
+    ),
+  createProject: (payload: Partial<CatalogProject>) =>
+    request<{ project: CatalogProject }>("/api/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  updateProject: (projectId: string, payload: Partial<CatalogProject>) =>
+    request<{ project: CatalogProject }>(`/api/projects/${encodeURIComponent(projectId)}/update`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  deleteProject: (projectId: string) =>
+    request<{ ok: boolean; project_id: string }>(`/api/projects/${encodeURIComponent(projectId)}/delete`, {
+      method: "POST",
+    }),
+  probeGit: (git_url: string, branch = "") =>
+    request<GitProbeResult>("/api/projects/probe-git", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ git_url, branch }),
+    }),
+  importProjectsCsv: (csv_text: string, mode: "upsert" | "replace" = "upsert") =>
+    request<{ created: number; updated: number; errors: Array<{ line: number; project_id: string; reason: string }> }>(
+      "/api/projects/import",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ csv_text, mode }),
+      }
+    ),
+  downloadProjectsCsv: async () => {
+    const res = await fetch("/api/projects/export", { credentials: "same-origin" });
+    if (!res.ok) throw new Error(`导出失败 (HTTP ${res.status})`);
+    const blob = await res.blob();
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objUrl;
+    a.download = "projects.csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
+  },
+  refreshProjectMetrics: (project_ids?: string[]) =>
+    request<{ scanned: number; updated: number; missing_repo: number }>("/api/projects/refresh-metrics", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_ids }),
+    }),
+  saveStaleThresholds: (warn_days: number, critical_days: number) =>
+    request<{ stale_thresholds: StaleThresholds }>("/api/projects/stale-thresholds", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ warn_days, critical_days }),
+    }),
+  pauseScan: (reason = "") =>
+    request<PauseState>("/api/scans/pause", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    }),
+  resumeScan: () =>
+    request<PauseState>("/api/scans/resume", {
+      method: "POST",
+    }),
   doctor: () => request<DoctorReport>("/api/doctor"),
   schedule: () => request<ScheduleResponse>("/api/schedule"),
   saveSchedule: (payload: {

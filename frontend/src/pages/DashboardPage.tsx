@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Download } from "lucide-react";
+import { AlertTriangle, Download } from "lucide-react";
 import type { OverviewResponse, ProjectRow } from "../types";
 
 function csvCell(v: string | number | null | undefined): string {
@@ -27,6 +27,7 @@ const fmtPct = (v: number | null | undefined) => (v == null ? "—" : `${Math.ro
 export function DashboardPage({ data, loading, onOpenReport }: Props) {
   const [dept, setDept] = useState("");
   const [grade, setGrade] = useState("");
+  const [staleOnly, setStaleOnly] = useState(false);
   const [search, setSearch] = useState("");
   const [sortKey, setSortKey] = useState<keyof ProjectRow>("total");
   const [sortAsc, setSortAsc] = useState(true);
@@ -44,6 +45,7 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
         (r) =>
           (!dept || r.department === dept) &&
           (!grade || r.grade === grade) &&
+          (!staleOnly || r.stale_level === "warning" || r.stale_level === "critical") &&
           (!q || `${r.project_name} ${r.project_id} ${r.owner} ${r.tech_stack}`.toLowerCase().includes(q))
       )
       .sort((a, b) => {
@@ -54,7 +56,7 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
         if (bv == null) return -1;
         return (av > bv ? 1 : av < bv ? -1 : 0) * (sortAsc ? 1 : -1);
       });
-  }, [rows, dept, grade, search, sortKey, sortAsc]);
+  }, [rows, dept, grade, staleOnly, search, sortKey, sortAsc]);
 
   const kpis = useMemo(() => {
     const scored = filtered.filter((r) => r.total != null);
@@ -62,6 +64,8 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
     const avg = (arr: number[]) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
     const sum = (k: "P0" | "P1" | "security_p0") => filtered.reduce((a, r) => a + (r[k] || 0), 0);
     const failCount = filtered.filter((r) => r.status === "error").length;
+    const staleWarn = rows.filter((r) => r.stale_level === "warning").length;
+    const staleCrit = rows.filter((r) => r.stale_level === "critical").length;
     return {
       totalCount: filtered.length,
       failCount,
@@ -70,8 +74,10 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
       p0: sum("P0"),
       p1: sum("P1"),
       secP0: sum("security_p0"),
+      staleWarn,
+      staleCrit,
     };
-  }, [filtered]);
+  }, [filtered, rows]);
 
   const deptSummary = useMemo(() => {
     const map = new Map<string, ProjectRow[]>();
@@ -107,7 +113,7 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
   const handleExportCsv = () => {
     const header = [
       "项目ID", "项目名称", "部门", "负责人", "总评分", "较上次", "档位",
-      "安全评分", "覆盖率", "P0", "P1", "P2", "P3", "最近日期", "提交",
+      "安全评分", "覆盖率", "P0", "P1", "P2", "P3", "代码行数(LOC)", "最后提交时间", "未维护天数", "最近扫描日期", "提交",
     ];
     const lines = [
       header.join(","),
@@ -116,7 +122,9 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
           r.project_id, r.project_name, r.department, r.owner,
           r.total ?? "", r.delta_total ?? "", r.grade,
           r.security ?? "", r.coverage != null ? `${Math.round(r.coverage * 100)}%` : "",
-          r.P0, r.P1, r.P2, r.P3, r.date || "", r.commit || "",
+          r.P0, r.P1, r.P2, r.P3,
+          r.loc_total ?? "", r.last_commit_at ? r.last_commit_at.slice(0, 10) : "", r.inactive_days ?? "",
+          r.date || "", r.commit || "",
         ].map(csvCell).join(",")
       ),
     ];
@@ -180,6 +188,26 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
             {data?.latest_run
               ? `最新批次 ${data.latest_run.date} (${data.latest_run.run_id})`
               : "暂无批次记录"}
+          </div>
+        </div>
+        <div
+          className="card"
+          style={{ cursor: "pointer", borderColor: staleOnly ? "var(--warning)" : undefined }}
+          title="点击筛选长期未维护项目"
+          onClick={() => {
+            setViewMode("projects");
+            setStaleOnly((v) => !v);
+          }}
+        >
+          <div className="tile-label">长期未维护预警</div>
+          <div
+            className="tile-value"
+            style={{ color: kpis.staleCrit > 0 ? "var(--critical)" : kpis.staleWarn > 0 ? "var(--warning)" : undefined }}
+          >
+            {kpis.staleCrit + kpis.staleWarn}
+          </div>
+          <div className="tile-note">
+            停滞 ≥{data?.stale_thresholds?.critical_days ?? 180}天: {kpis.staleCrit} · ≥{data?.stale_thresholds?.warn_days ?? 90}天: {kpis.staleWarn}
           </div>
         </div>
       </div>
@@ -395,6 +423,14 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
             onChange={(e) => setSearch(e.target.value)}
             style={{ minWidth: 240 }}
           />
+          <button
+            type="button"
+            className={`weekday-btn ${staleOnly ? "active" : ""}`}
+            onClick={() => setStaleOnly((v) => !v)}
+          >
+            <AlertTriangle size={12} style={{ marginRight: 4, verticalAlign: "-2px" }} />
+            仅看长期未维护 ({kpis.staleCrit + kpis.staleWarn})
+          </button>
         </div>
 
         <div className="table-wrap">
@@ -427,13 +463,13 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
                 <th className="num sortable" onClick={() => toggleSort("P1")}>
                   P1
                 </th>
-                <th className="num sortable" onClick={() => toggleSort("P2")}>
-                  P2
+                <th className="num sortable" onClick={() => toggleSort("loc_total")}>
+                  代码量
                 </th>
-                <th className="num sortable" onClick={() => toggleSort("P3")}>
-                  P3
+                <th className="sortable" onClick={() => toggleSort("inactive_days")}>
+                  最后代码提交
                 </th>
-                <th>最近日期 / 提交</th>
+                <th>最近扫描 / 提交</th>
               </tr>
             </thead>
             <tbody>
@@ -482,8 +518,35 @@ export function DashboardPage({ data, loading, onOpenReport }: Props) {
                     <td className="num">{fmtPct(r.coverage)}</td>
                     <td className="num">{r.P0}</td>
                     <td className="num">{r.P1}</td>
-                    <td className="num">{r.P2}</td>
-                    <td className="num">{r.P3}</td>
+                    <td className="num">
+                      {r.loc_total != null ? (
+                        r.loc_total >= 10000 ? `${(r.loc_total / 10000).toFixed(1)}w` : r.loc_total.toLocaleString()
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
+                    </td>
+                    <td title={r.last_commit_subject ? `${r.last_commit_author || ""}：${r.last_commit_subject}` : undefined}>
+                      {r.last_commit_at ? (
+                        <div>
+                          <div>{r.last_commit_at.slice(0, 10)}</div>
+                          {r.stale_level === "critical" ? (
+                            <span style={{ fontSize: 11, color: "var(--critical)", fontWeight: 600 }}>
+                              停滞 {r.inactive_days}天
+                            </span>
+                          ) : r.stale_level === "warning" ? (
+                            <span style={{ fontSize: 11, color: "var(--warning)", fontWeight: 600 }}>
+                              久未更新 {r.inactive_days}天
+                            </span>
+                          ) : (
+                            <span className="muted" style={{ fontSize: 11 }}>
+                              {r.inactive_days ?? 0}天前
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
+                    </td>
                     <td>
                       <div>{r.date || "—"}</div>
                       <div className="muted" style={{ fontSize: 12 }}>
