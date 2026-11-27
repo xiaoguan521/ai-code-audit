@@ -580,6 +580,96 @@ select:disabled {
   overflow-x: auto;
 }
 
+.projects-table th,
+.projects-table td {
+  padding: 8px 8px;
+}
+
+.sticky-action-col {
+  position: sticky;
+  right: 0;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: -6px 0 12px -8px rgba(15, 23, 42, 0.16);
+  z-index: 2;
+}
+
+:root[data-theme="dark"] .sticky-action-col {
+  background: rgba(15, 23, 42, 0.95);
+  box-shadow: -6px 0 12px -8px rgba(0, 0, 0, 0.55);
+}
+
+.branch-combo-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  min-width: 240px;
+  z-index: 80;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.2);
+  overflow: hidden;
+}
+
+.branch-combo-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+}
+
+.branch-combo-search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  padding: 2px 4px;
+  font-size: 12px;
+}
+
+.branch-combo-search input:focus {
+  outline: none;
+  border: none;
+}
+
+.branch-combo-list {
+  max-height: 210px;
+  overflow-y: auto;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.branch-combo-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-1);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.branch-combo-item:hover {
+  background: var(--bg-2);
+}
+
+.branch-combo-item.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

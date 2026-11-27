@@ -211,16 +211,27 @@ class Phase2WebIntegrationTests(unittest.TestCase):
         self.assertEqual(upd["project"]["branch"], "release")
         self.assertEqual(upd["project"]["status"], "停用")
 
-        # 3. Git 探测接口（mock subprocess）
+        # 3. Git 探测接口（mock subprocess）并持久化项目健康状态 + 批量校验接口
         fake_proc = mock.Mock(returncode=0, stdout="ref: refs/heads/main\tHEAD\nabc\trefs/heads/main\ndef\trefs/heads/release\n", stderr="")
         with mock.patch("platform_db.subprocess.run", return_value=fake_proc):
             code, probe = mgr.request("POST", "/api/projects/probe-git", {
-                "git_url": "https://git.example.com/new.git", "branch": "release",
+                "git_url": "https://git.example.com/new.git", "branch": "release", "project_id": "proj-new",
             })
         self.assertEqual(code, 200)
         self.assertTrue(probe["ok"])
         self.assertTrue(probe["branch_exists"])
         self.assertEqual(probe["branches"], ["main", "release"])
+
+        # 批量校验：模拟 proj-a 分支缺失，验证 git_health == 'error'
+        missing_branch_proc = mock.Mock(returncode=0, stdout="ref: refs/heads/master\tHEAD\nabc\trefs/heads/master\n", stderr="")
+        with mock.patch("platform_db.subprocess.run", return_value=missing_branch_proc):
+            code, pall = mgr.request("POST", "/api/projects/probe-all", {"only_active": True})
+        self.assertEqual(code, 200)
+        self.assertEqual(pall["failed"], 1)
+        code, projs_chk = mgr.request("GET", "/api/projects")
+        pa_chk = next(p for p in projs_chk["projects"] if p["project_id"] == "proj-a")
+        self.assertEqual(pa_chk["git_health"], "error")
+        self.assertIn("未找到分支", pa_chk["git_health_reason"])
 
         # 4. 刷新代码量与最后提交时间 + 长期未维护阈值
         code, ref = mgr.request("POST", "/api/projects/refresh-metrics", {})
@@ -270,6 +281,7 @@ class Phase2WebIntegrationTests(unittest.TestCase):
             ("POST", "/api/projects/proj-a/update", {"branch": "dev"}),
             ("POST", "/api/projects/proj-a/delete", None),
             ("POST", "/api/projects/probe-git", {"git_url": "https://a.com/x.git"}),
+            ("POST", "/api/projects/probe-all", {}),
             ("POST", "/api/projects/import", {"csv_text": "project_id\nx\n"}),
             ("POST", "/api/projects/refresh-metrics", {}),
             ("POST", "/api/projects/stale-thresholds", {"warn_days": 30, "critical_days": 60}),

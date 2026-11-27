@@ -207,11 +207,22 @@ export const api = {
     request<{ ok: boolean; project_id: string }>(`/api/projects/${encodeURIComponent(projectId)}/delete`, {
       method: "POST",
     }),
-  probeGit: (git_url: string, branch = "") =>
+  probeGit: (git_url: string, branch = "", project_id = "") =>
     request<GitProbeResult>("/api/projects/probe-git", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ git_url, branch }),
+      body: JSON.stringify({ git_url, branch, ...(project_id ? { project_id } : {}) }),
+    }),
+  probeAllProjectsGit: (only_active = true) =>
+    request<{
+      total: number;
+      ok: number;
+      failed: number;
+      failed_items: Array<{ project_id: string; project_name: string; branch: string; error: string }>;
+    }>("/api/projects/probe-all", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ only_active }),
     }),
   importProjectsCsv: (csv_text: string, mode: "upsert" | "replace" = "upsert") =>
     request<{ created: number; updated: number; errors: Array<{ line: number; project_id: string; reason: string }> }>(

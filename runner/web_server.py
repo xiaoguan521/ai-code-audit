@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import csv
 import datetime as dt
 try:
@@ -704,6 +705,115 @@ def _merge_project_code_metrics(meta: dict, st: dict, thresholds: dict[str, int]
         "inactive_days": inactive_days,
         "stale_level": stale_level,
     }
+
+
+def _is_git_or_branch_error(raw: str | None) -> bool:
+    s = (raw or "").lower()
+    if not s:
+        return False
+    return any(tok in s for tok in (
+        "clone", "branch", "git", "not found", "repository", "remote ref",
+        "authentication", "could not read", "could not resolve", "permission denied",
+        "权限", "分支", "仓库", "无法访问", "连接失败",
+    ))
+
+
+def _latest_run_git_errors(output_dir: Path) -> dict[str, str]:
+    """从最近一次扫描批次中提取因 Git 地址/分支/鉴权失败的项目报错映射。"""
+    runs = _discover_runs(output_dir)
+    if not runs:
+        return {}
+    latest = runs[0]
+    data = _read_json(_resolve_run_file(output_dir, latest["date"], latest["run_id"]))
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for rec in data.get("projects") or []:
+        if rec.get("status") != "ok" and _is_git_or_branch_error(rec.get("error")):
+            pid = str(rec.get("project_id") or "")
+            if pid:
+                out[pid] = str(rec.get("error") or "")[:300]
+    return out
+
+
+def _compute_git_health(proj: dict, st: dict | None, run_git_err: str | None) -> tuple[str, str]:
+    """综合 URL 校验、主动探测结果、最近扫描报错与成功基线判定 Git 地址/分支健康度。"""
+    url = str(proj.get("git_url") or "").strip()
+    branch = str(proj.get("branch") or "").strip()
+    if not url or not branch:
+        return "error", "缺少 Git 地址或分支名"
+    try:
+        platform_db.validate_git_url(url)
+    except ValueError as exc:
+        return "error", str(exc)
+    if branch.startswith("-") or any(ch.isspace() for ch in branch) or ".." in branch:
+        return "error", f"分支名格式非法：{branch}"
+    chk = proj.get("git_check_ok")
+    if chk is True:
+        return "ok", ""
+    if chk is False:
+        return "error", str(proj.get("git_check_error") or "Git 连通或分支校验失败")
+    if run_git_err:
+        return "error", f"最近扫描报错：{run_git_err}"
+    if isinstance(st, dict) and st.get("last_commit"):
+        if st.get("git_url") == url and (st.get("branch") or "main") == branch:
+            return "ok", ""
+    return "unknown", ""
+
+
+def _probe_all_projects_git(output_dir: Path, db: platform_db.PlatformDB,
+                            project_ids: list[str] | None = None,
+                            only_active: bool = True) -> dict:
+    """并发批量探测项目 Git 地址与分支是否存在，并持久化健康状态。"""
+    rt_creds = _runtime_git_creds_file(output_dir)
+    cred_file = rt_creds if rt_creds.is_file() else _base_git_creds_file()
+    projects = db.list_projects()
+    target_set = set(project_ids) if project_ids else None
+    targets = [
+        p for p in projects
+        if (target_set is None or p["project_id"] in target_set)
+        and (not only_active or target_set is not None or p.get("status") == "在研")
+    ]
+    if not targets:
+        return {"total": 0, "ok": 0, "failed": 0, "failed_items": []}
+
+    def _one(p: dict) -> tuple[dict, bool, str]:
+        pid = p["project_id"]
+        branch = str(p.get("branch") or "main").strip() or "main"
+        try:
+            res = platform_db.probe_git_remote(
+                str(p.get("git_url") or ""), branch=branch, timeout_sec=10, credential_file=cred_file
+            )
+        except ValueError as exc:
+            db.update_project_git_check(pid, ok=False, error=str(exc))
+            return p, False, str(exc)
+        if not res["ok"]:
+            err = res["error"] or "仓库连通失败"
+            db.update_project_git_check(pid, ok=False, error=err)
+            return p, False, err
+        if not res["branch_exists"]:
+            err = f"远端未找到分支「{branch}」"
+            if res.get("default_branch"):
+                err += f"（默认分支：{res['default_branch']}）"
+            db.update_project_git_check(pid, ok=False, error=err)
+            return p, False, err
+        db.update_project_git_check(pid, ok=True, error="")
+        return p, True, ""
+
+    ok_cnt = 0
+    failed_items: list[dict] = []
+    with cf.ThreadPoolExecutor(max_workers=min(8, max(1, len(targets)))) as pool:
+        for p, is_ok, err in pool.map(_one, targets):
+            if is_ok:
+                ok_cnt += 1
+            else:
+                failed_items.append({
+                    "project_id": p["project_id"],
+                    "project_name": p.get("project_name") or p["project_id"],
+                    "branch": p.get("branch") or "",
+                    "error": err,
+                })
+    return {"total": len(targets), "ok": ok_cnt, "failed": len(failed_items), "failed_items": failed_items}
 
 
 def _refresh_projects_metrics(output_dir: Path, settings_path: Path | None,
@@ -2116,6 +2226,7 @@ class AuditHandler(BaseHTTPRequestHandler):
             if allowed_pids is not None:
                 projects = [p for p in projects if p["project_id"] in allowed_pids]
             thresholds = db.get_stale_thresholds()
+            run_git_errors = _latest_run_git_errors(output_dir)
             state_dir = output_dir / "state"
             enriched_projects = []
             for p in projects:
@@ -2125,6 +2236,9 @@ class AuditHandler(BaseHTTPRequestHandler):
                 if isinstance(st, dict):
                     item["state"] = st
                 item.update(_merge_project_code_metrics(item, st if isinstance(st, dict) else {}, thresholds))
+                gh, gh_reason = _compute_git_health(item, st if isinstance(st, dict) else None, run_git_errors.get(pid))
+                item["git_health"] = gh
+                item["git_health_reason"] = gh_reason
                 enriched_projects.append(item)
             return self._send_json(200, {
                 "projects": enriched_projects,
@@ -2468,13 +2582,31 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return self._send_json(400, {"error": "无效的 JSON 请求体"})
             try:
                 rt_creds = _runtime_git_creds_file(self.cfg["output_dir"])
+                branch_str = str(payload.get("branch") or "").strip()
                 res = platform_db.probe_git_remote(
                     str(payload.get("git_url") or ""),
-                    branch=str(payload.get("branch") or ""),
+                    branch=branch_str,
                     credential_file=rt_creds if rt_creds.is_file() else _base_git_creds_file(),
                 )
             except ValueError as exc:
                 return self._send_json(400, {"error": str(exc)})
+            pid_opt = str(payload.get("project_id") or "").strip()
+            if pid_opt and _is_safe_segment(pid_opt) and db.get_project(pid_opt):
+                is_ok = bool(res["ok"] and res["branch_exists"])
+                err_msg = "" if is_ok else (res["error"] or f"远端未找到分支「{branch_str}」")
+                db.update_project_git_check(pid_opt, ok=is_ok, error=err_msg)
+            return self._send_json(200, res)
+
+        if path == "/api/projects/probe-all":
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            payload = self._read_json_body() or {}
+            pids = payload.get("project_ids")
+            pid_list = [str(x) for x in pids if _is_safe_segment(str(x))] if isinstance(pids, list) and pids else None
+            only_active = bool(payload.get("only_active", True))
+            res = _probe_all_projects_git(self.cfg["output_dir"], db, project_ids=pid_list, only_active=only_active)
+            db.record_audit(cur_user, "probe_all_projects_git", target=f"{res['ok']}/{res['total']}",
+                            detail={"failed": res["failed"]}, client_ip=client_ip)
             return self._send_json(200, res)
 
         if path == "/api/projects/import":

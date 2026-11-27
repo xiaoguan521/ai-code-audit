@@ -248,6 +248,9 @@ export interface CatalogProject {
   last_commit_subject?: string;
   inactive_days?: number | null;
   stale_level?: "active" | "warning" | "critical" | "unknown";
+  git_health?: "ok" | "error" | "unknown";
+  git_health_reason?: string;
+  git_checked_at?: string | null;
   state?: {
     last_scan_date?: string;
     last_commit?: string;

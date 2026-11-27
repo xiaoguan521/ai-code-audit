@@ -528,6 +528,15 @@ class PlatformDB:
                 CREATE INDEX IF NOT EXISTS idx_email_logs_created ON email_logs(id DESC);
                 """
             )
+            # 兼容已有数据库：为 projects 表补齐 Git 连通性巡检字段
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)").fetchall()}
+            for col_name, col_def in (
+                ("git_check_ok", "INTEGER"),
+                ("git_check_error", "TEXT NOT NULL DEFAULT ''"),
+                ("git_checked_at", "TEXT"),
+            ):
+                if col_name not in cols:
+                    conn.execute(f"ALTER TABLE projects ADD COLUMN {col_name} {col_def}")
 
     @staticmethod
     def _public_user(row: sqlite3.Row | None) -> dict | None:
@@ -893,6 +902,9 @@ class PlatformDB:
             "last_commit_author": row["last_commit_author"] or "",
             "last_commit_subject": row["last_commit_subject"] or "",
             "metrics_updated_at": row["metrics_updated_at"],
+            "git_check_ok": None if row["git_check_ok"] is None else bool(row["git_check_ok"]),
+            "git_check_error": row["git_check_error"] or "",
+            "git_checked_at": row["git_checked_at"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         })
@@ -1005,17 +1017,20 @@ class PlatformDB:
         now = _now_iso()
         with self._lock, self._connect() as conn:
             exists = conn.execute(
-                "SELECT project_id FROM projects WHERE project_id = ?", (cleaned["project_id"],)
+                "SELECT project_id, git_url, branch FROM projects WHERE project_id = ?", (cleaned["project_id"],)
             ).fetchone()
             if create_only and exists:
                 raise ValueError(f"项目 ID 已存在：{cleaned['project_id']}")
             if exists:
+                git_changed = (exists["git_url"] != cleaned["git_url"] or exists["branch"] != cleaned["branch"])
                 conn.execute(
                     """
                     UPDATE projects
                     SET project_name=?, department=?, owner=?, git_url=?, branch=?, status=?,
                         tech_stack=?, project_type=?, core_flows=?, scope_out=?, materials_dir=?,
-                        weights=?, notes=?, updated_at=?
+                        weights=?, notes=?, updated_at=?,
+                        git_check_ok=CASE WHEN ? THEN NULL ELSE git_check_ok END,
+                        git_check_error=CASE WHEN ? THEN '' ELSE git_check_error END
                     WHERE project_id=?
                     """,
                     (
@@ -1023,7 +1038,9 @@ class PlatformDB:
                         cleaned["git_url"], cleaned["branch"], cleaned["status"],
                         cleaned["tech_stack"], cleaned["project_type"], cleaned["core_flows"],
                         cleaned["scope_out"], cleaned["materials_dir"], cleaned["weights"],
-                        cleaned["notes"], now, cleaned["project_id"],
+                        cleaned["notes"], now,
+                        1 if git_changed else 0, 1 if git_changed else 0,
+                        cleaned["project_id"],
                     ),
                 )
             else:
@@ -1153,6 +1170,15 @@ class PlatformDB:
                     last_commit_author, last_commit_author, last_commit_subject, last_commit_subject,
                     now, project_id,
                 ),
+            )
+
+    def update_project_git_check(self, project_id: str, *, ok: bool | None, error: str = "") -> None:
+        now = _now_iso()
+        val = None if ok is None else (1 if ok else 0)
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE projects SET git_check_ok = ?, git_check_error = ?, git_checked_at = ? WHERE project_id = ?",
+                (val, (error or "")[:300], now, project_id),
             )
 
     # ---------- 提示词模板版本管理 ----------

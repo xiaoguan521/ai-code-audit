@@ -1,11 +1,15 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
+  Check,
+  ChevronDown,
   Download,
   FolderGit2,
   GitBranch,
   Plus,
   RefreshCw,
+  Search,
+  ShieldAlert,
   Sliders,
   Trash2,
   Upload,
@@ -63,13 +67,17 @@ export function ProjectsPage({ currentUser }: Props) {
   const [statusFilter, setStatusFilter] = useState("");
   const [deptFilter, setDeptFilter] = useState("");
   const [staleFilter, setStaleFilter] = useState("");
+  const [gitHealthFilter, setGitHealthFilter] = useState("");
   const [query, setQuery] = useState("");
 
   // 新增/编辑弹窗
   const [modalMode, setModalMode] = useState<"create" | "edit" | null>(null);
   const [form, setForm] = useState<Partial<CatalogProject>>(EMPTY_FORM);
   const [probing, setProbing] = useState(false);
+  const [probingAll, setProbingAll] = useState(false);
   const [probeRes, setProbeRes] = useState<GitProbeResult | null>(null);
+  const [branchDropdownOpen, setBranchDropdownOpen] = useState(false);
+  const [branchSearch, setBranchSearch] = useState("");
 
   // CSV 导入弹窗
   const [showImport, setShowImport] = useState(false);
@@ -119,9 +127,10 @@ export function ProjectsPage({ currentUser }: Props) {
       if (deptFilter && (p.department || "").trim() !== deptFilter) return false;
       if (staleFilter === "stale" && p.stale_level !== "warning" && p.stale_level !== "critical") return false;
       if (staleFilter && staleFilter !== "stale" && p.stale_level !== staleFilter) return false;
+      if (gitHealthFilter && (p.git_health || "unknown") !== gitHealthFilter) return false;
       if (
         q &&
-        !`${p.project_id} ${p.project_name} ${p.department} ${p.owner} ${p.git_url} ${p.branch} ${p.tech_stack}`
+        !`${p.project_id} ${p.project_name} ${p.department} ${p.owner} ${p.git_url} ${p.branch} ${p.tech_stack} ${p.git_health_reason || ""}`
           .toLowerCase()
           .includes(q)
       ) {
@@ -129,25 +138,37 @@ export function ProjectsPage({ currentUser }: Props) {
       }
       return true;
     });
-  }, [projects, statusFilter, deptFilter, staleFilter, query]);
+  }, [projects, statusFilter, deptFilter, staleFilter, gitHealthFilter, query]);
 
   const stats = useMemo(() => {
     const activeScan = projects.filter((p) => p.status === "在研").length;
     const totalLoc = projects.reduce((acc, p) => acc + (p.loc_total || 0), 0);
     const critStale = projects.filter((p) => p.stale_level === "critical").length;
     const warnStale = projects.filter((p) => p.stale_level === "warning").length;
-    return { total: projects.length, activeScan, totalLoc, critStale, warnStale };
+    const gitErrorCount = projects.filter((p) => p.git_health === "error").length;
+    return { total: projects.length, activeScan, totalLoc, critStale, warnStale, gitErrorCount };
   }, [projects]);
+
+  const filteredRemoteBranches = useMemo(() => {
+    const all = probeRes?.ok ? probeRes.branches : [];
+    const q = branchSearch.trim().toLowerCase();
+    if (!q) return all;
+    return all.filter((b) => b.toLowerCase().includes(q));
+  }, [probeRes, branchSearch]);
 
   const openCreate = () => {
     setForm({ ...EMPTY_FORM });
     setProbeRes(null);
+    setBranchDropdownOpen(false);
+    setBranchSearch("");
     setModalMode("create");
   };
 
   const openEdit = (p: CatalogProject) => {
     setForm({ ...p });
     setProbeRes(null);
+    setBranchDropdownOpen(false);
+    setBranchSearch("");
     setModalMode("edit");
   };
 
@@ -159,15 +180,46 @@ export function ProjectsPage({ currentUser }: Props) {
     setProbing(true);
     setError(null);
     try {
-      const res = await api.probeGit(form.git_url.trim(), (form.branch || "").trim());
+      const res = await api.probeGit(
+        form.git_url.trim(),
+        (form.branch || "").trim(),
+        modalMode === "edit" ? (form.project_id || "") : ""
+      );
       setProbeRes(res);
-      if (res.ok && !form.branch?.trim() && res.default_branch) {
-        setForm((prev) => ({ ...prev, branch: res.default_branch }));
+      setBranchSearch("");
+      if (res.ok && res.branches.length > 0) {
+        setBranchDropdownOpen(true);
+        if (!form.branch?.trim() && res.default_branch) {
+          setForm((prev) => ({ ...prev, branch: res.default_branch }));
+        }
+      }
+      if (modalMode === "edit") {
+        void loadData();
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Git 探测失败");
     } finally {
       setProbing(false);
+    }
+  };
+
+  const handleProbeAllGit = async () => {
+    setProbingAll(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.probeAllProjectsGit(true);
+      await loadData();
+      if (res.failed > 0) {
+        setGitHealthFilter("error");
+        setNotice(`批量 Git 校验完成（共 ${res.total} 个在研项目）：正常 ${res.ok} 个，发现异常 ${res.failed} 个，已自动筛选出异常项目`);
+      } else {
+        setNotice(`批量 Git 校验完成（共 ${res.total} 个在研项目）：全部 ${res.ok} 个地址与分支均正常`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "批量校验 Git 失败");
+    } finally {
+      setProbingAll(false);
     }
   };
 
@@ -318,6 +370,21 @@ export function ProjectsPage({ currentUser }: Props) {
           </div>
           <div className="tile-note">按 Git 最近一次代码提交时间自动判定</div>
         </div>
+        <div
+          className="card"
+          style={{
+            cursor: "pointer",
+            borderColor: gitHealthFilter === "error" ? "var(--critical)" : undefined,
+          }}
+          title="点击筛选地址或分支异常的项目"
+          onClick={() => setGitHealthFilter((v) => (v === "error" ? "" : "error"))}
+        >
+          <div className="tile-label">地址 / 分支异常</div>
+          <div className="tile-value" style={{ color: stats.gitErrorCount > 0 ? "var(--critical)" : undefined }}>
+            {stats.gitErrorCount}
+          </div>
+          <div className="tile-note">点击一键筛选 · 支持下方批量校验</div>
+        </div>
       </div>
 
       {/* 主表 */}
@@ -331,6 +398,15 @@ export function ProjectsPage({ currentUser }: Props) {
               <>
                 <button type="button" className="btn btn-primary" onClick={openCreate}>
                   <Plus size={14} /> 新增项目
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={probingAll || busy}
+                  title="并发执行 git ls-remote 批量检查所有在研项目的仓库连通性与目标分支是否存在"
+                  onClick={() => void handleProbeAllGit()}
+                >
+                  <ShieldAlert size={14} /> {probingAll ? "批量校验中…" : "批量校验 Git"}
                 </button>
                 <button type="button" className="btn" disabled={busy} onClick={() => void handleRefreshMetrics()}>
                   <RefreshCw size={14} /> 刷新代码量与提交时间
@@ -374,16 +450,22 @@ export function ProjectsPage({ currentUser }: Props) {
             <option value="warning">久未更新（≥{thresholds.warn_days}天）</option>
             <option value="active">维护活跃</option>
           </select>
+          <select value={gitHealthFilter} onChange={(e) => setGitHealthFilter(e.target.value)}>
+            <option value="">全部 Git 状态</option>
+            <option value="error">地址 / 分支异常 ({stats.gitErrorCount})</option>
+            <option value="ok">Git 地址与分支正常</option>
+            <option value="unknown">尚未校验</option>
+          </select>
           <input
-            placeholder="搜索项目 ID / 名称 / 负责人 / Git 地址 / 分支"
+            placeholder="搜索项目 ID / 名称 / 负责人 / Git 地址 / 分支 / 异常原因"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            style={{ minWidth: 260 }}
+            style={{ minWidth: 240, flex: "1 1 240px", maxWidth: 360 }}
           />
         </div>
 
         <div className="table-wrap">
-          <table>
+          <table className="projects-table">
             <thead>
               <tr>
                 <th>项目</th>
@@ -392,7 +474,7 @@ export function ProjectsPage({ currentUser }: Props) {
                 <th>状态</th>
                 <th className="num">代码量 (LOC)</th>
                 <th>最后代码提交 / 活跃度</th>
-                {isAdmin && <th>操作</th>}
+                {isAdmin && <th className="sticky-action-col">操作</th>}
               </tr>
             </thead>
             <tbody>
@@ -400,23 +482,61 @@ export function ProjectsPage({ currentUser }: Props) {
                 const langs = topLangs(p.languages);
                 return (
                   <tr key={p.project_id} style={{ opacity: p.status === "在研" ? 1 : 0.6 }}>
-                    <td>
-                      <div style={{ fontWeight: 600 }}>{p.project_name}</div>
-                      <div className="muted" style={{ fontSize: 12 }}>
+                    <td style={{ whiteSpace: "normal", minWidth: 180, maxWidth: 240, wordBreak: "break-word" }}>
+                      <div style={{ fontWeight: 600, lineHeight: 1.35 }}>{p.project_name}</div>
+                      <div className="muted" style={{ fontSize: 11.5, marginTop: 2, wordBreak: "break-all" }}>
                         <code>{p.project_id}</code>
                       </div>
                     </td>
-                    <td>
+                    <td style={{ whiteSpace: "normal", minWidth: 92, maxWidth: 130 }}>
                       <div>{p.department || "—"}</div>
                       <div className="muted" style={{ fontSize: 12 }}>
                         {p.owner || "未指定"}
                       </div>
                     </td>
-                    <td style={{ whiteSpace: "normal", maxWidth: 320 }}>
-                      <div style={{ fontSize: 12, wordBreak: "break-all" }}>{p.git_url || "—"}</div>
-                      <div className="muted" style={{ fontSize: 11.5, marginTop: 2, display: "inline-flex", alignItems: "center", gap: 4 }}>
-                        <GitBranch size={11} /> {p.branch || "main"}
+                    <td style={{ whiteSpace: "normal", minWidth: 190, maxWidth: 260 }}>
+                      <div style={{ fontSize: 12, wordBreak: "break-all", lineHeight: 1.35 }}>{p.git_url || "—"}</div>
+                      <div
+                        style={{
+                          fontSize: 11.5,
+                          marginTop: 3,
+                          display: "flex",
+                          alignItems: "center",
+                          flexWrap: "wrap",
+                          gap: 6,
+                        }}
+                      >
+                        <span className="muted" style={{ display: "inline-flex", alignItems: "center", gap: 3 }}>
+                          <GitBranch size={11} /> {p.branch || "main"}
+                        </span>
+                        {p.git_health === "error" && (
+                          <span
+                            className="chip"
+                            title={p.git_health_reason || "地址或分支异常"}
+                            style={{
+                              borderColor: "var(--critical)",
+                              color: "var(--critical)",
+                              fontSize: 11,
+                              padding: "1px 6px",
+                            }}
+                          >
+                            <AlertTriangle size={10} /> 地址/分支异常
+                          </span>
+                        )}
                       </div>
+                      {p.git_health === "error" && p.git_health_reason && (
+                        <div
+                          style={{
+                            fontSize: 11,
+                            color: "var(--critical)",
+                            marginTop: 2,
+                            lineHeight: 1.35,
+                            wordBreak: "break-word",
+                          }}
+                        >
+                          {p.git_health_reason.slice(0, 90)}
+                        </div>
+                      )}
                     </td>
                     <td>
                       <span className="chip">
@@ -468,12 +588,12 @@ export function ProjectsPage({ currentUser }: Props) {
                       )}
                     </td>
                     {isAdmin && (
-                      <td>
-                        <div style={{ display: "flex", gap: 6 }}>
+                      <td className="sticky-action-col">
+                        <div style={{ display: "flex", gap: 5, flexWrap: "nowrap" }}>
                           <button
                             type="button"
                             className="btn"
-                            style={{ padding: "3px 8px", fontSize: 12 }}
+                            style={{ padding: "3px 7px", fontSize: 12 }}
                             onClick={() => openEdit(p)}
                           >
                             编辑
@@ -481,7 +601,7 @@ export function ProjectsPage({ currentUser }: Props) {
                           <button
                             type="button"
                             className="btn"
-                            style={{ padding: "3px 8px", fontSize: 12 }}
+                            style={{ padding: "3px 7px", fontSize: 12 }}
                             disabled={busy}
                             onClick={() => void handleToggleStatus(p)}
                           >
@@ -490,7 +610,7 @@ export function ProjectsPage({ currentUser }: Props) {
                           <button
                             type="button"
                             className="btn btn-danger"
-                            style={{ padding: "3px 8px", fontSize: 12 }}
+                            style={{ padding: "3px 7px", fontSize: 12 }}
                             disabled={busy}
                             onClick={() => void handleDelete(p)}
                           >
@@ -531,7 +651,10 @@ export function ProjectsPage({ currentUser }: Props) {
           <form
             className="card"
             style={{ width: "min(640px, 96vw)", maxHeight: "90vh", overflowY: "auto", display: "grid", gap: 10 }}
-            onClick={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              setBranchDropdownOpen(false);
+            }}
             onSubmit={(e) => void handleSaveProject(e)}
           >
             <div className="card-title">
@@ -614,12 +737,14 @@ export function ProjectsPage({ currentUser }: Props) {
               >
                 {probeRes.ok ? (
                   <div>
-                    连通正常！检测到 {probeRes.branches.length} 个远端分支（默认：<code>{probeRes.default_branch || "—"}</code>）
-                    {form.branch && !probeRes.branch_exists && (
+                    连通正常！检测到 <b>{probeRes.branches.length}</b> 个远端分支（默认：<code>{probeRes.default_branch || "—"}</code>）
+                    {form.branch && !probeRes.branches.includes(form.branch.trim()) ? (
                       <span style={{ color: "var(--warning)", marginLeft: 8 }}>
-                        注意：当前所填分支「{form.branch}」不在远端分支列表中
+                        注意：当前所填分支「{form.branch}」不在远端分支列表中，可在下方下拉搜索选择
                       </span>
-                    )}
+                    ) : form.branch ? (
+                      <span style={{ marginLeft: 8 }}>· 当前分支「{form.branch}」存在 ✓</span>
+                    ) : null}
                   </div>
                 ) : (
                   <div>连通失败：{probeRes.error}</div>
@@ -627,23 +752,124 @@ export function ProjectsPage({ currentUser }: Props) {
               </div>
             )}
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
-              <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
-                <span className="muted">扫描分支 *</span>
-                <input
-                  list="remote-branches"
-                  value={form.branch || "main"}
-                  onChange={(e) => setForm({ ...form, branch: e.target.value })}
-                  required
-                />
-                {probeRes?.ok && probeRes.branches.length > 0 && (
-                  <datalist id="remote-branches">
-                    {probeRes.branches.map((b) => (
-                      <option key={b} value={b} />
-                    ))}
-                  </datalist>
+            <div style={{ display: "grid", gridTemplateColumns: "1.35fr 1fr 1fr", gap: 10 }}>
+              <div
+                style={{ display: "grid", gap: 4, fontSize: 12, position: "relative" }}
+                onClick={(e) => e.stopPropagation()}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setBranchDropdownOpen(false);
+                }}
+              >
+                <span className="muted">
+                  扫描分支 *{probeRes?.ok && probeRes.branches.length > 0 ? `（支持下拉/模糊查，共 ${probeRes.branches.length} 个）` : ""}
+                </span>
+                <div style={{ display: "flex", position: "relative", alignItems: "center" }}>
+                  <input
+                    style={{ width: "100%", paddingRight: probeRes?.ok && probeRes.branches.length > 0 ? 30 : 10 }}
+                    value={form.branch || ""}
+                    placeholder="输入或选择扫描分支"
+                    onFocus={() => {
+                      if (probeRes?.ok && probeRes.branches.length > 0) setBranchDropdownOpen(true);
+                    }}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setForm({ ...form, branch: val });
+                      if (probeRes?.ok && probeRes.branches.length > 0) {
+                        setBranchSearch(val);
+                        setBranchDropdownOpen(true);
+                      }
+                    }}
+                    required
+                  />
+                  {probeRes?.ok && probeRes.branches.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBranchSearch("");
+                        setBranchDropdownOpen((v) => !v);
+                      }}
+                      title="展开/收起远端分支列表"
+                      style={{
+                        position: "absolute",
+                        right: 4,
+                        border: "none",
+                        background: "transparent",
+                        padding: 4,
+                        display: "grid",
+                        placeItems: "center",
+                        cursor: "pointer",
+                        color: "var(--text-2)",
+                      }}
+                    >
+                      <ChevronDown size={14} />
+                    </button>
+                  )}
+                </div>
+
+                {branchDropdownOpen && probeRes?.ok && probeRes.branches.length > 0 && (
+                  <div className="branch-combo-panel">
+                    <div className="branch-combo-search">
+                      <Search size={12} className="muted" />
+                      <input
+                        type="text"
+                        placeholder="输入关键词模糊筛选分支…"
+                        value={branchSearch}
+                        onChange={(e) => setBranchSearch(e.target.value)}
+                      />
+                      <span className="muted" style={{ fontSize: 11, whiteSpace: "nowrap" }}>
+                        {filteredRemoteBranches.length}/{probeRes.branches.length}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setBranchDropdownOpen(false)}
+                        style={{
+                          border: "none",
+                          background: "transparent",
+                          color: "var(--text-2)",
+                          fontSize: 11,
+                          cursor: "pointer",
+                          padding: "0 2px",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        收起
+                      </button>
+                    </div>
+                    <div className="branch-combo-list">
+                      {filteredRemoteBranches.map((b) => {
+                        const selected = (form.branch || "").trim() === b;
+                        const isDef = probeRes.default_branch === b;
+                        return (
+                          <button
+                            key={b}
+                            type="button"
+                            className={`branch-combo-item ${selected ? "active" : ""}`}
+                            onClick={() => {
+                              setForm({ ...form, branch: b });
+                              setBranchSearch("");
+                              setBranchDropdownOpen(false);
+                            }}
+                          >
+                            <span style={{ display: "inline-flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                              <GitBranch size={12} />
+                              <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{b}</span>
+                            </span>
+                            <span style={{ display: "inline-flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+                              {isDef && <span className="chip" style={{ fontSize: 10, padding: "0 5px" }}>默认</span>}
+                              {selected && <Check size={12} />}
+                            </span>
+                          </button>
+                        );
+                      })}
+                      {filteredRemoteBranches.length === 0 && (
+                        <div className="muted" style={{ padding: "10px 12px", textAlign: "center", fontSize: 12 }}>
+                          未匹配到包含「{branchSearch}」的远端分支
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 )}
-              </label>
+              </div>
               <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
                 <span className="muted">状态</span>
                 <select value={form.status || "在研"} onChange={(e) => setForm({ ...form, status: e.target.value })}>
