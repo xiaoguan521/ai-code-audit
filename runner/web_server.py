@@ -1276,9 +1276,9 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict,
         code_metrics = _merge_project_code_metrics(meta, st, thresholds)
         rows.append({
             "project_id": pid,
-            "project_name": rec.get("project_name") or meta.get("project_name") or pid,
-            "department": rec.get("department") or meta.get("department") or "",
-            "owner": rec.get("owner") or meta.get("owner") or "",
+            "project_name": meta.get("project_name") or rec.get("project_name") or pid,
+            "department": meta.get("department") or rec.get("department") or "",
+            "owner": meta.get("owner") or rec.get("owner") or "",
             "tech_stack": meta.get("tech_stack") or "",
             "branch": meta.get("branch") or st.get("branch") or "",
             "catalog_status": meta.get("status") or "",

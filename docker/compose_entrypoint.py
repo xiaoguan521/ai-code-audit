@@ -193,7 +193,16 @@ def configure_settings(settings: dict, env: dict) -> dict:
 
 def main() -> None:
     settings_file = Path(os.environ.get("AUDIT_SETTINGS_FILE", ROOT / "config/settings.json"))
-    projects_file = os.environ.get("AUDIT_PROJECTS_FILE", str(ROOT / "config/projects.csv"))
+    data_dir = os.environ.get("AUDIT_DATA_DIR", "").strip()
+    state_dir = (Path(data_dir) / "output" / "state") if data_dir else None
+    managed_csv = (state_dir / "projects.managed.csv") if state_dir else None
+    projects_file = os.environ.get("AUDIT_PROJECTS_FILE", "").strip() or (
+        str(managed_csv) if (managed_csv and managed_csv.is_file()) else str(ROOT / "config/projects.csv")
+    )
+    if state_dir and not os.environ.get("AUDIT_GIT_CREDENTIAL_FILE", "").strip():
+        rt_creds = state_dir / "git-credentials.runtime"
+        if rt_creds.is_file():
+            os.environ["AUDIT_GIT_CREDENTIAL_FILE"] = str(rt_creds)
     with settings_file.open(encoding="utf-8") as f:
         settings = configure_settings(json.load(f), os.environ)
 

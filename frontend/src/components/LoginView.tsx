@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import {
   ArrowRight,
   Cpu,
@@ -10,6 +10,7 @@ import {
   Terminal,
   User,
 } from "lucide-react";
+import { NeuralBackdrop } from "./NeuralBackdrop";
 
 interface Props {
   username: string;
@@ -36,7 +37,7 @@ const AI_TELEMETRY_LINES = [
   { tag: "HARNESS", text: "DeepSeek Headless Agent 已就绪 · 64 项八性规则装载完成" },
   { tag: "AST-MAP", text: "构建仓库代码地图 · 识别核心入口 / 鉴权 / 数据访问链路" },
   { tag: "SEC-SCAN", text: "静态预扫描联动 Semgrep & 密钥防泄露门禁检查中..." },
-  { tag: "SCORING", text: "八维加权模型收敛完成 · 自动生成 Markdown & Word 报告" },
+  { tag: "SCORING", text: "八维加权模型收敛 · 自动输出 Markdown & Word 报告" },
   { tag: "RBAC", text: "多角色隔离通道激活 · 超管 / 管理员 / 负责人分级鉴权" },
 ];
 
@@ -49,7 +50,6 @@ export function LoginView({
   onPasswordChange,
   onSubmit,
 }: Props) {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [showPwd, setShowPwd] = useState(false);
   const [activeDim, setActiveDim] = useState(0);
   const [logCursor, setLogCursor] = useState(0);
@@ -68,186 +68,14 @@ export function LoginView({
     };
   }, []);
 
-  // 交互式神经网络粒子 + 脉冲连线 Canvas 背景
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-    let width = window.innerWidth;
-    let height = window.innerHeight;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-
-    const resize = () => {
-      width = window.innerWidth;
-      height = window.innerHeight;
-      canvas.width = Math.floor(width * dpr);
-      canvas.height = Math.floor(height * dpr);
-      canvas.style.width = `${width}px`;
-      canvas.style.height = `${height}px`;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    };
-    resize();
-
-    const nodeCount = Math.max(42, Math.min(82, Math.floor((width * height) / 18500)));
-    const nodes = Array.from({ length: nodeCount }, () => ({
-      x: Math.random() * width,
-      y: Math.random() * height,
-      vx: (Math.random() - 0.5) * 0.42,
-      vy: (Math.random() - 0.5) * 0.42,
-      r: 1.3 + Math.random() * 1.9,
-      phase: Math.random() * Math.PI * 2,
-      hue: Math.random() > 0.45 ? "56, 189, 248" : "129, 140, 248",
-    }));
-
-    const pulses: Array<{ from: number; to: number; t: number; speed: number }> = [];
-    const mouse = { x: -9999, y: -9999, active: false };
-
-    const onMove = (ev: MouseEvent) => {
-      mouse.x = ev.clientX;
-      mouse.y = ev.clientY;
-      mouse.active = true;
-    };
-    const onLeave = () => {
-      mouse.active = false;
-    };
-    window.addEventListener("resize", resize);
-    window.addEventListener("mousemove", onMove, { passive: true });
-    window.addEventListener("mouseleave", onLeave);
-
-    let rafId = 0;
-    const linkDist = 148;
-    const linkDistSq = linkDist * linkDist;
-
-    const frame = (nowMs: number) => {
-      ctx.clearRect(0, 0, width, height);
-
-      // 更新节点位置
-      for (let i = 0; i < nodes.length; i++) {
-        const n = nodes[i];
-        if (!reducedMotion) {
-          n.x += n.vx;
-          n.y += n.vy;
-          if (n.x < -20) n.x = width + 20;
-          if (n.x > width + 20) n.x = -20;
-          if (n.y < -20) n.y = height + 20;
-          if (n.y > height + 20) n.y = -20;
-
-          if (mouse.active) {
-            const dx = mouse.x - n.x;
-            const dy = mouse.y - n.y;
-            const d2 = dx * dx + dy * dy;
-            if (d2 > 900 && d2 < 38000) {
-              n.x += dx * 0.0022;
-              n.y += dy * 0.0022;
-            }
-          }
-        }
-      }
-
-      // 绘制神经连线
-      for (let i = 0; i < nodes.length; i++) {
-        const a = nodes[i];
-        for (let j = i + 1; j < nodes.length; j++) {
-          const b = nodes[j];
-          const dx = a.x - b.x;
-          const dy = a.y - b.y;
-          const d2 = dx * dx + dy * dy;
-          if (d2 < linkDistSq) {
-            const alpha = (1 - Math.sqrt(d2) / linkDist) * 0.28;
-            ctx.strokeStyle = `rgba(99, 179, 255, ${alpha.toFixed(3)})`;
-            ctx.lineWidth = 0.85;
-            ctx.beginPath();
-            ctx.moveTo(a.x, a.y);
-            ctx.lineTo(b.x, b.y);
-            ctx.stroke();
-
-            if (!reducedMotion && pulses.length < 14 && Math.random() < 0.00055) {
-              pulses.push({ from: i, to: j, t: 0, speed: 0.012 + Math.random() * 0.014 });
-            }
-          }
-        }
-
-        // 鼠标星芒连接
-        if (mouse.active) {
-          const mdx = mouse.x - a.x;
-          const mdy = mouse.y - a.y;
-          const md2 = mdx * mdx + mdy * mdy;
-          if (md2 < 28000) {
-            const mAlpha = (1 - Math.sqrt(md2) / 168) * 0.45;
-            ctx.strokeStyle = `rgba(56, 189, 248, ${mAlpha.toFixed(3)})`;
-            ctx.lineWidth = 1;
-            ctx.beginPath();
-            ctx.moveTo(a.x, a.y);
-            ctx.lineTo(mouse.x, mouse.y);
-            ctx.stroke();
-          }
-        }
-      }
-
-      // 绘制光脉冲数据包
-      for (let k = pulses.length - 1; k >= 0; k--) {
-        const p = pulses[k];
-        p.t += p.speed;
-        const a = nodes[p.from];
-        const b = nodes[p.to];
-        if (!a || !b || p.t >= 1) {
-          pulses.splice(k, 1);
-          continue;
-        }
-        const px = a.x + (b.x - a.x) * p.t;
-        const py = a.y + (b.y - a.y) * p.t;
-        const grad = ctx.createRadialGradient(px, py, 0, px, py, 7);
-        grad.addColorStop(0, "rgba(125, 211, 252, 0.95)");
-        grad.addColorStop(0.5, "rgba(99, 102, 241, 0.45)");
-        grad.addColorStop(1, "rgba(99, 102, 241, 0)");
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(px, py, 7, 0, Math.PI * 2);
-        ctx.fill();
-      }
-
-      // 绘制呼吸发光节点
-      const timeSec = nowMs * 0.0022;
-      for (let i = 0; i < nodes.length; i++) {
-        const n = nodes[i];
-        const glow = 0.52 + 0.38 * Math.sin(timeSec + n.phase);
-        ctx.fillStyle = `rgba(${n.hue}, ${glow.toFixed(3)})`;
-        ctx.beginPath();
-        ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
-        ctx.fill();
-      }
-
-      if (!reducedMotion) {
-        rafId = window.requestAnimationFrame(frame);
-      }
-    };
-
-    rafId = window.requestAnimationFrame(frame);
-    return () => {
-      window.cancelAnimationFrame(rafId);
-      window.removeEventListener("resize", resize);
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseleave", onLeave);
-    };
-  }, []);
-
   const visibleLogs = [0, 1, 2].map(
     (offset) => AI_TELEMETRY_LINES[(logCursor + offset) % AI_TELEMETRY_LINES.length]
   );
 
   return (
     <div className="ai-login-stage">
-      {/* 动态神经网络粒子背景 */}
-      <canvas ref={canvasRef} className="ai-login-canvas" aria-hidden="true" />
-      {/* 赛博网格 + 光晕 + 垂直扫描光带 */}
-      <div className="ai-login-grid" aria-hidden="true" />
-      <div className="ai-login-orb ai-login-orb-1" aria-hidden="true" />
-      <div className="ai-login-orb ai-login-orb-2" aria-hidden="true" />
-      <div className="ai-login-orb ai-login-orb-3" aria-hidden="true" />
-      <div className="ai-login-scanbeam" aria-hidden="true" />
+      {/* 共享动态神经网络粒子 + 赛博网格 + 光晕 + 扫描光带 */}
+      <NeuralBackdrop variant="login" dark />
 
       <div className="ai-login-layout">
         {/* 左侧：AI 审查核心视觉区 */}

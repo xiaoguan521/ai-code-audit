@@ -345,16 +345,18 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted }: Props) {
                     <RotateCcw size={14} /> 重跑失败项 ({failedProjects.length})
                   </button>
                 )}
+                {isAdmin && detail.status !== "running" && projects.length > 0 && (
+                  <button
+                    className="btn"
+                    disabled={actionBusy}
+                    title="按负责人聚合发送本批次结果邮件（含 Word/Markdown 报告附件）"
+                    onClick={() => void handleSendBatchEmails()}
+                  >
+                    <Mail size={14} /> 发送邮件通知
+                  </button>
+                )}
                 {isAdmin && okCount > 0 && (
                   <>
-                    <button
-                      className="btn"
-                      disabled={actionBusy}
-                      title="按负责人聚合发送本批次结果邮件（含 Word/Markdown 报告附件）"
-                      onClick={() => void handleSendBatchEmails()}
-                    >
-                      <Mail size={14} /> 发送邮件通知
-                    </button>
                     <button
                       className="btn"
                       disabled={actionBusy}

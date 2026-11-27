@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, ReactNode, useEffect, useState } from "react";
 import {
   Activity,
   BarChart3,
@@ -6,7 +6,10 @@ import {
   FolderGit2,
   History,
   LogOut,
+  Menu,
   Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
   RefreshCw,
   Settings,
   ShieldCheck,
@@ -15,9 +18,11 @@ import {
   Sun,
   UserCircle2,
   Users,
+  X,
 } from "lucide-react";
 import { api, setUnauthorizedHandler } from "./api";
 import { LoginView } from "./components/LoginView";
+import { NeuralBackdrop } from "./components/NeuralBackdrop";
 import { ProfileModal } from "./components/ProfileModal";
 import { ConfigPage } from "./pages/ConfigPage";
 import { DashboardPage } from "./pages/DashboardPage";
@@ -93,6 +98,8 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [reportTarget, setReportTarget] = useState<ReportTarget | null>(initial.reportTarget);
   const [focusTaskId, setFocusTaskId] = useState<string | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? "dark" : "light";
@@ -194,6 +201,7 @@ export function App() {
 
   const navigate = (nextPage: Page) => {
     setPage(nextPage);
+    setMobileMenuOpen(false);
     window.location.hash = buildHash(nextPage, nextPage === "reports" ? reportTarget : null);
   };
 
@@ -224,149 +232,217 @@ export function App() {
     );
   }
 
+  const isAdmin = currentUser.role === "superadmin" || currentUser.role === "admin";
+  const isSuper = currentUser.role === "superadmin";
+
+  type NavItem = { id: Page; label: string; desc: string; icon: ReactNode };
+  type NavGroup = { title: string; items: NavItem[] };
+
+  const navGroups: NavGroup[] = [
+    {
+      title: "审查监控",
+      items: [
+        { id: "dashboard", label: "质量看板", desc: "八维评分趋势与长期未维护预警", icon: <BarChart3 size={16} /> },
+        { id: "progress", label: "实时进度", desc: "扫描队列监控、暂停与继续控制", icon: <Activity size={16} /> },
+        { id: "runs", label: "批次记录", desc: "历史批次清册、导出与结果邮件通知", icon: <History size={16} /> },
+        { id: "reports", label: "报告阅读", desc: "单项目八性报告与管理层汇总阅读", icon: <FileText size={16} /> },
+      ],
+    },
+    {
+      title: "资产与配置",
+      items: [
+        {
+          id: "projects",
+          label: isAdmin ? "项目管理" : "我的项目",
+          desc: isAdmin ? "Git 仓库维护、分支探测与代码活跃度" : "名下项目代码量与维护活跃度",
+          icon: <FolderGit2 size={16} />,
+        },
+        {
+          id: "config",
+          label: isAdmin ? "扫描配置" : "触发扫描",
+          desc: isAdmin ? "手动扫描、定时计划与环境自检" : "手动触发本人负责项目审查",
+          icon: <Settings size={16} />,
+        },
+        ...(isAdmin
+          ? [{ id: "prompts" as Page, label: "提示词配置", desc: "SKILL.md 与汇总提示词在线热更新与回滚", icon: <Sparkles size={16} /> }]
+          : []),
+      ],
+    },
+    ...(isAdmin
+      ? [
+          {
+            title: "系统管理",
+            items: [
+              { id: "users" as Page, label: "用户管理", desc: "账号角色授权、拼音邮箱批量生成与审计", icon: <Users size={16} /> },
+              ...(isSuper
+                ? [
+                    {
+                      id: "ops" as Page,
+                      label: "运维配置",
+                      desc: "模型接口、并发环境变量、Git 凭据与 SMTP 邮件",
+                      icon: <SlidersHorizontal size={16} />,
+                    },
+                  ]
+                : []),
+            ],
+          },
+        ]
+      : []),
+  ];
+
+  const allNavItems = navGroups.flatMap((g) => g.items);
+  const currentNav = allNavItems.find((it) => it.id === page) || allNavItems[0];
+
   return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div className="topbar-inner">
-          <div className="brand">
-            <span className="brand-badge">
-              <ShieldCheck size={17} />
-            </span>
-            <span>八性代码质量审查平台</span>
-          </div>
+    <div className={`console-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
+      <NeuralBackdrop variant="console" dark={dark} />
+      {mobileMenuOpen && (
+        <div
+          className="sidebar-backdrop no-print"
+          onClick={() => setMobileMenuOpen(false)}
+          aria-hidden="true"
+        />
+      )}
 
-          <nav className="nav-tabs">
-            <button
-              className={`nav-tab ${page === "dashboard" ? "active" : ""}`}
-              onClick={() => navigate("dashboard")}
-            >
-              <BarChart3 size={15} /> 质量看板
-            </button>
-            <button
-              className={`nav-tab ${page === "progress" ? "active" : ""}`}
-              onClick={() => navigate("progress")}
-            >
-              <Activity size={15} /> 实时进度
-            </button>
-            <button
-              className={`nav-tab ${page === "runs" ? "active" : ""}`}
-              onClick={() => navigate("runs")}
-            >
-              <History size={15} /> 批次记录
-            </button>
-            <button
-              className={`nav-tab ${page === "reports" ? "active" : ""}`}
-              onClick={() => navigate("reports")}
-            >
-              <FileText size={15} /> 报告阅读
-            </button>
-            <button
-              className={`nav-tab ${page === "projects" ? "active" : ""}`}
-              onClick={() => navigate("projects")}
-            >
-              <FolderGit2 size={15} /> {currentUser.role === "user" ? "我的项目" : "项目管理"}
-            </button>
-            {(currentUser.role === "superadmin" || currentUser.role === "admin") && (
-              <button
-                className={`nav-tab ${page === "prompts" ? "active" : ""}`}
-                onClick={() => navigate("prompts")}
-              >
-                <Sparkles size={15} /> 提示词
-              </button>
-            )}
-            <button
-              className={`nav-tab ${page === "config" ? "active" : ""}`}
-              onClick={() => navigate("config")}
-            >
-              <Settings size={15} /> {currentUser.role === "user" ? "触发扫描" : "扫描配置"}
-            </button>
-            {(currentUser.role === "superadmin" || currentUser.role === "admin") && (
-              <button
-                className={`nav-tab ${page === "users" ? "active" : ""}`}
-                onClick={() => navigate("users")}
-              >
-                <Users size={15} /> 用户管理
-              </button>
-            )}
-            {currentUser.role === "superadmin" && (
-              <button
-                className={`nav-tab ${page === "ops" ? "active" : ""}`}
-                onClick={() => navigate("ops")}
-              >
-                <SlidersHorizontal size={15} /> 运维配置
-              </button>
-            )}
-          </nav>
-
-          <div className="topbar-actions">
-            <button
-              className="btn"
-              onClick={() => setShowProfile(true)}
-              title="个人资料、公司邮箱与密码设置"
-            >
-              <UserCircle2 size={15} />
-              <span>{currentUser.display_name}</span>
-              <span className="chip" style={{ padding: "0 6px", fontSize: 11 }}>
-                {ROLE_BADGE[currentUser.role]}
-              </span>
-            </button>
-            <button className="btn" onClick={() => void loadOverview()} disabled={loading}>
-              <RefreshCw size={14} /> 刷新
-            </button>
-            <button className="btn" onClick={() => setDark(!dark)} aria-label="切换主题">
-              {dark ? <Sun size={15} /> : <Moon size={15} />}
-            </button>
-            <button className="btn" onClick={() => void handleLogout()} title="退出登录">
-              <LogOut size={14} /> 退出
-            </button>
-          </div>
+      <aside className={`sidebar no-print ${mobileMenuOpen ? "open" : ""}`}>
+        <div className="sidebar-brand">
+          <span className="brand-badge">
+            <ShieldCheck size={17} />
+          </span>
+          {!sidebarCollapsed && (
+            <div className="sidebar-brand-text">
+              <div className="sidebar-brand-title">八性代码审查</div>
+              <div className="sidebar-brand-sub">AI Audit Console</div>
+            </div>
+          )}
+          <button
+            type="button"
+            className="sidebar-mobile-close"
+            onClick={() => setMobileMenuOpen(false)}
+            aria-label="关闭菜单"
+          >
+            <X size={16} />
+          </button>
         </div>
-      </header>
 
-      <main className="main-wrap">
-        {error && (
-          <div className="card no-print" style={{ marginBottom: 14, borderColor: "var(--critical)" }}>
-            <b style={{ color: "var(--critical)" }}>API 连接提示：</b>
-            <span>{error}</span>
+        <nav className="sidebar-nav">
+          {navGroups.map((group) => (
+            <div key={group.title} className="sidebar-group">
+              {!sidebarCollapsed && <div className="sidebar-group-title">{group.title}</div>}
+              {group.items.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  title={sidebarCollapsed ? item.label : undefined}
+                  className={`sidebar-item ${page === item.id ? "active" : ""}`}
+                  onClick={() => navigate(item.id)}
+                >
+                  <span className="sidebar-item-icon">{item.icon}</span>
+                  {!sidebarCollapsed && <span className="sidebar-item-label">{item.label}</span>}
+                </button>
+              ))}
+            </div>
+          ))}
+        </nav>
+
+        <div className="sidebar-footer">
+          <button
+            type="button"
+            className="sidebar-collapse-btn"
+            onClick={() => setSidebarCollapsed((v) => !v)}
+            title={sidebarCollapsed ? "展开侧边栏" : "收起侧边栏"}
+          >
+            {sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+            {!sidebarCollapsed && <span>收起菜单</span>}
+          </button>
+        </div>
+      </aside>
+
+      <div className="console-body">
+        <header className="topbar no-print">
+          <div className="topbar-console-inner">
+            <div className="topbar-left">
+              <button
+                type="button"
+                className="btn mobile-menu-btn"
+                onClick={() => setMobileMenuOpen(true)}
+                aria-label="打开菜单"
+              >
+                <Menu size={16} />
+              </button>
+              <div className="page-heading">
+                <span className="page-heading-title">{currentNav.label}</span>
+                <span className="page-heading-sep">/</span>
+                <span className="page-heading-desc">{currentNav.desc}</span>
+              </div>
+            </div>
+
+            <div className="topbar-actions">
+              <button
+                className="btn"
+                onClick={() => setShowProfile(true)}
+                title="个人资料、公司邮箱与密码设置"
+              >
+                <UserCircle2 size={15} />
+                <span>{currentUser.display_name}</span>
+                <span className="chip" style={{ padding: "0 6px", fontSize: 11 }}>
+                  {ROLE_BADGE[currentUser.role]}
+                </span>
+              </button>
+              <button className="btn" onClick={() => void loadOverview()} disabled={loading} title="刷新看板数据">
+                <RefreshCw size={14} /> 刷新
+              </button>
+              <button className="btn" onClick={() => setDark(!dark)} aria-label="切换主题" title="切换明暗主题">
+                {dark ? <Sun size={15} /> : <Moon size={15} />}
+              </button>
+              <button className="btn" onClick={() => void handleLogout()} title="退出登录">
+                <LogOut size={14} /> 退出
+              </button>
+            </div>
           </div>
-        )}
-        {page === "dashboard" && (
-          <DashboardPage data={overview} loading={loading} onOpenReport={openReport} />
-        )}
-        {page === "progress" && (
-          <ProgressPage
-            currentUser={currentUser}
-            initialTaskId={focusTaskId}
-            onOpenReport={openReport}
-            onScanStarted={handleScanStarted}
-          />
-        )}
-        {page === "runs" && (
-          <RunsPage
-            currentUser={currentUser}
-            onOpenReport={openReport}
-            onScanStarted={handleScanStarted}
-          />
-        )}
-        {page === "reports" && (
-          <ReportsPage
-            currentUser={currentUser}
-            initialTarget={reportTarget}
-            onTargetChange={setReportTarget}
-          />
-        )}
-        {page === "projects" && <ProjectsPage currentUser={currentUser} />}
-        {page === "prompts" && (currentUser.role === "superadmin" || currentUser.role === "admin") && (
-          <PromptsPage />
-        )}
-        {page === "config" && (
-          <ConfigPage currentUser={currentUser} onScanStarted={handleScanStarted} />
-        )}
-        {page === "users" && (currentUser.role === "superadmin" || currentUser.role === "admin") && (
-          <UsersPage currentUser={currentUser} />
-        )}
-        {page === "ops" && currentUser.role === "superadmin" && <OpsConfigPage />}
-      </main>
+        </header>
+
+        <main className="main-wrap">
+          {error && (
+            <div className="card no-print" style={{ marginBottom: 14, borderColor: "var(--critical)" }}>
+              <b style={{ color: "var(--critical)" }}>API 连接提示：</b>
+              <span>{error}</span>
+            </div>
+          )}
+          {page === "dashboard" && (
+            <DashboardPage data={overview} loading={loading} onOpenReport={openReport} />
+          )}
+          {page === "progress" && (
+            <ProgressPage
+              currentUser={currentUser}
+              initialTaskId={focusTaskId}
+              onOpenReport={openReport}
+              onScanStarted={handleScanStarted}
+            />
+          )}
+          {page === "runs" && (
+            <RunsPage
+              currentUser={currentUser}
+              onOpenReport={openReport}
+              onScanStarted={handleScanStarted}
+            />
+          )}
+          {page === "reports" && (
+            <ReportsPage
+              currentUser={currentUser}
+              initialTarget={reportTarget}
+              onTargetChange={setReportTarget}
+            />
+          )}
+          {page === "projects" && <ProjectsPage currentUser={currentUser} />}
+          {page === "prompts" && isAdmin && <PromptsPage />}
+          {page === "config" && (
+            <ConfigPage currentUser={currentUser} onScanStarted={handleScanStarted} />
+          )}
+          {page === "users" && isAdmin && <UsersPage currentUser={currentUser} />}
+          {page === "ops" && isSuper && <OpsConfigPage />}
+        </main>
+      </div>
 
       {(showProfile || currentUser.must_change_password) && (
         <ProfileModal
