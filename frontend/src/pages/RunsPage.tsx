@@ -68,6 +68,7 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [confirmKind, setConfirmKind] = useState<"delete_run" | "send_emails" | null>(null);
+  const [confirmError, setConfirmError] = useState<string | null>(null);
 
   // 清册筛选状态
   const [statusFilter, setStatusFilter] = useState<"" | "ok" | "error">("");
@@ -162,14 +163,17 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
     }
   };
 
+  const activeDate = detail?.date || selected?.date || "";
+  const activeRunId = detail?.run_id || selected?.run_id || "";
+
   const handleMarkAborted = async () => {
-    if (!detail) return;
+    if (!detail || !activeDate || !activeRunId) return;
     setActionBusy(true);
     setError(null);
     try {
-      await api.markRunAborted(detail.date, detail.run_id);
+      await api.markRunAborted(activeDate, activeRunId);
       await loadRuns();
-      const updated = await api.runDetail(detail.date, detail.run_id);
+      const updated = await api.runDetail(activeDate, activeRunId);
       setDetail(updated);
     } catch (err) {
       setError(err instanceof Error ? err.message : "标记中断失败");
@@ -180,16 +184,19 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
 
   const handleDeleteRun = () => {
     if (!detail) return;
+    setConfirmError(null);
     setConfirmKind("delete_run");
   };
 
   const confirmDeleteRun = async () => {
-    if (!detail) return;
+    if (!detail || !activeDate || !activeRunId) return;
     setActionBusy(true);
     setError(null);
+    setConfirmError(null);
     try {
-      await api.deleteRun(detail.date, detail.run_id);
+      await api.deleteRun(activeDate, activeRunId);
       setConfirmKind(null);
+      setNotice(`已永久删除批次 ${activeDate} / ${activeRunId}`);
       const res = await api.runs();
       setRuns(res.runs);
       if (res.runs.length > 0) {
@@ -199,21 +206,23 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
         setDetail(null);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "删除批次失败");
+      const msg = err instanceof Error ? err.message : "删除批次失败";
+      setConfirmError(msg);
+      setError(msg);
     } finally {
       setActionBusy(false);
     }
   };
 
   const handleViewRejected = async (pid: string, name: string) => {
-    if (!detail) return;
+    if (!detail || !activeDate || !activeRunId) return;
     setError(null);
     try {
-      const res = await api.rejectedDraft(detail.date, detail.run_id, pid);
+      const res = await api.rejectedDraft(activeDate, activeRunId, pid);
       setDraftModal({
         title: `${name}（${pid}）被拦截的原始输出`,
         markdown: res.markdown,
-        filenameBase: `${detail.date}_${pid}_draft`,
+        filenameBase: `${activeDate}_${pid}_draft`,
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载拦截草稿失败");
@@ -221,14 +230,14 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
   };
 
   const handleGenerateSummary = async () => {
-    if (!detail) return;
+    if (!detail || !activeDate || !activeRunId) return;
     setActionBusy(true);
     setError(null);
     try {
-      await api.generateSummary(detail.date, detail.run_id);
-      const updated = await api.runDetail(detail.date, detail.run_id);
+      await api.generateSummary(activeDate, activeRunId);
+      const updated = await api.runDetail(activeDate, activeRunId);
       setDetail(updated);
-      onOpenReport(detail.date, detail.run_id, "_summary");
+      onOpenReport(activeDate, activeRunId, "_summary");
     } catch (err) {
       setError(err instanceof Error ? err.message : "生成汇总报告失败");
     } finally {
@@ -237,13 +246,13 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
   };
 
   const handleDownloadSummaryWord = async () => {
-    if (!detail) return;
+    if (!detail || !activeDate || !activeRunId) return;
     setActionBusy(true);
     setError(null);
     setNotice(null);
     try {
-      await api.downloadReportDocx(detail.date, detail.run_id, "_summary", true);
-      const updated = await api.runDetail(detail.date, detail.run_id).catch(() => null);
+      await api.downloadReportDocx(activeDate, activeRunId, "_summary", true);
+      const updated = await api.runDetail(activeDate, activeRunId).catch(() => null);
       if (updated) setDetail(updated);
     } catch (err) {
       setError(err instanceof Error ? err.message : "导出 Word 汇总失败");
@@ -254,20 +263,24 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
 
   const handleSendBatchEmails = () => {
     if (!detail) return;
+    setConfirmError(null);
     setConfirmKind("send_emails");
   };
 
   const confirmSendBatchEmails = async () => {
-    if (!detail) return;
+    if (!detail || !activeDate || !activeRunId) return;
     setActionBusy(true);
     setError(null);
+    setConfirmError(null);
     setNotice(null);
     try {
-      const res = await api.sendRunEmails(detail.date, detail.run_id);
+      const res = await api.sendRunEmails(activeDate, activeRunId);
       setConfirmKind(null);
       setNotice(`邮件投递完成：成功 ${res.sent} 封，失败 ${res.failed} 封，按偏好跳过 ${res.skipped} 人`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "发送批次邮件失败");
+      const msg = err instanceof Error ? err.message : "发送批次邮件失败";
+      setConfirmError(msg);
+      setError(msg);
     } finally {
       setActionBusy(false);
     }
@@ -337,7 +350,7 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
           <div>
             <div className="card-title" style={{ flexWrap: "wrap" }}>
               <span>
-                批次详情：{detail.date} / {detail.run_id}
+                批次详情：{activeDate} / {activeRunId}
               </span>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 {isAdmin && detail.status === "running" && (
@@ -685,18 +698,22 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
         tone={confirmKind === "delete_run" ? "danger" : "info"}
         title={
           confirmKind === "delete_run"
-            ? `确认永久删除批次 ${detail?.date} / ${detail?.run_id}？`
+            ? `确认永久删除批次 ${activeDate} / ${activeRunId}？`
             : `确认发送本批次审查结果邮件？`
         }
         description={
           confirmKind === "delete_run"
             ? "该批次的运行记录与项目报告将被彻底清除；若项目最新基线指向该批次，系统会自动回退到上一次有效扫描结果。"
-            : `将按项目负责人聚合发送批次（${detail?.date} / ${detail?.run_id}）的 HTML 报告与附件（并按配置抄送管理汇总）。`
+            : `将按项目负责人聚合发送批次（${activeDate} / ${activeRunId}）的 HTML 报告与附件（并按配置抄送管理汇总）。`
         }
         confirmLabel={confirmKind === "delete_run" ? "永久删除批次" : "确认发送邮件"}
+        error={confirmError}
         busy={actionBusy}
         onConfirm={() => void (confirmKind === "delete_run" ? confirmDeleteRun() : confirmSendBatchEmails())}
-        onCancel={() => setConfirmKind(null)}
+        onCancel={() => {
+          setConfirmError(null);
+          setConfirmKind(null);
+        }}
       />
     </div>
   );

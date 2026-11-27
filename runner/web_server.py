@@ -1778,45 +1778,52 @@ def _rollback_states_for_deleted_run(output_dir: Path, deleted_rep_dir: Path, de
     cleared: list[str] = []
     reports_root = (output_dir / "reports").resolve()
 
+    # 外层仅遍历一次历史批次，避免 O(项目数 × 历史批次数) 反复读盘导致删除卡顿；
+    # 全部受影响项目找到最新可用历史记录后立刻提前终止。
+    need_pids = set(affected_pids)
+    found_map: dict[str, tuple[dict, dict, Path]] = {}
+    for r in remaining_runs:
+        if not need_pids:
+            break
+        rdata = _read_json(_resolve_run_file(output_dir, r["date"], r["run_id"]))
+        if not isinstance(rdata, dict):
+            continue
+        rrep_dir = _resolve_report_dir(output_dir, r["date"], r["run_id"])
+        for rec in rdata.get("projects") or []:
+            pid = str(rec.get("project_id") or "")
+            if pid not in need_pids or rec.get("status") != "ok":
+                continue
+            cand_raw = str(rec.get("report_path") or "").strip()
+            cand = Path(cand_raw) if cand_raw else (rrep_dir / f"{pid}.md")
+            if not cand.is_file():
+                cand = rrep_dir / f"{pid}.md"
+            try:
+                cand_res = cand.resolve()
+            except OSError:
+                continue
+            if not cand_res.is_relative_to(reports_root) or not cand_res.is_file():
+                continue
+            found_map[pid] = (r, rec, cand_res)
+            need_pids.discard(pid)
+
     for pid in affected_pids:
         sf = state_dir / f"{pid}.json"
         old_st = _read_json(sf) or {}
-        found_state: dict | None = None
-        for r in remaining_runs:
-            rdata = _read_json(_resolve_run_file(output_dir, r["date"], r["run_id"]))
-            if not isinstance(rdata, dict):
-                continue
-            rrep_dir = _resolve_report_dir(output_dir, r["date"], r["run_id"])
-            for rec in rdata.get("projects") or []:
-                if rec.get("project_id") != pid or rec.get("status") != "ok":
-                    continue
-                cand_raw = str(rec.get("report_path") or "").strip()
-                cand = Path(cand_raw) if cand_raw else (rrep_dir / f"{pid}.md")
-                if not cand.is_file():
-                    cand = rrep_dir / f"{pid}.md"
-                try:
-                    cand_res = cand.resolve()
-                except OSError:
-                    continue
-                if not cand_res.is_relative_to(reports_root) or not cand_res.is_file():
-                    continue
-                found_state = dict(old_st) if isinstance(old_st, dict) else {}
-                found_state.update({
-                    "last_commit": rec.get("commit") or found_state.get("last_commit") or "",
-                    "last_report": str(cand_res),
-                    "last_scan_date": r["date"],
-                    "report_mode": rec.get("report_mode") or rdata.get("report_mode") or "standard",
-                    "scores": rec.get("report_scores"),
-                })
-                if "incremental_streak" in rec:
-                    found_state["incremental_streak"] = rec["incremental_streak"]
-                if "last_full_date" in rec:
-                    found_state["last_full_date"] = rec["last_full_date"]
-                break
-            if found_state is not None:
-                break
-
-        if found_state is not None:
+        hit = found_map.get(pid)
+        if hit is not None:
+            r, rec, cand_res = hit
+            found_state = dict(old_st) if isinstance(old_st, dict) else {}
+            found_state.update({
+                "last_commit": rec.get("commit") or found_state.get("last_commit") or "",
+                "last_report": str(cand_res),
+                "last_scan_date": r["date"],
+                "report_mode": rec.get("report_mode") or r.get("report_mode") or "standard",
+                "scores": rec.get("report_scores"),
+            })
+            if "incremental_streak" in rec:
+                found_state["incremental_streak"] = rec["incremental_streak"]
+            if "last_full_date" in rec:
+                found_state["last_full_date"] = rec["last_full_date"]
             tmp = sf.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(found_state, ensure_ascii=False, indent=2), encoding="utf-8")
             try:
@@ -2338,6 +2345,8 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return self._send_json(404, {"error": "未找到该批次运行记录"})
             rep_dir = _resolve_report_dir(output_dir, date_str, run_id)
             res_dir = run_file.parent
+            data["date"] = data.get("date") or date_str
+            data["run_id"] = data.get("run_id") or run_id
             data["has_summary"] = (rep_dir / "_summary.md").is_file() and allowed_pids is None
             data["can_delete"] = _can_delete_run(cur_user, data)
             data.setdefault("triggered_by", "")

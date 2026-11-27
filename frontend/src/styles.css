@@ -1873,14 +1873,25 @@ tbody tr.clickable:hover {
   flex-wrap: wrap;
 }
 
-.btn-danger-solid {
+.btn.btn-danger-solid {
   background: var(--critical);
   color: #fff;
   border-color: var(--critical);
+  transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, transform 0.12s ease;
 }
 
-.btn-danger-solid:hover:not(:disabled) {
-  filter: brightness(0.92);
+.btn.btn-danger-solid:hover:not(:disabled) {
+  background: #b91c1c;
+  border-color: #b91c1c;
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(220, 38, 38, 0.34);
+}
+
+.btn.btn-danger-solid:active:not(:disabled) {
+  background: #991b1b;
+  border-color: #991b1b;
+  color: #fff;
+  transform: translateY(0.5px);
 }
 
 /* 统一弹窗遮罩与入场动效 */

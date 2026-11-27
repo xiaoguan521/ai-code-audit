@@ -8,6 +8,7 @@ export interface ConfirmDialogProps {
   description: string;
   previewItems?: string[];
   footnote?: string;
+  error?: string | null;
   confirmLabel?: string;
   cancelLabel?: string;
   busy?: boolean;
@@ -22,6 +23,7 @@ export function ConfirmDialog({
   description,
   previewItems,
   footnote,
+  error,
   confirmLabel = "确认执行",
   cancelLabel = "取消",
   busy = false,
@@ -94,6 +96,22 @@ export function ConfirmDialog({
         )}
 
         {footnote && <div className="confirm-footnote">{footnote}</div>}
+
+        {error && (
+          <div
+            style={{
+              fontSize: 12.5,
+              padding: "8px 10px",
+              borderRadius: 8,
+              border: "1px solid var(--critical)",
+              background: "color-mix(in srgb, var(--critical) 10%, transparent)",
+              color: "var(--critical)",
+              lineHeight: 1.45,
+            }}
+          >
+            {error}
+          </div>
+        )}
 
         <div className="confirm-footer">
           <button type="button" className="btn" disabled={busy} onClick={onCancel}>
