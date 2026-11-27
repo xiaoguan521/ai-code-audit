@@ -434,7 +434,13 @@ export function App() {
               onTargetChange={setReportTarget}
             />
           )}
-          {page === "projects" && <ProjectsPage currentUser={currentUser} />}
+          {page === "projects" && (
+            <ProjectsPage
+              currentUser={currentUser}
+              onOpenReport={openReport}
+              onScanStarted={handleScanStarted}
+            />
+          )}
           {page === "prompts" && isAdmin && <PromptsPage />}
           {page === "config" && (
             <ConfigPage currentUser={currentUser} onScanStarted={handleScanStarted} />

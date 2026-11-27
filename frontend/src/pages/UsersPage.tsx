@@ -1,6 +1,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import { KeyRound, Plus, RefreshCw, Shield, Trash2, UserPlus, Users } from "lucide-react";
 import { api } from "../api";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import type { AuditLogEntry, AuthUser, OwnerPreviewItem, UserRole } from "../types";
 
 interface Props {
@@ -21,6 +22,8 @@ export function UsersPage({ currentUser }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<AuthUser | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   // 新建用户表单
   const [showCreate, setShowCreate] = useState(false);
@@ -136,16 +139,24 @@ export function UsersPage({ currentUser }: Props) {
     }
   };
 
-  const handleDelete = async (u: AuthUser) => {
-    if (!window.confirm(`确定删除用户 ${u.display_name}（${u.username}）吗？`)) return;
+  const handleDelete = (u: AuthUser) => {
+    setDeleteTarget(u);
+  };
+
+  const confirmDeleteUser = async () => {
+    if (!deleteTarget) return;
+    setDeleting(true);
     setError(null);
     setNotice(null);
     try {
-      await api.deleteUser(u.id);
-      setNotice(`已删除用户 ${u.username}`);
+      await api.deleteUser(deleteTarget.id);
+      setNotice(`已删除用户 ${deleteTarget.username}`);
+      setDeleteTarget(null);
       await loadData();
     } catch (err) {
       setError(err instanceof Error ? err.message : "删除用户失败");
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -694,6 +705,17 @@ export function UsersPage({ currentUser }: Props) {
           </div>
         </div>
       )}
+      <ConfirmDialog
+        open={Boolean(deleteTarget)}
+        tone="danger"
+        title={deleteTarget ? `确认删除用户「${deleteTarget.display_name}」？` : ""}
+        description="删除后该账号将立即失效且无法再登录平台，其历史审计日志仍会保留。"
+        previewItems={deleteTarget ? [`${deleteTarget.display_name} (${deleteTarget.username})`] : undefined}
+        confirmLabel="确认删除"
+        busy={deleting}
+        onConfirm={() => void confirmDeleteUser()}
+        onCancel={() => setDeleteTarget(null)}
+      />
     </div>
   );
 }

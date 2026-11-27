@@ -1096,6 +1096,35 @@ class PlatformDB:
             self.export_projects_csv(managed_csv)
         return proj
 
+    def batch_update_project_status(self, project_ids: list[str], status: str, *,
+                                    managed_csv: Path | None = None) -> dict:
+        target_status = (status or "").strip()
+        if target_status not in VALID_PROJECT_STATUSES:
+            raise ValueError(f"状态必须是 {' / '.join(VALID_PROJECT_STATUSES)}")
+        clean_ids = [str(x).strip() for x in project_ids if str(x).strip()]
+        clean_ids = list(dict.fromkeys(clean_ids))
+        if not clean_ids:
+            raise ValueError("请至少选择一个项目")
+        now = _now_iso()
+        placeholders = ",".join("?" for _ in clean_ids)
+        with self._lock, self._connect() as conn:
+            existing = [
+                r["project_id"]
+                for r in conn.execute(
+                    f"SELECT project_id FROM projects WHERE project_id IN ({placeholders})",
+                    clean_ids,
+                ).fetchall()
+            ]
+            if existing:
+                ph2 = ",".join("?" for _ in existing)
+                conn.execute(
+                    f"UPDATE projects SET status = ?, updated_at = ? WHERE project_id IN ({ph2})",
+                    [target_status, now, *existing],
+                )
+        if managed_csv is not None and existing:
+            self.export_projects_csv(managed_csv)
+        return {"updated": len(existing), "status": target_status, "project_ids": existing}
+
     def delete_project(self, project_id: str, *, managed_csv: Path | None = None) -> dict:
         with self._lock, self._connect() as conn:
             row = conn.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()

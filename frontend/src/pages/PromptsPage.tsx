@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Check, History, RefreshCw, RotateCcw, Sparkles } from "lucide-react";
 import { api } from "../api";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import type { PromptItem } from "../types";
 
 export function PromptsPage() {
@@ -12,6 +13,11 @@ export function PromptsPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [confirmAction, setConfirmAction] = useState<
+    | { kind: "reset" }
+    | { kind: "rollback"; versionId: number; verNum: number }
+    | null
+  >(null);
 
   const loadData = async (keepKey?: PromptItem["key"]) => {
     setLoading(true);
@@ -66,39 +72,40 @@ export function PromptsPage() {
     }
   };
 
-  const handleReset = async () => {
+  const handleReset = () => {
     if (!current) return;
-    if (!window.confirm(`确定将「${current.title}」恢复为镜像内置默认版本吗？（历史版本记录仍会保留）`)) return;
-    setBusy(true);
-    setError(null);
-    setNotice(null);
-    try {
-      const res = await api.resetPrompt(current.key);
-      setPrompts(res.prompts);
-      const updated = res.prompts.find((p) => p.key === current.key);
-      if (updated) setDraft(updated.content);
-      setNotice(`已恢复「${current.title}」为内置默认版本`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "恢复默认失败");
-    } finally {
-      setBusy(false);
-    }
+    setConfirmAction({ kind: "reset" });
   };
 
-  const handleRollback = async (versionId: number, verNum: number) => {
+  const handleRollback = (versionId: number, verNum: number) => {
     if (!current) return;
-    if (!window.confirm(`确认回滚「${current.title}」到历史版本 v${verNum} 吗？`)) return;
+    setConfirmAction({ kind: "rollback", versionId, verNum });
+  };
+
+  const executeConfirm = async () => {
+    if (!current || !confirmAction) return;
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
-      const res = await api.rollbackPrompt(current.key, versionId);
-      setPrompts(res.prompts);
-      const updated = res.prompts.find((p) => p.key === current.key);
-      if (updated) setDraft(updated.content);
-      setNotice(`已回滚至 v${verNum} 并热生效`);
+      if (confirmAction.kind === "reset") {
+        const res = await api.resetPrompt(current.key);
+        setPrompts(res.prompts);
+        const updated = res.prompts.find((p) => p.key === current.key);
+        if (updated) setDraft(updated.content);
+        setNotice(`已恢复「${current.title}」为内置默认版本`);
+      } else {
+        const res = await api.rollbackPrompt(current.key, confirmAction.versionId);
+        setPrompts(res.prompts);
+        const updated = res.prompts.find((p) => p.key === current.key);
+        if (updated) setDraft(updated.content);
+        setNotice(`已回滚至 v${confirmAction.verNum} 并热生效`);
+      }
+      setConfirmAction(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "回滚失败");
+      setError(
+        err instanceof Error ? err.message : confirmAction.kind === "reset" ? "恢复默认失败" : "回滚失败"
+      );
     } finally {
       setBusy(false);
     }
@@ -314,6 +321,24 @@ export function PromptsPage() {
           )}
         </div>
       </div>
+      <ConfirmDialog
+        open={Boolean(confirmAction && current)}
+        tone="warning"
+        title={
+          confirmAction?.kind === "reset"
+            ? `确认将「${current?.title || ""}」恢复为内置默认版本？`
+            : `确认回滚「${current?.title || ""}」到历史版本 v${confirmAction?.kind === "rollback" ? confirmAction.verNum : ""}？`
+        }
+        description={
+          confirmAction?.kind === "reset"
+            ? "恢复后下一次扫描将使用镜像内置的默认提示词，已保存的历史版本记录仍会保留，可随时切回。"
+            : "回滚后将立即热生效并在下一次扫描中自动挂载该历史版本。"
+        }
+        confirmLabel={confirmAction?.kind === "reset" ? "确认恢复默认" : "确认回滚"}
+        busy={busy}
+        onConfirm={() => void executeConfirm()}
+        onCancel={() => setConfirmAction(null)}
+      />
     </div>
   );
 }

@@ -252,11 +252,15 @@ class Phase2WebIntegrationTests(unittest.TestCase):
         pa_ov = next(r for r in ov["rows"] if r["project_id"] == "proj-a")
         self.assertEqual(pa_ov["stale_level"], "critical")
 
-        # 5. CSV 批量导入与删除项目
+        # 5. CSV 批量导入、批量状态切换与删除项目
         csv_body = "project_id,project_name,department,owner,git_url,branch,status\nproj-csv,CSV导入项目,测试部,康特,https://git.example.com/csv.git,main,在研\n"
         code, imp = mgr.request("POST", "/api/projects/import", {"csv_text": csv_body, "mode": "upsert"})
         self.assertEqual(code, 200)
         self.assertEqual(imp["created"], 1)
+        code, bstat = mgr.request("POST", "/api/projects/batch-status", {"project_ids": ["proj-csv"], "status": "停用"})
+        self.assertEqual(code, 200)
+        self.assertEqual(bstat["updated"], 1)
+        self.assertEqual(bstat["status"], "停用")
         self.assertEqual(mgr.request("POST", "/api/projects/proj-csv/delete")[0], 200)
 
         # 6. 暂停 / 继续扫描状态同步到 progress 接口
@@ -282,6 +286,7 @@ class Phase2WebIntegrationTests(unittest.TestCase):
             ("POST", "/api/projects/proj-a/delete", None),
             ("POST", "/api/projects/probe-git", {"git_url": "https://a.com/x.git"}),
             ("POST", "/api/projects/probe-all", {}),
+            ("POST", "/api/projects/batch-status", {"project_ids": ["proj-a"], "status": "停用"}),
             ("POST", "/api/projects/import", {"csv_text": "project_id\nx\n"}),
             ("POST", "/api/projects/refresh-metrics", {}),
             ("POST", "/api/projects/stale-thresholds", {"warn_days": 30, "critical_days": 60}),

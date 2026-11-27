@@ -218,7 +218,7 @@ export const api = {
         ...(vcs_type ? { vcs_type } : {}),
       }),
     }),
-  probeAllProjectsGit: (only_active = true) =>
+  probeAllProjectsGit: (only_active = true, project_ids?: string[]) =>
     request<{
       total: number;
       ok: number;
@@ -227,7 +227,16 @@ export const api = {
     }>("/api/projects/probe-all", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ only_active }),
+      body: JSON.stringify({
+        only_active,
+        ...(project_ids && project_ids.length > 0 ? { project_ids } : {}),
+      }),
+    }),
+  batchUpdateProjectStatus: (project_ids: string[], status: string) =>
+    request<{ updated: number; status: string; project_ids: string[] }>("/api/projects/batch-status", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_ids, status }),
     }),
   importProjectsCsv: (csv_text: string, mode: "upsert" | "replace" = "upsert") =>
     request<{ created: number; updated: number; errors: Array<{ line: number; project_id: string; reason: string }> }>(

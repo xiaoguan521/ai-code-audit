@@ -2248,6 +2248,17 @@ class AuditHandler(BaseHTTPRequestHandler):
                 st = _read_json(state_dir / f"{pid}.json") if state_dir.is_dir() else None
                 if isinstance(st, dict):
                     item["state"] = st
+                    last_rep_raw = str(st.get("last_report") or "").strip()
+                    if last_rep_raw:
+                        try:
+                            rep_path = Path(last_rep_raw).resolve()
+                            reports_root = (output_dir / "reports").resolve()
+                            if rep_path.is_file() and rep_path.is_relative_to(reports_root):
+                                rel_parts = rep_path.relative_to(reports_root).parts
+                                if len(rel_parts) >= 3:
+                                    item["latest_report"] = {"date": rel_parts[0], "run_id": rel_parts[1]}
+                        except (OSError, ValueError):
+                            pass
                 item.update(_merge_project_code_metrics(item, st if isinstance(st, dict) else {}, thresholds))
                 gh, gh_reason = _compute_git_health(item, st if isinstance(st, dict) else None, run_git_errors.get(pid))
                 item["git_health"] = gh
@@ -2610,6 +2621,27 @@ class AuditHandler(BaseHTTPRequestHandler):
                 is_ok = bool(res["ok"] and res["branch_exists"])
                 err_msg = "" if is_ok else (res["error"] or f"远端未找到分支「{branch_str}」")
                 db.update_project_git_check(pid_opt, ok=is_ok, error=err_msg)
+            return self._send_json(200, res)
+
+        if path == "/api/projects/batch-status":
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            raw_ids = payload.get("project_ids")
+            if not isinstance(raw_ids, list) or not raw_ids:
+                return self._send_json(400, {"error": "请至少选择一个项目"})
+            pid_list = [str(x).strip() for x in raw_ids if _is_safe_segment(str(x).strip())]
+            managed_csv = _managed_projects_csv(self.cfg["output_dir"])
+            try:
+                res = db.batch_update_project_status(
+                    pid_list, str(payload.get("status") or ""), managed_csv=managed_csv
+                )
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            db.record_audit(cur_user, "batch_update_project_status", target=f"{res['updated']}个->{res['status']}",
+                            detail={"project_ids": res["project_ids"][:20]}, client_ip=client_ip)
             return self._send_json(200, res)
 
         if path == "/api/projects/probe-all":

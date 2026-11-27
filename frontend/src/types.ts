@@ -254,6 +254,10 @@ export interface CatalogProject {
   git_health?: "ok" | "error" | "unknown";
   git_health_reason?: string;
   git_checked_at?: string | null;
+  latest_report?: {
+    date: string;
+    run_id: string;
+  };
   state?: {
     last_scan_date?: string;
     last_commit?: string;

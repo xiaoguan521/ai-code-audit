@@ -13,6 +13,7 @@ import {
   Zap,
 } from "lucide-react";
 import { api } from "../api";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import type {
   EmailLogEntry,
   GitCredentialItem,
@@ -54,6 +55,7 @@ export function OpsConfigPage() {
   const [gitUsername, setGitUsername] = useState("");
   const [gitSecret, setGitSecret] = useState("");
   const [gitActive, setGitActive] = useState(true);
+  const [deleteGitTarget, setDeleteGitTarget] = useState<GitCredentialItem | null>(null);
 
   // SMTP 邮件投递配置与日志
   const [smtp, setSmtp] = useState<SmtpConfig | null>(null);
@@ -220,14 +222,19 @@ export function OpsConfigPage() {
     }
   };
 
-  const handleDeleteGit = async (item: GitCredentialItem) => {
-    if (!window.confirm(`确认删除 Git 凭据「${item.label || item.host}」（${item.username}）吗？`)) return;
+  const handleDeleteGit = (item: GitCredentialItem) => {
+    setDeleteGitTarget(item);
+  };
+
+  const confirmDeleteGit = async () => {
+    if (!deleteGitTarget) return;
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
-      await api.deleteGitCredential(item.id);
-      setNotice("已删除该 Git 凭据");
+      await api.deleteGitCredential(deleteGitTarget.id);
+      setNotice("已删除该仓库凭据");
+      setDeleteGitTarget(null);
       await loadData();
     } catch (err) {
       setError(err instanceof Error ? err.message : "删除失败");
@@ -997,6 +1004,21 @@ export function OpsConfigPage() {
           </form>
         </div>
       )}
+      <ConfirmDialog
+        open={Boolean(deleteGitTarget)}
+        tone="danger"
+        title={deleteGitTarget ? `确认删除凭据「${deleteGitTarget.label || deleteGitTarget.host}」？` : ""}
+        description="删除后会立即同步更新运行时凭据文件，依赖该账号拉取的仓库可能认证失败。"
+        previewItems={
+          deleteGitTarget
+            ? [`${deleteGitTarget.protocol}://${deleteGitTarget.host}${deleteGitTarget.path_prefix || ""} (${deleteGitTarget.username})`]
+            : undefined
+        }
+        confirmLabel="确认删除"
+        busy={busy}
+        onConfirm={() => void confirmDeleteGit()}
+        onCancel={() => setDeleteGitTarget(null)}
+      />
     </div>
   );
 }

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Download, FileText, Mail, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 import { api } from "../api";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { DraftModal } from "../components/DraftModal";
 import type { AuthUser, RunDetailResponse, RunSummary } from "../types";
 
@@ -56,6 +57,7 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted }: Props) {
   const [draftModal, setDraftModal] = useState<{ title: string; markdown: string; filenameBase: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [confirmKind, setConfirmKind] = useState<"delete_run" | "send_emails" | null>(null);
 
   // 清册筛选状态
   const [statusFilter, setStatusFilter] = useState<"" | "ok" | "error">("");
@@ -166,19 +168,18 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted }: Props) {
     }
   };
 
-  const handleDeleteRun = async () => {
+  const handleDeleteRun = () => {
     if (!detail) return;
-    if (
-      !window.confirm(
-        `确认永久删除批次 ${detail.date} / ${detail.run_id}？\n该批次的运行记录与项目报告将被清除；若项目最新基线指向该批次，系统会自动回退到上一次有效扫描结果。`
-      )
-    ) {
-      return;
-    }
+    setConfirmKind("delete_run");
+  };
+
+  const confirmDeleteRun = async () => {
+    if (!detail) return;
     setActionBusy(true);
     setError(null);
     try {
       await api.deleteRun(detail.date, detail.run_id);
+      setConfirmKind(null);
       const res = await api.runs();
       setRuns(res.runs);
       if (res.runs.length > 0) {
@@ -241,16 +242,19 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted }: Props) {
     }
   };
 
-  const handleSendBatchEmails = async () => {
+  const handleSendBatchEmails = () => {
     if (!detail) return;
-    if (!window.confirm(`确认向本批次（${detail.date} / ${detail.run_id}）涉及的项目负责人发送含报告附件的结果邮件吗？`)) {
-      return;
-    }
+    setConfirmKind("send_emails");
+  };
+
+  const confirmSendBatchEmails = async () => {
+    if (!detail) return;
     setActionBusy(true);
     setError(null);
     setNotice(null);
     try {
       const res = await api.sendRunEmails(detail.date, detail.run_id);
+      setConfirmKind(null);
       setNotice(`邮件投递完成：成功 ${res.sent} 封，失败 ${res.failed} 封，按偏好跳过 ${res.skipped} 人`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "发送批次邮件失败");
@@ -652,6 +656,25 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted }: Props) {
           onClose={() => setDraftModal(null)}
         />
       )}
+
+      <ConfirmDialog
+        open={Boolean(confirmKind && detail)}
+        tone={confirmKind === "delete_run" ? "danger" : "info"}
+        title={
+          confirmKind === "delete_run"
+            ? `确认永久删除批次 ${detail?.date} / ${detail?.run_id}？`
+            : `确认发送本批次审查结果邮件？`
+        }
+        description={
+          confirmKind === "delete_run"
+            ? "该批次的运行记录与项目报告将被彻底清除；若项目最新基线指向该批次，系统会自动回退到上一次有效扫描结果。"
+            : `将按项目负责人聚合发送批次（${detail?.date} / ${detail?.run_id}）的 HTML 报告与附件（并按配置抄送管理汇总）。`
+        }
+        confirmLabel={confirmKind === "delete_run" ? "永久删除批次" : "确认发送邮件"}
+        busy={actionBusy}
+        onConfirm={() => void (confirmKind === "delete_run" ? confirmDeleteRun() : confirmSendBatchEmails())}
+        onCancel={() => setConfirmKind(null)}
+      />
     </div>
   );
 }
