@@ -58,14 +58,23 @@ class TimeoutOptimizationTest(unittest.TestCase):
 
     def test_build_prompt_scale_concurrency_and_code_map(self):
         proj = {"project_id": "demo", "project_name": "Demo"}
-        large_prompt = run_daily.build_prompt(
+        large_standard_prompt = run_daily.build_prompt(
+            proj, "abc123", {"fast_mode": False}, "full",
+            code_map_summary_text="代码地图摘要：tracked=500，indexed=400",
+            project_scale="large", timeout_sec=5400,
+        )
+        self.assertIn("project_scale=large，timeout=90 分钟", large_standard_prompt)
+        self.assertIn("并发派生 2-3 个子代理", large_standard_prompt)
+        self.assertIn("代码地图摘要：tracked=500，indexed=400", large_standard_prompt)
+
+        large_fast_prompt = run_daily.build_prompt(
             proj, "abc123", {"fast_mode": True}, "full",
             code_map_summary_text="代码地图摘要：tracked=500，indexed=400",
             project_scale="large", timeout_sec=5400,
         )
-        self.assertIn("project_scale=large，timeout=90 分钟", large_prompt)
-        self.assertIn("并发派生 2-3 个子代理", large_prompt)
-        self.assertIn("代码地图摘要：tracked=500，indexed=400", large_prompt)
+        self.assertIn("禁止派生子代理", large_fast_prompt)
+        self.assertIn("12-18 次以内", large_fast_prompt)
+        self.assertNotIn("并发派生 2-3 个子代理", large_fast_prompt)
 
         small_prompt = run_daily.build_prompt(
             proj, "abc123", {"fast_mode": False}, "full",
@@ -73,6 +82,24 @@ class TimeoutOptimizationTest(unittest.TestCase):
         )
         self.assertIn("project_scale=small，timeout=30 分钟", small_prompt)
         self.assertIn("在当前会话直接完成", small_prompt)
+
+    def test_order_projects_lpt_schedules_heaviest_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outdir = Path(tmp)
+            rdir = outdir / "results" / "2026-11-26" / "r1"
+            rdir.mkdir(parents=True)
+            (rdir / "_run.json").write_text(json.dumps({
+                "projects": [
+                    {"project_id": "tiny", "metrics": {"total_seconds": 120}},
+                    {"project_id": "huge", "metrics": {"total_seconds": 2400}},
+                    {"project_id": "mid", "metrics": {"total_seconds": 600}},
+                ]
+            }), encoding="utf-8")
+            ordered = run_daily._order_projects_lpt(
+                [{"project_id": "tiny"}, {"project_id": "mid"}, {"project_id": "huge"}, {"project_id": "unknown"}],
+                outdir,
+            )
+            self.assertEqual([p["project_id"] for p in ordered], ["huge", "mid", "unknown", "tiny"])
 
     def test_try_resume_from_state_reuses_unchanged_report(self):
         with tempfile.TemporaryDirectory() as tmp:

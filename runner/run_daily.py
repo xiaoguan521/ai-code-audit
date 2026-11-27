@@ -677,29 +677,41 @@ def build_prompt(p: dict, commit: str, settings: dict, scan_type: str,
     lines.extend([
         "交付一份完整的中文 Markdown，包含全部 64 项、检查范围、问题及整改建议、"
         "待补充信息、八维得分、总分、安全分、覆盖率和评分依据。无法判断或证据不足时如实标记 NEED_INFO。",
-        "按 Skill 的评分规则计算；自行使用只读计算工具辅助算术并核对，不修改项目代码。",
-        "完成前在当前会话自行核对覆盖、结论及分数；发现错误只补查并修正对应部分，不要重新审查整个项目。",
+    ])
+    if fast:
+        lines.extend([
+            "本次是快速巡检：不生成逐项证据、文件路径行号、代码片段或证据表；"
+            "不为输出证据逐条定位或复读源码；可自主抽查非核心模块，未检查或依据不足的项标 NEED_INFO，"
+            "报告注明模式和实际检查范围。",
+            "快速巡检提速纪律：优先依据代码地图与预扫描摘要批量读取核心入口/配置/鉴权/数据访问文件，"
+            "建议将总工具调用控制在 12-18 次以内，禁止派生子代理，在当前会话直接完成；"
+            "Runner 落盘时会自动重算八维得分与总分，无需反复跑计算工具验算或二次重审，直接一次性收敛输出完整报告。",
+        ])
+    else:
+        lines.extend([
+            "按 Skill 的评分规则计算；自行使用只读计算工具辅助算术并核对，不修改项目代码。",
+            "完成前在当前会话自行核对覆盖、结论及分数；发现错误只补查并修正对应部分，不要重新审查整个项目。",
+            "本次是标准审查：按 Skill 输出并核对支持结论的源码证据。",
+        ])
+    lines.extend([
         "请保持关键二级标题与模板一致（`## 评分总览`、`## 风险问题清单`、`## 分维度检查结果`），"
         "风险等级统一使用 `P0`/`P1`/`P2`/`P3`（无风险留空或写 `-`），所有维度分与总分统一使用 10 分制（0–10）。",
         "最后一条回复必须直接输出完整 Markdown 报告正文：禁止用 ```markdown 代码块包裹全文，"
         "也禁止在输出完报告后再补发“报告已完成/已在上一条输出”等简短确认消息，不写入文件。",
     ])
-    if fast:
-        lines.append("本次是快速巡检：不生成逐项证据、文件路径行号、代码片段或证据表；"
-                     "不为输出证据逐条定位或复读源码；可自主抽查非核心模块，未检查或依据不足的项标 NEED_INFO，"
-                     "报告注明模式和实际检查范围。")
-    else:
-        lines.append("本次是标准审查：按 Skill 输出并核对支持结论的源码证据。")
     if project_scale or timeout_sec:
         budget_min = max(1, int(timeout_sec or 3600) // 60)
         scale_label = project_scale or "medium"
         lines.append(f"时间预算与并发策略（project_scale={scale_label}，timeout={budget_min} 分钟）：")
-        if scale_label == "large":
+        if scale_label == "large" and not fast:
             lines.append("- 大型仓库建议按核心模块或维度组并发派生 2-3 个子代理（并行子代理上限 3 个），"
-                         "通过上下文隔离缩短单次耗时；在快速模式下核心链路重点查、边缘模块按比例抽查。")
+                         "通过上下文隔离缩短单次耗时。")
+        elif fast:
+            lines.append("- 快速巡检在当前会话直接完成（不派生子代理，避免上下文重复开销）；"
+                         "大型仓库核心链路重点查、边缘模块按比例抽查。")
         else:
             lines.append("- 中小仓库建议在当前会话直接完成，避免派生子代理带来的启动与汇总开销。")
-        lines.append("- 注意时间预算：单组检查搜索 2-3 轮无直接线索即止损标 NEED_INFO-证据不足；"
+        lines.append("- 注意时间预算：单组检查搜索 1-2 轮（标准模式 2-3 轮）无直接线索即止损标 NEED_INFO-证据不足；"
                      "预算接近上限时停止新开探索，立即汇总已查结果输出完整 64 项报告。")
     if code_map_summary_text:
         lines.append(code_map_summary_text)
@@ -963,8 +975,11 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
                 s.strip() for s in (p.get("scope_out") or "").replace("；", ";").split(";") if s.strip()
             ] + list(settings.get("default_scope_out", []))
             log(f"{pid}: 开始预扫描")
+            pre_tools = list(settings.get("prescan_tools", []))
+            if settings.get("fast_mode", False) and settings.get("fast_skip_lizard", True):
+                pre_tools = [t for t in pre_tools if t != "lizard"]
             with measure(metrics["stages_seconds"], "prescan"):
-                pre = prescan(repo, ctx / "prescan", settings.get("prescan_tools", []), pre_settings)
+                pre = prescan(repo, ctx / "prescan", pre_tools, pre_settings)
             metrics["prescan_tools"] = pre
             log(f"{pid}: 预扫描结束，耗时 {metrics['stages_seconds']['prescan']} 秒")
             unavailable = [f"{name}: {info.get('reason', info['status'])}" for name, info in pre.items()
@@ -1253,6 +1268,52 @@ class DaemonThreadPoolExecutor(cf.ThreadPoolExecutor):
             self._threads.add(t)
 
 
+def _order_projects_lpt(projects: list[dict], outdir: Path) -> list[dict]:
+    """按历史真实扫描耗时降序重排调度顺序（LPT：大仓库先上车、小仓库填缝，减少批次末尾空转拖尾）。"""
+    if len(projects) <= 2:
+        return list(projects)
+    results_dir = outdir / "results"
+    if not results_dir.is_dir():
+        return list(projects)
+    hist_sec: dict[str, float] = {}
+    scanned_runs = 0
+    try:
+        date_dirs = sorted((d for d in results_dir.iterdir() if d.is_dir()), reverse=True)
+        for ddir in date_dirs:
+            run_dirs = sorted((r for r in ddir.iterdir() if r.is_dir()), reverse=True)
+            for rdir in run_dirs:
+                rf = rdir / "_run.json"
+                if not rf.is_file():
+                    continue
+                scanned_runs += 1
+                try:
+                    data = json.loads(rf.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                for rec in data.get("projects") or []:
+                    pid = str(rec.get("project_id") or "")
+                    if not pid or pid in hist_sec:
+                        continue
+                    metrics = rec.get("metrics") or {}
+                    model_sec = (metrics.get("stages_seconds") or {}).get("model")
+                    tot_sec = metrics.get("total_seconds")
+                    dur = tot_sec if isinstance(tot_sec, (int, float)) else model_sec
+                    if isinstance(dur, (int, float)) and dur >= 15.0:
+                        hist_sec[pid] = float(dur)
+                if scanned_runs >= 10:
+                    break
+            if scanned_runs >= 10:
+                break
+    except OSError:
+        return list(projects)
+    if not hist_sec:
+        return list(projects)
+    median_dur = sorted(hist_sec.values())[len(hist_sec) // 2]
+    indexed = list(enumerate(projects))
+    indexed.sort(key=lambda pair: (-hist_sec.get(pair[1]["project_id"], median_dur), pair[0]))
+    return [p for _, p in indexed]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="八性 AI 代码检查 · 多项目 Markdown 审查")
     ap.add_argument("--settings", default=str(ROOT / "config" / "settings.json"))
@@ -1390,7 +1451,8 @@ def main() -> int:
         abort_event = threading.Event()
         settings["_abort_event"] = abort_event
         executor = DaemonThreadPoolExecutor(max_workers=parallel)
-        jobs = {executor.submit(scan_project, p, settings, run_date, args, snapshot_at): p for p in projects}
+        scheduled_projects = _order_projects_lpt(projects, outdir)
+        jobs = {executor.submit(scan_project, p, settings, run_date, args, snapshot_at): p for p in scheduled_projects}
         try:
             for job in cf.as_completed(jobs, timeout=batch_timeout):
                 p = jobs[job]

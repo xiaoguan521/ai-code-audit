@@ -2,19 +2,20 @@
   "workdir": "/data/ai-audit/work",
   "output_dir": "/data/ai-audit/output",
   "model": "",
-  "max_parallel": 2,
-  "max_model_concurrency": 2,
-  "model_queue_timeout_sec": 1800,
+  "max_parallel": 6,
+  "max_model_concurrency": 3,
+  "model_queue_timeout_sec": 3600,
   "batch_timeout_sec": 129600,
   "prescan_timeouts": {},
   "per_project_timeout_sec": 3600,
   "adaptive_timeout": true,
   "scale_timeouts": {
-    "small": 1800,
+    "small": 2700,
     "medium": 3600,
     "large": 5400
   },
   "fast_mode": false,
+  "fast_skip_lizard": true,
   "validation_mode": "lenient",
   "snapshot_at": "",
   "clone_depth": 200,
@@ -35,7 +36,7 @@
     "semgrep",
     "lizard"
   ],
-  "prescan_parallelism": 2,
+  "prescan_parallelism": 4,
   "summary": {
     "enabled": true,
     "timeout_sec": 900,

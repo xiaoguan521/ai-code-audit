@@ -310,7 +310,7 @@ def _configured_model(agent: dict, launcher: str, env: dict) -> str | None:
 
 
 def _run_with_progress(command: list[str], cwd, prompt_input: str | None, env: dict,
-                       timeout: int, progress) -> subprocess.CompletedProcess:
+                       timeout: int, progress, diag: dict | None = None) -> subprocess.CompletedProcess:
     """Stream sanitized event boundaries while preserving the original final event stream."""
     process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE if prompt_input is not None else None,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, shell=False,
@@ -319,6 +319,14 @@ def _run_with_progress(command: list[str], cwd, prompt_input: str | None, env: d
     start = time.monotonic()
 
     def emit(event):
+        if diag is not None:
+            if event.get("phase") == "step_start" or isinstance(event.get("step"), int):
+                step_val = event.get("step")
+                diag["steps"] = max(diag.get("steps", 0), step_val if isinstance(step_val, int) else diag.get("steps", 0) + 1)
+            tname = event.get("tool") or event.get("tool_name") or event.get("toolName")
+            if isinstance(tname, str) and tname:
+                diag["tool_calls"] = diag.get("tool_calls", 0) + 1
+                diag["last_tool"] = tname
         try:
             progress(event)
         except Exception:
@@ -395,10 +403,11 @@ def run(prompt: str, repo, ctx, settings: dict, timeout: int) -> dict:
     configured_env = agent.get("env")
     if launcher == "local" and isinstance(configured_env, dict):
         env.update({str(key): str(value) for key, value in configured_env.items()})
+    diag: dict[str, Any] = {}
     try:
         progress = settings.get("_progress_callback")
         if callable(progress):
-            completed = _run_with_progress(command, repo, prompt_input, env, timeout, progress)
+            completed = _run_with_progress(command, repo, prompt_input, env, timeout, progress, diag=diag)
         else:
             completed = subprocess.run(
                 command,
@@ -417,7 +426,15 @@ def run(prompt: str, repo, ctx, settings: dict, timeout: int) -> dict:
                                text=True, timeout=60, check=False)
             except (OSError, subprocess.TimeoutExpired):
                 pass
-        raise HarnessError(f"Harness 运行超过 {timeout} 秒", "timeout") from exc
+        detail_parts = []
+        if diag.get("steps"):
+            detail_parts.append(f"已运行 {diag['steps']} 步")
+        if diag.get("tool_calls"):
+            detail_parts.append(f"工具调用 {diag['tool_calls']} 次")
+        if diag.get("last_tool"):
+            detail_parts.append(f"最后工具 {diag['last_tool']}")
+        suffix = f"（{'，'.join(detail_parts)}）" if detail_parts else ""
+        raise HarnessError(f"Harness 运行超过 {timeout} 秒{suffix}", "timeout") from exc
     except OSError as exc:
         raise HarnessError(f"Harness 启动失败：{exc}", "failed") from exc
 

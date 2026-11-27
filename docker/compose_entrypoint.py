@@ -61,6 +61,10 @@ def configure_settings(settings: dict, env: dict) -> dict:
     if not isinstance(fast_mode, bool):
         raise ValueError("fast_mode 必须是 true/false")
     settings["fast_mode"] = _env_bool(env, "AUDIT_FAST_MODE", fast_mode)
+    fast_skip_lizard = settings.get("fast_skip_lizard", True)
+    if not isinstance(fast_skip_lizard, bool):
+        raise ValueError("fast_skip_lizard 必须是 true/false")
+    settings["fast_skip_lizard"] = _env_bool(env, "AUDIT_FAST_SKIP_LIZARD", fast_skip_lizard)
     validation_mode = (env.get("AUDIT_VALIDATION_MODE") or settings.get("validation_mode") or "lenient").strip().lower()
     if validation_mode not in {"lenient", "strict"}:
         raise ValueError("AUDIT_VALIDATION_MODE 必须是 lenient 或 strict")
