@@ -3,11 +3,16 @@ import type {
   AuthUser,
   CatalogProject,
   DoctorReport,
+  GitCredentialItem,
   GitProbeResult,
   LiveProgressResponse,
+  ModelTestResult,
+  OpsConfigResponse,
+  OpsRuntimeConfig,
   OverviewResponse,
   OwnerPreviewItem,
   PauseState,
+  PromptItem,
   ReportResponse,
   RunDetailResponse,
   RunSummary,
@@ -247,6 +252,80 @@ export const api = {
     }),
   resumeScan: () =>
     request<PauseState>("/api/scans/resume", {
+      method: "POST",
+    }),
+  prompts: () => request<{ prompts: PromptItem[] }>("/api/prompts"),
+  savePrompt: (key: string, content: string, note = "") =>
+    request<{ prompts: PromptItem[] }>(`/api/prompts/${encodeURIComponent(key)}/save`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content, note }),
+    }),
+  rollbackPrompt: (key: string, version_id: number) =>
+    request<{ prompts: PromptItem[] }>(`/api/prompts/${encodeURIComponent(key)}/rollback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ version_id }),
+    }),
+  resetPrompt: (key: string) =>
+    request<{ prompts: PromptItem[] }>(`/api/prompts/${encodeURIComponent(key)}/reset`, {
+      method: "POST",
+    }),
+  opsConfig: () => request<OpsConfigResponse>("/api/ops/config"),
+  saveOpsModel: (payload: Record<string, string | boolean>) =>
+    request<OpsConfigResponse>("/api/ops/model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  testOpsModel: (payload: { OPENAI_BASE_URL?: string; OPENAI_MODEL?: string; OPENAI_API_KEY?: string }) =>
+    request<ModelTestResult>("/api/ops/test-model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  saveOpsRuntime: (payload: Partial<OpsRuntimeConfig>) =>
+    request<OpsConfigResponse>("/api/ops/runtime", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  createGitCredential: (payload: {
+    label?: string;
+    protocol: "https" | "http";
+    host: string;
+    path_prefix?: string;
+    username: string;
+    secret: string;
+    is_active?: boolean;
+  }) =>
+    request<{ credential: GitCredentialItem; git_credentials: GitCredentialItem[] }>("/api/ops/git-credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  updateGitCredential: (
+    id: number,
+    payload: {
+      label?: string;
+      protocol: "https" | "http";
+      host: string;
+      path_prefix?: string;
+      username: string;
+      secret?: string;
+      is_active?: boolean;
+    }
+  ) =>
+    request<{ credential: GitCredentialItem; git_credentials: GitCredentialItem[] }>(
+      `/api/ops/git-credentials/${id}/update`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }
+    ),
+  deleteGitCredential: (id: number) =>
+    request<{ ok: boolean; git_credentials: GitCredentialItem[] }>(`/api/ops/git-credentials/${id}/delete`, {
       method: "POST",
     }),
   doctor: () => request<DoctorReport>("/api/doctor"),

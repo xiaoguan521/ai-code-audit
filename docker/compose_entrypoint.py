@@ -102,7 +102,14 @@ def configure_settings(settings: dict, env: dict) -> dict:
         raise ValueError("AUDIT_AGENT_TYPE 必须为 deepseek-harness")
     image = env.get("AUDIT_SCANNER_IMAGE") or agent.get("image") or "ghcr.io/xiaoguan521/ai-code-audit:main"
     env_file = env.get("AUDIT_MODEL_ENV_PATH") or agent.get("env_file") or "/run/secrets/model.env"
+    state_dir = Path(data_dir) / "output" / "state"
+    runtime_model_env = state_dir / "model.runtime.env"
+    if runtime_model_env.is_file():
+        env_file = str(runtime_model_env)
+    skill_override = state_dir / "prompts" / "SKILL.md"
     agent.update({"type": agent_type, "image": image, "env_file": env_file, "network": network})
+    if skill_override.is_file():
+        agent["skill_override_file"] = str(skill_override)
     if agent_type == "deepseek-harness":
         agent["strategy"] = "single"
         agent["launcher"] = env.get("AUDIT_HARNESS_LAUNCHER", agent.get("launcher", "docker"))
@@ -128,6 +135,59 @@ def configure_settings(settings: dict, env: dict) -> dict:
             "bin": env.get("AUDIT_SUMMARY_BIN") or agent.get("bin", "dsh"),
             "args": agent.get("args", ["headless", "--json", "--permission-mode", "read-only", "--approval-policy", "never"]),
         })
+
+    # 若超级管理员通过 Web 运维配置保存了 runtime_overrides.json，则热覆盖运行参数（免重启容器）
+    runtime_override_file = state_dir / "runtime_overrides.json"
+    if runtime_override_file.is_file():
+        try:
+            ov = json.loads(runtime_override_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            ov = None
+        if isinstance(ov, dict):
+            for k in ("max_parallel", "max_model_concurrency", "per_project_timeout_sec", "batch_timeout_sec"):
+                val = ov.get(k)
+                if isinstance(val, int) and not isinstance(val, bool) and val >= 1:
+                    settings[k] = val
+            for k in ("fast_mode", "fast_skip_lizard", "adaptive_timeout"):
+                val = ov.get(k)
+                if isinstance(val, bool):
+                    settings[k] = val
+            if ov.get("validation_mode") in ("lenient", "strict"):
+                settings["validation_mode"] = ov["validation_mode"]
+            st_map = dict(settings.get("scale_timeouts") or {})
+            for ov_k, sk in (("timeout_small_sec", "small"), ("timeout_medium_sec", "medium"), ("timeout_large_sec", "large")):
+                val = ov.get(ov_k)
+                if isinstance(val, int) and not isinstance(val, bool) and val >= 60:
+                    st_map[sk] = val
+            if st_map:
+                settings["scale_timeouts"] = st_map
+            if isinstance(ov.get("summary_enabled"), bool):
+                summary["enabled"] = ov["summary_enabled"]
+                if summary["enabled"] and agent_type == "deepseek-harness" and not isinstance(summary.get("agent"), dict):
+                    summary["agent"] = {
+                        "type": "deepseek-harness",
+                        "strategy": "single",
+                        "launcher": "docker",
+                        "image": env.get("AUDIT_SUMMARY_IMAGE") or agent["image"],
+                        "network": env.get("AUDIT_SUMMARY_NETWORK") or agent["network"],
+                        "env_file": env.get("AUDIT_SUMMARY_MODEL_ENV_PATH") or env_file,
+                        "bin": env.get("AUDIT_SUMMARY_BIN") or agent.get("bin", "dsh"),
+                        "args": agent.get("args", ["headless", "--json", "--permission-mode", "read-only", "--approval-policy", "never"]),
+                    }
+            if isinstance(ov.get("scanner_image"), str) and ov["scanner_image"].strip():
+                agent["image"] = ov["scanner_image"].strip()
+                if isinstance(summary.get("agent"), dict):
+                    summary["agent"]["image"] = agent["image"]
+            if isinstance(ov.get("model_network"), str) and ov["model_network"].strip():
+                agent["network"] = ov["model_network"].strip()
+                if isinstance(summary.get("agent"), dict):
+                    summary["agent"]["network"] = agent["network"]
+            if isinstance(ov.get("semgrep_rules_dir"), str):
+                srd = ov["semgrep_rules_dir"].strip()
+                if srd and Path(srd).is_absolute():
+                    settings["semgrep_rules_dir"] = srd
+                elif not srd:
+                    settings.pop("semgrep_rules_dir", None)
     return settings
 
 

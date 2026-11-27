@@ -161,6 +161,9 @@ def _docker_command(agent: dict, repo, ctx) -> tuple[list[str], str]:
         "-w", "/workspace/repo",
         "--network", network,
     ]
+    skill_override = str(agent.get("skill_override_file") or "").strip()
+    if skill_override and os.path.isfile(skill_override):
+        docker += ["-v", f"{skill_override}:/opt/audit/skills/eight-quality-code-audit/SKILL.md:ro"]
     if agent.get("env_file"):
         docker += ["--env-file", str(agent["env_file"])]
     configured_env = agent.get("env")

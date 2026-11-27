@@ -357,6 +357,95 @@ export interface DoctorCheck {
   fix?: string;
 }
 
+export interface PromptVersionEntry {
+  id: number;
+  prompt_key: string;
+  version: number;
+  note: string;
+  updated_by: string;
+  is_active: number;
+  created_at: string;
+  char_count: number;
+}
+
+export interface PromptItem {
+  key: "skill_md" | "dispatch_extra" | "summary_prompt";
+  title: string;
+  description: string;
+  is_custom: boolean;
+  active_version: number;
+  updated_by: string;
+  updated_at: string | null;
+  content: string;
+  default_content: string;
+  versions: PromptVersionEntry[];
+}
+
+export interface OpsModelConfig {
+  source: string;
+  OPENAI_BASE_URL: string;
+  OPENAI_MODEL: string;
+  OPENAI_API_KEY_SET: boolean;
+  OPENAI_API_KEY_MASKED: string;
+  OPENAI_CONTEXT_WINDOW: string;
+  OPENAI_MAX_OUTPUT_TOKENS: string;
+  DEEPSEEK_BASE_URL: string;
+  DEEPSEEK_MODEL: string;
+  DEEPSEEK_API_KEY_SET: boolean;
+  DEEPSEEK_API_KEY_MASKED: string;
+  extra_env: Record<string, string>;
+}
+
+export interface OpsRuntimeConfig {
+  max_parallel: number;
+  max_model_concurrency: number;
+  per_project_timeout_sec: number;
+  timeout_small_sec: number;
+  timeout_medium_sec: number;
+  timeout_large_sec: number;
+  batch_timeout_sec: number;
+  fast_mode: boolean;
+  fast_skip_lizard: boolean;
+  adaptive_timeout: boolean;
+  validation_mode: "lenient" | "strict";
+  summary_enabled: boolean;
+  scanner_image: string;
+  model_network: string;
+  semgrep_rules_dir: string;
+}
+
+export interface GitCredentialItem {
+  id: number;
+  label: string;
+  protocol: "https" | "http";
+  host: string;
+  path_prefix: string;
+  username: string;
+  has_secret: boolean;
+  secret_masked: string;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface OpsConfigResponse {
+  model: OpsModelConfig;
+  runtime: OpsRuntimeConfig;
+  runtime_overridden: boolean;
+  git_credentials: GitCredentialItem[];
+  base_git_creds_present: boolean;
+}
+
+export interface ModelTestResult {
+  ok: boolean;
+  status_code: number;
+  elapsed_ms: number;
+  model: string;
+  reply_preview: string;
+  has_thinking: boolean;
+  error: string;
+}
+
 export interface DoctorReport {
   verdict: "ok" | "warn" | "error";
   errors: number;

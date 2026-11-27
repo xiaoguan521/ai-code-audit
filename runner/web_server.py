@@ -455,6 +455,181 @@ def _managed_projects_csv(output_dir: Path) -> Path:
     return output_dir / "state" / "projects.managed.csv"
 
 
+def _prompts_dir(output_dir: Path) -> Path:
+    return output_dir / "state" / "prompts"
+
+
+def _runtime_model_env_file(output_dir: Path) -> Path:
+    return output_dir / "state" / "model.runtime.env"
+
+
+def _runtime_overrides_file(output_dir: Path) -> Path:
+    return output_dir / "state" / "runtime_overrides.json"
+
+
+def _runtime_git_creds_file(output_dir: Path) -> Path:
+    return output_dir / "state" / "git-credentials.runtime"
+
+
+def _base_model_env_file(settings_path: Path | None) -> Path | None:
+    env_p = os.environ.get("AUDIT_MODEL_ENV_PATH", "").strip()
+    if env_p and Path(env_p).is_file():
+        return Path(env_p)
+    settings = (_read_json(settings_path) if settings_path else None) or {}
+    ag_env = (settings.get("agent") or {}).get("env_file") if isinstance(settings, dict) else None
+    if ag_env and Path(str(ag_env)).is_file():
+        return Path(str(ag_env))
+    cand = Path("/run/secrets/model.env")
+    return cand if cand.is_file() else None
+
+
+def _base_git_creds_file() -> Path | None:
+    cand = Path(os.environ.get("AUDIT_GIT_CREDENTIAL_FILE", "/run/secrets/git-credentials"))
+    return cand if cand.is_file() else None
+
+
+def _default_prompt_content(prompt_key: str) -> str:
+    if prompt_key == "skill_md":
+        p = ROOT / "skill" / "eight-quality-audit" / "SKILL.md"
+        return p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
+    if prompt_key == "summary_prompt":
+        return summary_adapter.DEFAULT_SUMMARY_PROMPT
+    return ""
+
+
+def _build_prompts_payload(db: platform_db.PlatformDB) -> list[dict]:
+    meta_map = [
+        (
+            "skill_md",
+            "Harness 核心审查规范 (SKILL.md)",
+            "每次启动扫描容器时热挂载覆盖 /opt/audit/skills/eight-quality-code-audit/SKILL.md，即时生效、免重构建镜像。",
+        ),
+        (
+            "dispatch_extra",
+            "单项目调度补充提示词",
+            "追加到每个项目的 Harness 调度指令末尾，适合添加公司专项审查要求、框架规范或临时审查口径。",
+        ),
+        (
+            "summary_prompt",
+            "批次整体汇总提示词",
+            "供汇总 Agent 深度撰写管理层报告第四、五章使用，支持 {compact_digest} 统计摘要占位符。",
+        ),
+    ]
+    out: list[dict] = []
+    for key, title, desc in meta_map:
+        default_text = _default_prompt_content(key)
+        active = db.get_active_prompt(key)
+        is_custom = bool(active and (key != "dispatch_extra" or str(active.get("content") or "").strip()))
+        out.append({
+            "key": key,
+            "title": title,
+            "description": desc,
+            "is_custom": is_custom,
+            "active_version": active["version"] if active else 0,
+            "updated_by": active["updated_by"] if active else "builtin",
+            "updated_at": active["created_at"] if active else None,
+            "content": active["content"] if active else default_text,
+            "default_content": default_text,
+            "versions": db.list_prompt_versions(key, limit=20),
+        })
+    return out
+
+
+def _read_effective_model_env(output_dir: Path, settings_path: Path | None) -> tuple[dict[str, str], str]:
+    base_file = _base_model_env_file(settings_path)
+    base_data = platform_db.parse_env_file(base_file) if base_file else {}
+    rt_file = _runtime_model_env_file(output_dir)
+    if rt_file.is_file():
+        merged = dict(base_data)
+        merged.update(platform_db.parse_env_file(rt_file))
+        return merged, "runtime_override"
+    return base_data, ("mounted_env" if base_file else "unconfigured")
+
+
+def _build_ops_config(output_dir: Path, settings_path: Path | None, db: platform_db.PlatformDB) -> dict:
+    raw_model, model_source = _read_effective_model_env(output_dir, settings_path)
+    known_model_keys = (
+        "OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_API_KEY",
+        "OPENAI_CONTEXT_WINDOW", "OPENAI_MAX_OUTPUT_TOKENS",
+        "DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL",
+    )
+    extra_env = {}
+    for k, v in raw_model.items():
+        if k in known_model_keys:
+            continue
+        is_secret = any(tok in k.upper() for tok in ("KEY", "SECRET", "TOKEN", "PASS"))
+        extra_env[k] = platform_db.mask_secret(v) if is_secret else v
+
+    model_view = {
+        "source": model_source,
+        "OPENAI_BASE_URL": raw_model.get("OPENAI_BASE_URL", ""),
+        "OPENAI_MODEL": raw_model.get("OPENAI_MODEL", ""),
+        "OPENAI_API_KEY_SET": bool(raw_model.get("OPENAI_API_KEY")),
+        "OPENAI_API_KEY_MASKED": platform_db.mask_secret(raw_model.get("OPENAI_API_KEY", "")),
+        "OPENAI_CONTEXT_WINDOW": raw_model.get("OPENAI_CONTEXT_WINDOW", "131072"),
+        "OPENAI_MAX_OUTPUT_TOKENS": raw_model.get("OPENAI_MAX_OUTPUT_TOKENS", "8192"),
+        "DEEPSEEK_BASE_URL": raw_model.get("DEEPSEEK_BASE_URL", ""),
+        "DEEPSEEK_MODEL": raw_model.get("DEEPSEEK_MODEL", ""),
+        "DEEPSEEK_API_KEY_SET": bool(raw_model.get("DEEPSEEK_API_KEY")),
+        "DEEPSEEK_API_KEY_MASKED": platform_db.mask_secret(raw_model.get("DEEPSEEK_API_KEY", "")),
+        "extra_env": extra_env,
+    }
+
+    settings = (_read_json(settings_path) if settings_path else None) or {}
+    if not isinstance(settings, dict):
+        settings = {}
+    scale = settings.get("scale_timeouts") if isinstance(settings.get("scale_timeouts"), dict) else {}
+    ag = settings.get("agent") if isinstance(settings.get("agent"), dict) else {}
+    summ = settings.get("summary") if isinstance(settings.get("summary"), dict) else {}
+
+    def _env_int(env_k: str, fallback: int) -> int:
+        raw = os.environ.get(env_k, "").strip()
+        try:
+            return int(raw) if raw else fallback
+        except ValueError:
+            return fallback
+
+    def _env_bool_val(env_k: str, fallback: bool) -> bool:
+        raw = os.environ.get(env_k, "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+        return fallback
+
+    runtime = {
+        "max_parallel": _env_int("AUDIT_MAX_PARALLEL", int(settings.get("max_parallel", 6))),
+        "max_model_concurrency": _env_int("AUDIT_MAX_MODEL_CONCURRENCY", int(settings.get("max_model_concurrency", 3))),
+        "per_project_timeout_sec": _env_int("AUDIT_PER_PROJECT_TIMEOUT_SEC", int(settings.get("per_project_timeout_sec", 3600))),
+        "timeout_small_sec": _env_int("AUDIT_TIMEOUT_SMALL_SEC", int(scale.get("small", 2700))),
+        "timeout_medium_sec": _env_int("AUDIT_TIMEOUT_MEDIUM_SEC", int(scale.get("medium", 3600))),
+        "timeout_large_sec": _env_int("AUDIT_TIMEOUT_LARGE_SEC", int(scale.get("large", 7200))),
+        "batch_timeout_sec": _env_int("AUDIT_BATCH_TIMEOUT_SEC", int(settings.get("batch_timeout_sec", 129600))),
+        "fast_mode": _env_bool_val("AUDIT_FAST_MODE", bool(settings.get("fast_mode", False))),
+        "fast_skip_lizard": _env_bool_val("AUDIT_FAST_SKIP_LIZARD", bool(settings.get("fast_skip_lizard", True))),
+        "adaptive_timeout": _env_bool_val("AUDIT_ADAPTIVE_TIMEOUT", bool(settings.get("adaptive_timeout", True))),
+        "validation_mode": (os.environ.get("AUDIT_VALIDATION_MODE") or settings.get("validation_mode") or "lenient").strip(),
+        "summary_enabled": _env_bool_val("AUDIT_SUMMARY_ENABLED", bool(summ.get("enabled", True))),
+        "scanner_image": (os.environ.get("AUDIT_SCANNER_IMAGE") or ag.get("image") or "").strip(),
+        "model_network": (os.environ.get("AUDIT_MODEL_NETWORK") or ag.get("network") or "").strip(),
+        "semgrep_rules_dir": (os.environ.get("AUDIT_SEMGREP_RULES_DIR") or settings.get("semgrep_rules_dir") or "").strip(),
+    }
+    ov_file = _runtime_overrides_file(output_dir)
+    ov = _read_json(ov_file) if ov_file.is_file() else None
+    if isinstance(ov, dict):
+        for k in runtime:
+            if k in ov and ov[k] is not None:
+                runtime[k] = ov[k]
+
+    return {
+        "model": model_view,
+        "runtime": runtime,
+        "runtime_overridden": ov_file.is_file(),
+        "git_credentials": db.list_git_credentials(include_secret=False),
+        "base_git_creds_present": _base_git_creds_file() is not None,
+    }
+
+
 def _effective_projects_csv(cfg: dict) -> Path:
     managed = _managed_projects_csv(cfg["output_dir"])
     return managed if managed.is_file() else cfg["projects_csv"]
@@ -1423,6 +1598,10 @@ def _start_scan_task(payload: dict, root: Path, settings_path: Path, projects_cs
     sub_env["AUDIT_TRIGGER"] = trigger
     if triggered_by:
         sub_env["AUDIT_TRIGGERED_BY"] = triggered_by
+    if output_dir is not None:
+        rt_git_creds = _runtime_git_creds_file(output_dir)
+        if rt_git_creds.is_file():
+            sub_env["AUDIT_GIT_CREDENTIAL_FILE"] = str(rt_git_creds)
     if use_compose:
         cmd = [sys.executable, str(compose_ep)]
         sub_env["AUDIT_SETTINGS_FILE"] = str(settings_path)
@@ -1956,6 +2135,18 @@ class AuditHandler(BaseHTTPRequestHandler):
         if path == "/api/scans/pause":
             return self._send_json(200, _get_pause_state(output_dir))
 
+        if path == "/api/prompts":
+            assert cur_user is not None
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            return self._send_json(200, {"prompts": _build_prompts_payload(db)})
+
+        if path == "/api/ops/config":
+            assert cur_user is not None
+            if not self._require_role(cur_user, ("superadmin",)):
+                return
+            return self._send_json(200, _build_ops_config(output_dir, self.cfg["settings_path"], db))
+
         if path == "/api/doctor":
             assert cur_user is not None
             if not self._require_role(cur_user, ("superadmin", "admin")):
@@ -2258,9 +2449,11 @@ class AuditHandler(BaseHTTPRequestHandler):
             if payload is None:
                 return self._send_json(400, {"error": "无效的 JSON 请求体"})
             try:
+                rt_creds = _runtime_git_creds_file(self.cfg["output_dir"])
                 res = platform_db.probe_git_remote(
                     str(payload.get("git_url") or ""),
                     branch=str(payload.get("branch") or ""),
+                    credential_file=rt_creds if rt_creds.is_file() else _base_git_creds_file(),
                 )
             except ValueError as exc:
                 return self._send_json(400, {"error": str(exc)})
@@ -2345,6 +2538,194 @@ class AuditHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return self._send_json(400, {"error": str(exc)})
             return self._send_json(404, {"error": "未知的项目操作"})
+
+        # 提示词在线配置与版本回滚（superadmin + admin）
+        if path.startswith("/api/prompts/"):
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            segs = [urllib.parse.unquote(s) for s in path[len("/api/prompts/"):].split("/") if s]
+            if len(segs) != 2 or segs[0] not in platform_db.PROMPT_KEYS:
+                return self._send_json(400, {"error": "无效的提示词操作路径"})
+            pkey, action = segs[0], segs[1]
+            pdir = _prompts_dir(self.cfg["output_dir"])
+            payload = self._read_json_body() or {}
+            try:
+                if action == "save":
+                    saved = db.save_prompt(
+                        pkey,
+                        str(payload.get("content") or ""),
+                        updated_by=cur_user.get("username", ""),
+                        note=str(payload.get("note") or ""),
+                        prompts_dir=pdir,
+                    )
+                    db.record_audit(cur_user, "save_prompt", target=f"{pkey}@v{saved['version']}",
+                                    detail={"note": saved["note"], "length": len(saved["content"])},
+                                    client_ip=client_ip)
+                    return self._send_json(200, {"prompts": _build_prompts_payload(db)})
+                if action == "rollback":
+                    vid = int(payload.get("version_id") or 0)
+                    saved = db.rollback_prompt(pkey, vid, updated_by=cur_user.get("username", ""), prompts_dir=pdir)
+                    db.record_audit(cur_user, "rollback_prompt", target=f"{pkey}@v{saved['version']}",
+                                    detail={"source_version_id": vid}, client_ip=client_ip)
+                    return self._send_json(200, {"prompts": _build_prompts_payload(db)})
+                if action == "reset":
+                    db.reset_prompt(pkey, prompts_dir=pdir)
+                    db.record_audit(cur_user, "reset_prompt", target=pkey, client_ip=client_ip)
+                    return self._send_json(200, {"prompts": _build_prompts_payload(db)})
+            except KeyError as exc:
+                return self._send_json(404, {"error": str(exc)})
+            except (ValueError, TypeError) as exc:
+                return self._send_json(400, {"error": str(exc)})
+            return self._send_json(404, {"error": "未知的提示词操作"})
+
+        # 超级管理员（运维）专属配置：模型 / 运行环境变量 / Git 账号凭据
+        if path == "/api/ops/model":
+            if not self._require_role(cur_user, ("superadmin",)):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            existing_env, _ = _read_effective_model_env(self.cfg["output_dir"], self.cfg["settings_path"])
+            next_env = dict(existing_env)
+            for k in ("OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_CONTEXT_WINDOW", "OPENAI_MAX_OUTPUT_TOKENS",
+                      "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL"):
+                if k in payload:
+                    val = str(payload.get(k) or "").strip()
+                    if val:
+                        next_env[k] = val
+                    else:
+                        next_env.pop(k, None)
+            # 密钥字段留空表示保持原有密钥不变；传入明确值则覆盖
+            for secret_k in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY"):
+                val = str(payload.get(secret_k) or "").strip()
+                if val:
+                    next_env[secret_k] = val
+                elif payload.get(f"clear_{secret_k}"):
+                    next_env.pop(secret_k, None)
+            try:
+                platform_db.write_env_file(_runtime_model_env_file(self.cfg["output_dir"]), next_env)
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            db.record_audit(cur_user, "update_model_config", target="model.runtime.env",
+                            detail={"OPENAI_BASE_URL": next_env.get("OPENAI_BASE_URL", ""),
+                                    "OPENAI_MODEL": next_env.get("OPENAI_MODEL", "")},
+                            client_ip=client_ip)
+            return self._send_json(200, _build_ops_config(self.cfg["output_dir"], self.cfg["settings_path"], db))
+
+        if path == "/api/ops/test-model":
+            if not self._require_role(cur_user, ("superadmin",)):
+                return
+            payload = self._read_json_body() or {}
+            existing_env, _ = _read_effective_model_env(self.cfg["output_dir"], self.cfg["settings_path"])
+            base_url = str(payload.get("OPENAI_BASE_URL") or existing_env.get("OPENAI_BASE_URL") or "").strip()
+            model = str(payload.get("OPENAI_MODEL") or existing_env.get("OPENAI_MODEL") or "").strip()
+            api_key = str(payload.get("OPENAI_API_KEY") or "").strip() or existing_env.get("OPENAI_API_KEY", "")
+            try:
+                res = platform_db.test_openai_endpoint(base_url, model, api_key)
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            return self._send_json(200, res)
+
+        if path == "/api/ops/runtime":
+            if not self._require_role(cur_user, ("superadmin",)):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            validated: dict = {}
+            int_limits = {
+                "max_parallel": (1, 32),
+                "max_model_concurrency": (1, 32),
+                "per_project_timeout_sec": (60, 28800),
+                "timeout_small_sec": (60, 28800),
+                "timeout_medium_sec": (60, 28800),
+                "timeout_large_sec": (60, 28800),
+                "batch_timeout_sec": (300, 604800),
+            }
+            for k, (lo, hi) in int_limits.items():
+                if k in payload and payload[k] is not None and str(payload[k]).strip() != "":
+                    try:
+                        v = int(payload[k])
+                    except (TypeError, ValueError):
+                        return self._send_json(400, {"error": f"{k} 必须为整数"})
+                    if v < lo or v > hi:
+                        return self._send_json(400, {"error": f"{k} 需在 {lo}–{hi} 之间"})
+                    validated[k] = v
+            for k in ("fast_mode", "fast_skip_lizard", "adaptive_timeout", "summary_enabled"):
+                if k in payload:
+                    validated[k] = bool(payload[k])
+            if "validation_mode" in payload:
+                vm = str(payload["validation_mode"] or "lenient").strip().lower()
+                if vm not in ("lenient", "strict"):
+                    return self._send_json(400, {"error": "validation_mode 仅支持 lenient 或 strict"})
+                validated["validation_mode"] = vm
+            for k in ("scanner_image", "model_network", "semgrep_rules_dir"):
+                if k in payload:
+                    val = str(payload[k] or "").strip()
+                    if any(ch.isspace() for ch in val):
+                        return self._send_json(400, {"error": f"{k} 不能包含空白字符"})
+                    if k == "semgrep_rules_dir" and val and not Path(val).is_absolute():
+                        return self._send_json(400, {"error": "semgrep_rules_dir 必须为容器内绝对路径"})
+                    validated[k] = val
+            ov_file = _runtime_overrides_file(self.cfg["output_dir"])
+            ov_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = ov_file.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(validated, ensure_ascii=False, indent=2), encoding="utf-8")
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp, ov_file)
+            db.record_audit(cur_user, "update_runtime_config", target="runtime_overrides.json",
+                            detail=validated, client_ip=client_ip)
+            return self._send_json(200, _build_ops_config(self.cfg["output_dir"], self.cfg["settings_path"], db))
+
+        if path == "/api/ops/git-credentials":
+            if not self._require_role(cur_user, ("superadmin",)):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            try:
+                created = db.upsert_git_credential(
+                    payload,
+                    runtime_file=_runtime_git_creds_file(self.cfg["output_dir"]),
+                    base_file=_base_git_creds_file(),
+                )
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            db.record_audit(cur_user, "create_git_credential", target=f"{created['protocol']}://{created['host']}{created['path_prefix']}",
+                            detail={"username": created["username"], "label": created["label"]}, client_ip=client_ip)
+            return self._send_json(201, {"credential": created, "git_credentials": db.list_git_credentials(include_secret=False)})
+
+        if path.startswith("/api/ops/git-credentials/"):
+            if not self._require_role(cur_user, ("superadmin",)):
+                return
+            segs = [urllib.parse.unquote(s) for s in path[len("/api/ops/git-credentials/"):].split("/") if s]
+            if len(segs) != 2 or not segs[0].isdigit():
+                return self._send_json(400, {"error": "无效的 Git 账号操作路径"})
+            cid, action = int(segs[0]), segs[1]
+            rt_file = _runtime_git_creds_file(self.cfg["output_dir"])
+            base_file = _base_git_creds_file()
+            try:
+                if action == "update":
+                    payload = self._read_json_body()
+                    if payload is None:
+                        return self._send_json(400, {"error": "无效的 JSON 请求体"})
+                    updated = db.upsert_git_credential(payload, cred_id=cid, runtime_file=rt_file, base_file=base_file)
+                    db.record_audit(cur_user, "update_git_credential", target=f"{updated['protocol']}://{updated['host']}{updated['path_prefix']}",
+                                    detail={"username": updated["username"], "is_active": updated["is_active"]}, client_ip=client_ip)
+                    return self._send_json(200, {"credential": updated, "git_credentials": db.list_git_credentials(include_secret=False)})
+                if action == "delete":
+                    deleted = db.delete_git_credential(cid, runtime_file=rt_file, base_file=base_file)
+                    db.record_audit(cur_user, "delete_git_credential", target=f"{deleted['protocol']}://{deleted['host']}{deleted['path_prefix']}",
+                                    detail={"username": deleted["username"]}, client_ip=client_ip)
+                    return self._send_json(200, {"ok": True, "git_credentials": db.list_git_credentials(include_secret=False)})
+            except KeyError as exc:
+                return self._send_json(404, {"error": str(exc)})
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            return self._send_json(404, {"error": "未知的 Git 账号操作"})
 
         # 扫描暂停 / 恢复（superadmin + admin）
         if path == "/api/scans/pause":
@@ -2503,6 +2884,9 @@ def main() -> int:
     seeded = db.seed_projects_from_csv(projects_csv, _managed_projects_csv(output_dir))
     if seeded:
         print(f"[web_server] 已从 {projects_csv.name} 初始化导入 {seeded} 个项目到管理端数据库", flush=True)
+    db.sync_all_active_prompts(_prompts_dir(output_dir))
+    if db.list_git_credentials():
+        db.export_git_credentials_file(_runtime_git_creds_file(output_dir), base_file=_base_git_creds_file())
     init_admin = db.ensure_initial_superadmin(legacy_token=auth_token)
     if init_admin:
         init_user, init_pass = init_admin

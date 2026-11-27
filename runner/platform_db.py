@@ -17,11 +17,22 @@ import secrets
 import sqlite3
 import subprocess
 import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 ROLES = ("superadmin", "admin", "user")
 EMAIL_NOTIFY_MODES = ("batch", "risk_only", "off")
 SESSION_TTL_SEC = 24 * 3600
+PROMPT_KEYS = ("skill_md", "dispatch_extra", "summary_prompt")
+PROMPT_FILENAMES = {
+    "skill_md": "SKILL.md",
+    "dispatch_extra": "dispatch_extra.txt",
+    "summary_prompt": "summary_prompt.txt",
+}
+ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{2,64}$")
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -466,6 +477,29 @@ class PlatformDB:
                 CREATE TABLE IF NOT EXISTS platform_settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS prompt_versions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    prompt_key TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    updated_by TEXT NOT NULL DEFAULT '',
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_prompt_versions_key ON prompt_versions(prompt_key, version DESC);
+                CREATE TABLE IF NOT EXISTS git_credentials (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    label TEXT NOT NULL DEFAULT '',
+                    protocol TEXT NOT NULL DEFAULT 'https',
+                    host TEXT NOT NULL,
+                    path_prefix TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL,
+                    secret TEXT NOT NULL,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
                 """
@@ -1097,6 +1131,377 @@ class PlatformDB:
                 ),
             )
 
+    # ---------- 提示词模板版本管理 ----------
+
+    @staticmethod
+    def _sync_prompt_file(prompts_dir: Path | None, key: str, content: str | None) -> None:
+        if prompts_dir is None:
+            return
+        fname = PROMPT_FILENAMES.get(key)
+        if not fname:
+            return
+        target = prompts_dir / fname
+        if content is None:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(prompts_dir, 0o755)
+        except OSError:
+            pass
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        try:
+            # Scanner 容器以非 root node 运行，需允许组/其他只读
+            os.chmod(tmp, 0o644)
+        except OSError:
+            pass
+        os.replace(tmp, target)
+
+    def get_active_prompt(self, prompt_key: str) -> dict | None:
+        if prompt_key not in PROMPT_KEYS:
+            raise ValueError(f"不支持的提示词键：{prompt_key}")
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM prompt_versions WHERE prompt_key = ? AND is_active = 1 ORDER BY version DESC LIMIT 1",
+                (prompt_key,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_prompt_versions(self, prompt_key: str, limit: int = 20) -> list[dict]:
+        if prompt_key not in PROMPT_KEYS:
+            raise ValueError(f"不支持的提示词键：{prompt_key}")
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, prompt_key, version, note, updated_by, is_active, created_at, length(content) AS char_count "
+                "FROM prompt_versions WHERE prompt_key = ? ORDER BY version DESC LIMIT ?",
+                (prompt_key, max(1, min(100, int(limit)))),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def save_prompt(self, prompt_key: str, content: str, *, updated_by: str,
+                    note: str = "", prompts_dir: Path | None = None) -> dict:
+        if prompt_key not in PROMPT_KEYS:
+            raise ValueError(f"不支持的提示词键：{prompt_key}")
+        text = str(content or "")
+        if prompt_key == "skill_md" and len(text.strip()) < 200:
+            raise ValueError("SKILL.md 核心提示词内容过短（至少 200 字符），请勿误清空")
+        now = _now_iso()
+        with self._lock, self._connect() as conn:
+            max_ver = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM prompt_versions WHERE prompt_key = ?",
+                (prompt_key,),
+            ).fetchone()[0]
+            next_ver = int(max_ver) + 1
+            conn.execute("UPDATE prompt_versions SET is_active = 0 WHERE prompt_key = ?", (prompt_key,))
+            cur = conn.execute(
+                """
+                INSERT INTO prompt_versions (prompt_key, version, content, note, updated_by, is_active, created_at)
+                VALUES (?, ?, ?, ?, ?, 1, ?)
+                """,
+                (prompt_key, next_ver, text, (note or "").strip()[:200], updated_by, now),
+            )
+            row = conn.execute("SELECT * FROM prompt_versions WHERE id = ?", (cur.lastrowid,)).fetchone()
+            assert row is not None
+            saved = dict(row)
+        self._sync_prompt_file(prompts_dir, prompt_key, text if text.strip() else None)
+        return saved
+
+    def rollback_prompt(self, prompt_key: str, version_id: int, *, updated_by: str,
+                        prompts_dir: Path | None = None) -> dict:
+        if prompt_key not in PROMPT_KEYS:
+            raise ValueError(f"不支持的提示词键：{prompt_key}")
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM prompt_versions WHERE id = ? AND prompt_key = ?",
+                (version_id, prompt_key),
+            ).fetchone()
+            if not row:
+                raise KeyError("未找到目标提示词历史版本")
+            content = row["content"]
+            src_ver = row["version"]
+        return self.save_prompt(
+            prompt_key,
+            content,
+            updated_by=updated_by,
+            note=f"回滚至 v{src_ver}",
+            prompts_dir=prompts_dir,
+        )
+
+    def reset_prompt(self, prompt_key: str, *, prompts_dir: Path | None = None) -> None:
+        """恢复内置默认提示词（取消数据库自定义覆盖并删除热挂载文件）。"""
+        if prompt_key not in PROMPT_KEYS:
+            raise ValueError(f"不支持的提示词键：{prompt_key}")
+        with self._lock, self._connect() as conn:
+            conn.execute("UPDATE prompt_versions SET is_active = 0 WHERE prompt_key = ?", (prompt_key,))
+        self._sync_prompt_file(prompts_dir, prompt_key, None)
+
+    def sync_all_active_prompts(self, prompts_dir: Path) -> None:
+        for key in PROMPT_KEYS:
+            active = self.get_active_prompt(key)
+            if active and str(active.get("content") or "").strip():
+                self._sync_prompt_file(prompts_dir, key, str(active["content"]))
+            else:
+                self._sync_prompt_file(prompts_dir, key, None)
+
+    # ---------- Git 仓库账号凭据管理（仅超管） ----------
+
+    @staticmethod
+    def _public_git_cred(row: sqlite3.Row, include_secret: bool = False) -> dict:
+        out = {
+            "id": int(row["id"]),
+            "label": row["label"] or "",
+            "protocol": row["protocol"] or "https",
+            "host": row["host"],
+            "path_prefix": row["path_prefix"] or "",
+            "username": row["username"],
+            "has_secret": bool(row["secret"]),
+            "secret_masked": mask_secret(row["secret"] or ""),
+            "is_active": bool(row["is_active"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        if include_secret:
+            out["secret"] = row["secret"] or ""
+        return out
+
+    def list_git_credentials(self, include_secret: bool = False) -> list[dict]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT * FROM git_credentials ORDER BY id ASC").fetchall()
+            return [self._public_git_cred(r, include_secret=include_secret) for r in rows]
+
+    def upsert_git_credential(self, data: dict, *, cred_id: int | None = None,
+                              runtime_file: Path | None = None,
+                              base_file: Path | None = None) -> dict:
+        protocol = str(data.get("protocol") or "https").strip().lower()
+        if protocol not in ("https", "http"):
+            raise ValueError("协议仅支持 https 或 http")
+        host = str(data.get("host") or "").strip().lower().removeprefix("https://").removeprefix("http://").strip("/")
+        if not host or any(ch.isspace() or ch in "@/" for ch in host):
+            raise ValueError("Git 域名/地址格式无效，例如 git.shineyue.com 或 10.0.1.10:8080")
+        path_prefix = str(data.get("path_prefix") or "").strip()
+        if path_prefix and not path_prefix.startswith("/"):
+            path_prefix = "/" + path_prefix
+        if any(ch.isspace() for ch in path_prefix):
+            raise ValueError("路径前缀不能包含空白字符")
+        username = str(data.get("username") or "").strip()
+        if not username or any(ch in "\r\n" for ch in username):
+            raise ValueError("Git 用户名不能为空")
+        secret_input = str(data.get("secret") or "")
+        if any(ch in "\r\n" for ch in secret_input):
+            raise ValueError("Git 密码/Token 不能包含换行符")
+        label = str(data.get("label") or "").strip()[:100]
+        is_active = 1 if bool(data.get("is_active", True)) else 0
+        now = _now_iso()
+
+        with self._lock, self._connect() as conn:
+            if cred_id is not None:
+                old = conn.execute("SELECT * FROM git_credentials WHERE id = ?", (cred_id,)).fetchone()
+                if not old:
+                    raise KeyError("未找到该 Git 账号配置")
+                final_secret = secret_input if secret_input else old["secret"]
+                if not final_secret:
+                    raise ValueError("密码/访问令牌不能为空")
+                conn.execute(
+                    """
+                    UPDATE git_credentials
+                    SET label=?, protocol=?, host=?, path_prefix=?, username=?, secret=?, is_active=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (label, protocol, host, path_prefix, username, final_secret, is_active, now, cred_id),
+                )
+                row = conn.execute("SELECT * FROM git_credentials WHERE id = ?", (cred_id,)).fetchone()
+            else:
+                if not secret_input:
+                    raise ValueError("新增 Git 账号时密码/访问令牌不能为空")
+                cur = conn.execute(
+                    """
+                    INSERT INTO git_credentials (label, protocol, host, path_prefix, username, secret, is_active, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (label, protocol, host, path_prefix, username, secret_input, is_active, now, now),
+                )
+                row = conn.execute("SELECT * FROM git_credentials WHERE id = ?", (cur.lastrowid,)).fetchone()
+            assert row is not None
+            saved = self._public_git_cred(row)
+        if runtime_file is not None:
+            self.export_git_credentials_file(runtime_file, base_file=base_file)
+        return saved
+
+    def delete_git_credential(self, cred_id: int, *, runtime_file: Path | None = None,
+                              base_file: Path | None = None) -> dict:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM git_credentials WHERE id = ?", (cred_id,)).fetchone()
+            if not row:
+                raise KeyError("未找到该 Git 账号配置")
+            deleted = self._public_git_cred(row)
+            conn.execute("DELETE FROM git_credentials WHERE id = ?", (cred_id,))
+        if runtime_file is not None:
+            self.export_git_credentials_file(runtime_file, base_file=base_file)
+        return deleted
+
+    def export_git_credentials_file(self, runtime_file: Path, base_file: Path | None = None) -> int:
+        """将超管维护的 Git 凭据与宿主机只读 git-credentials 合并导出为 0600 凭据文件。"""
+        active_creds = [c for c in self.list_git_credentials(include_secret=True) if c["is_active"]]
+        lines: list[str] = []
+        managed_keys: set[tuple[str, str, str]] = set()
+        for c in active_creds:
+            u = urllib.parse.quote(str(c["username"]), safe="")
+            s = urllib.parse.quote(str(c["secret"]), safe="")
+            lines.append(f"{c['protocol']}://{u}:{s}@{c['host']}{c['path_prefix']}")
+            managed_keys.add((c["protocol"], c["host"].lower(), c["path_prefix"]))
+
+        # 合并只读挂载的初始凭据中未被 Web 覆盖的条目，确保兼容存量部署
+        if base_file and base_file.is_file():
+            try:
+                for raw in base_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    try:
+                        p = urllib.parse.urlparse(line)
+                        key = (p.scheme.lower(), (p.hostname or "").lower() + (f":{p.port}" if p.port else ""), p.path or "")
+                    except ValueError:
+                        key = ("", "", "")
+                    if key not in managed_keys:
+                        lines.append(line)
+            except OSError:
+                pass
+
+        if not lines:
+            try:
+                runtime_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return 0
+        runtime_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = runtime_file.with_suffix(".tmp")
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, runtime_file)
+        return len(lines)
+
+
+def mask_secret(value: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if len(s) <= 4:
+        return "****"
+    if len(s) <= 8:
+        return s[:1] + "****" + s[-2:]
+    return s[:3] + "****" + s[-4:]
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not path or not path.is_file():
+        return out
+    try:
+        for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            if k:
+                out[k] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def write_env_file(path: Path, data: dict[str, str]) -> None:
+    lines = ["# Managed by AI Code Audit Portal (superadmin) — do not commit"]
+    for k, v in data.items():
+        key = str(k).strip()
+        val = str(v).strip()
+        if not ENV_KEY_RE.match(key):
+            raise ValueError(f"环境变量名格式无效：{key}")
+        if "\n" in val or "\r" in val:
+            raise ValueError(f"环境变量 {key} 的值不能包含换行符")
+        if val != "":
+            lines.append(f"{key}={val}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".env.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
+def test_openai_endpoint(base_url: str, model: str, api_key: str, timeout_sec: int = 15) -> dict:
+    """测试 OpenAI 兼容模型接口连通性与响应耗时（不泄露密钥）。"""
+    url_root = (base_url or "").strip().rstrip("/")
+    if not url_root.lower().startswith(("http://", "https://")):
+        raise ValueError("模型接口地址必须以 http:// 或 https:// 开头")
+    target = f"{url_root}/chat/completions"
+    payload = {
+        "model": (model or "").strip(),
+        "messages": [{"role": "user", "content": "Reply with OK only."}],
+        "max_tokens": 16,
+        "temperature": 0,
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key and api_key.strip():
+        headers["Authorization"] = f"Bearer {api_key.strip()}"
+    req = urllib.request.Request(
+        target, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
+    )
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            elapsed_ms = round((time.perf_counter() - t0) * 1000)
+            parsed = json.loads(raw) if raw else {}
+            choices = parsed.get("choices") or []
+            msg = choices[0].get("message", {}) if choices and isinstance(choices[0], dict) else {}
+            content = str(msg.get("content") or "").strip()[:120]
+            reasoning = msg.get("reasoning_content") or msg.get("reasoning")
+            return {
+                "ok": True,
+                "status_code": resp.status,
+                "elapsed_ms": elapsed_ms,
+                "model": parsed.get("model") or model,
+                "reply_preview": content,
+                "has_thinking": bool(reasoning),
+                "error": "",
+            }
+    except urllib.error.HTTPError as exc:
+        elapsed_ms = round((time.perf_counter() - t0) * 1000)
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:300]
+        finally:
+            exc.close()
+        return {
+            "ok": False,
+            "status_code": exc.code,
+            "elapsed_ms": elapsed_ms,
+            "model": model,
+            "reply_preview": "",
+            "has_thinking": False,
+            "error": f"HTTP {exc.code}: {body}",
+        }
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - t0) * 1000)
+        return {
+            "ok": False,
+            "status_code": 0,
+            "elapsed_ms": elapsed_ms,
+            "model": model,
+            "reply_preview": "",
+            "has_thinking": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
 
 def validate_git_url(raw_url: str) -> str:
     """校验 Git 仓库地址，防止参数注入与 file:// 本地路径泄露。"""
@@ -1111,11 +1516,14 @@ def validate_git_url(raw_url: str) -> str:
     raise ValueError("Git 地址仅支持 http://、https://、ssh:// 或 git@ 协议")
 
 
-def probe_git_remote(git_url: str, branch: str = "", timeout_sec: int = 15) -> dict:
+def probe_git_remote(git_url: str, branch: str = "", timeout_sec: int = 15,
+                     credential_file: Path | None = None) -> dict:
     """执行只读 git ls-remote --heads 校验连通性与分支是否存在。"""
     url = validate_git_url(git_url)
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
+    if credential_file and credential_file.is_file():
+        env["AUDIT_GIT_CREDENTIAL_FILE"] = str(credential_file)
     try:
         proc = subprocess.run(
             ["git", "ls-remote", "--heads", "--symref", url],

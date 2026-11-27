@@ -10,6 +10,8 @@ import {
   RefreshCw,
   Settings,
   ShieldCheck,
+  SlidersHorizontal,
+  Sparkles,
   Sun,
   UserCircle2,
   Users,
@@ -19,14 +21,16 @@ import { LoginView } from "./components/LoginView";
 import { ProfileModal } from "./components/ProfileModal";
 import { ConfigPage } from "./pages/ConfigPage";
 import { DashboardPage } from "./pages/DashboardPage";
+import { OpsConfigPage } from "./pages/OpsConfigPage";
 import { ProgressPage } from "./pages/ProgressPage";
 import { ProjectsPage } from "./pages/ProjectsPage";
+import { PromptsPage } from "./pages/PromptsPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { RunsPage } from "./pages/RunsPage";
 import { UsersPage } from "./pages/UsersPage";
 import type { AuthUser, OverviewResponse } from "./types";
 
-type Page = "dashboard" | "progress" | "runs" | "reports" | "projects" | "config" | "users";
+type Page = "dashboard" | "progress" | "runs" | "reports" | "projects" | "prompts" | "config" | "users" | "ops";
 type ReportTarget = { date: string; runId: string; target: string };
 
 const ROLE_BADGE: Record<AuthUser["role"], string> = {
@@ -43,8 +47,10 @@ function parseHash(): { page: Page; reportTarget: ReportTarget | null } {
   else if (pathPart === "runs") page = "runs";
   else if (pathPart === "reports") page = "reports";
   else if (pathPart === "projects") page = "projects";
+  else if (pathPart === "prompts") page = "prompts";
   else if (pathPart === "config") page = "config";
   else if (pathPart === "users") page = "users";
+  else if (pathPart === "ops") page = "ops";
 
   if (page === "reports" && queryPart) {
     const params = new URLSearchParams(queryPart);
@@ -145,7 +151,9 @@ export function App() {
 
   useEffect(() => {
     if (authChecked && currentUser) {
-      if (page === "users" && currentUser.role === "user") {
+      if ((page === "users" || page === "prompts") && currentUser.role === "user") {
+        setPage("dashboard");
+      } else if (page === "ops" && currentUser.role !== "superadmin") {
         setPage("dashboard");
       }
       void loadOverview();
@@ -258,6 +266,14 @@ export function App() {
             >
               <FolderGit2 size={15} /> {currentUser.role === "user" ? "我的项目" : "项目管理"}
             </button>
+            {(currentUser.role === "superadmin" || currentUser.role === "admin") && (
+              <button
+                className={`nav-tab ${page === "prompts" ? "active" : ""}`}
+                onClick={() => navigate("prompts")}
+              >
+                <Sparkles size={15} /> 提示词
+              </button>
+            )}
             <button
               className={`nav-tab ${page === "config" ? "active" : ""}`}
               onClick={() => navigate("config")}
@@ -270,6 +286,14 @@ export function App() {
                 onClick={() => navigate("users")}
               >
                 <Users size={15} /> 用户管理
+              </button>
+            )}
+            {currentUser.role === "superadmin" && (
+              <button
+                className={`nav-tab ${page === "ops" ? "active" : ""}`}
+                onClick={() => navigate("ops")}
+              >
+                <SlidersHorizontal size={15} /> 运维配置
               </button>
             )}
           </nav>
@@ -332,12 +356,16 @@ export function App() {
           />
         )}
         {page === "projects" && <ProjectsPage currentUser={currentUser} />}
+        {page === "prompts" && (currentUser.role === "superadmin" || currentUser.role === "admin") && (
+          <PromptsPage />
+        )}
         {page === "config" && (
           <ConfigPage currentUser={currentUser} onScanStarted={handleScanStarted} />
         )}
         {page === "users" && (currentUser.role === "superadmin" || currentUser.role === "admin") && (
           <UsersPage currentUser={currentUser} />
         )}
+        {page === "ops" && currentUser.role === "superadmin" && <OpsConfigPage />}
       </main>
 
       {(showProfile || currentUser.must_change_password) && (
