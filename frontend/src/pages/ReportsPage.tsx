@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Check, ChevronLeft, ChevronRight, Download, FileText, Link2, Printer, RefreshCw } from "lucide-react";
 import { api } from "../api";
-import type { ReportResponse, RunDetailResponse, RunSummary } from "../types";
+import type { AuthUser, ReportResponse, RunDetailResponse, RunSummary } from "../types";
 import {
   downloadBlob,
   downloadMarkdown,
@@ -17,15 +17,19 @@ function csvCell(v: string): string {
 }
 
 interface Props {
+  currentUser?: AuthUser | null;
   initialTarget: { date: string; runId: string; target: string } | null;
   onTargetChange?: (next: { date: string; runId: string; target: string }) => void;
 }
 
-export function ReportsPage({ initialTarget, onTargetChange }: Props) {
+export function ReportsPage({ currentUser, initialTarget, onTargetChange }: Props) {
+  const isAdmin = !currentUser || currentUser.role === "superadmin" || currentUser.role === "admin";
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [date, setDate] = useState(initialTarget?.date || "");
   const [runId, setRunId] = useState(initialTarget?.runId || "");
-  const [target, setTarget] = useState(initialTarget?.target || "_summary");
+  const [target, setTarget] = useState(
+    initialTarget?.target || (isAdmin ? "_summary" : "")
+  );
   const [runDetail, setRunDetail] = useState<RunDetailResponse | null>(null);
   const [report, setReport] = useState<ReportResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -66,8 +70,17 @@ export function ReportsPage({ initialTarget, onTargetChange }: Props) {
 
   useEffect(() => {
     if (!date || !runId) return;
-    api.runDetail(date, runId).then(setRunDetail).catch(() => setRunDetail(null));
-  }, [date, runId]);
+    api
+      .runDetail(date, runId)
+      .then((d) => {
+        setRunDetail(d);
+        if (!isAdmin && (!target || target === "_summary")) {
+          const firstOk = (d.projects || []).find((p) => p.status === "ok");
+          if (firstOk) setTarget(firstOk.project_id);
+        }
+      })
+      .catch(() => setRunDetail(null));
+  }, [date, runId, isAdmin]);
 
   useEffect(() => {
     if (!date || !runId || !target) return;
@@ -106,8 +119,8 @@ export function ReportsPage({ initialTarget, onTargetChange }: Props) {
   }, [okProjects, projectSearch]);
 
   const targetOrder = useMemo(
-    () => ["_summary", ...visibleProjects.map((p) => p.project_id)],
-    [visibleProjects]
+    () => (isAdmin ? ["_summary", ...visibleProjects.map((p) => p.project_id)] : visibleProjects.map((p) => p.project_id)),
+    [visibleProjects, isAdmin]
   );
   const currentIdx = targetOrder.indexOf(target);
 
@@ -191,7 +204,7 @@ export function ReportsPage({ initialTarget, onTargetChange }: Props) {
               const [d, r] = e.target.value.split("/");
               setDate(d || "");
               setRunId(r || "");
-              setTarget("_summary");
+              setTarget(isAdmin ? "_summary" : "");
             }}
           >
             {runs.length === 0 && <option value="">暂无批次</option>}
@@ -210,7 +223,8 @@ export function ReportsPage({ initialTarget, onTargetChange }: Props) {
           />
 
           <select value={target} onChange={(e) => setTarget(e.target.value)} style={{ maxWidth: 280 }}>
-            <option value="_summary">跨项目汇总报告 (_summary.md)</option>
+            {isAdmin && <option value="_summary">跨项目汇总报告 (_summary.md)</option>}
+            {!isAdmin && visibleProjects.length === 0 && <option value="">暂无可阅读报告</option>}
             {visibleProjects.map((p) => (
               <option key={p.project_id} value={p.project_id}>
                 {p.project_name || p.project_id} ({p.project_id})
@@ -243,7 +257,7 @@ export function ReportsPage({ initialTarget, onTargetChange }: Props) {
             {copied ? <Check size={14} /> : <Link2 size={14} />} {copied ? "已复制" : "复制链接"}
           </button>
 
-          {target === "_summary" && date && runId && (
+          {isAdmin && target === "_summary" && date && runId && (
             <button
               className="btn btn-primary"
               disabled={exportBusy}

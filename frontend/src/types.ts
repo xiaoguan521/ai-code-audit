@@ -1,8 +1,46 @@
+export type UserRole = "superadmin" | "admin" | "user";
+
+export interface AuthUser {
+  id: number;
+  username: string;
+  display_name: string;
+  role: UserRole;
+  email: string;
+  must_change_password: boolean;
+  email_notify: "batch" | "risk_only" | "off";
+  is_active: boolean;
+  created_at?: string;
+  updated_at?: string;
+  last_login_at?: string | null;
+}
+
+export interface OwnerPreviewItem {
+  display_name: string;
+  username: string;
+  email: string;
+  role: UserRole;
+  exists: boolean;
+}
+
+export interface AuditLogEntry {
+  id: number;
+  actor_username: string;
+  actor_role: string;
+  action: string;
+  target: string;
+  detail: string;
+  client_ip: string;
+  created_at: string;
+}
+
 export interface RunSummary {
   date: string;
   run_id: string;
   status: string;
   report_mode?: string;
+  triggered_by?: string;
+  trigger?: string;
+  can_delete?: boolean;
   started_at?: string | null;
   finished_at?: string | null;
   snapshot_at?: string | null;
@@ -106,6 +144,9 @@ export interface RunDetailResponse {
   run_id: string;
   status: string;
   report_mode?: string;
+  triggered_by?: string;
+  trigger?: string;
+  can_delete?: boolean;
   started_at?: string | null;
   finished_at?: string | null;
   snapshot_at?: string | null;

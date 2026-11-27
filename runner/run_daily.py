@@ -1412,6 +1412,12 @@ def main() -> int:
     progress = {"date": run_date, "run_id": args.run_id, "started_at": now().isoformat(),
                 "status": "running", "finished_at": None, "projects": [], "pending_projects": ids.copy(),
                 "snapshot_at": snapshot_text(snapshot_at), "snapshot_method": SNAPSHOT_METHOD}
+    triggered_by = os.environ.get("AUDIT_TRIGGERED_BY", "").strip()
+    trigger_kind = os.environ.get("AUDIT_TRIGGER", "").strip()
+    if triggered_by:
+        progress["triggered_by"] = triggered_by
+    if trigger_kind:
+        progress["trigger"] = trigger_kind
     if not args.summary_only:
         progress["report_mode"] = report_mode
     write_json_atomic(runlog, progress, mode=0o600)

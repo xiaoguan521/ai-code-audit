@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Download, FileText, RefreshCw, RotateCcw } from "lucide-react";
+import { AlertTriangle, Download, FileText, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 import { api } from "../api";
 import { DraftModal } from "../components/DraftModal";
-import type { RunDetailResponse, RunSummary } from "../types";
+import type { AuthUser, RunDetailResponse, RunSummary } from "../types";
 
 interface Props {
+  currentUser?: AuthUser | null;
   onOpenReport: (date: string, runId: string, target: string) => void;
   onScanStarted?: (taskId: string) => void;
 }
@@ -45,7 +46,8 @@ function classifyError(raw: string | undefined): string {
   return "其他错误";
 }
 
-export function RunsPage({ onOpenReport, onScanStarted }: Props) {
+export function RunsPage({ currentUser, onOpenReport, onScanStarted }: Props) {
+  const isAdmin = !currentUser || currentUser.role === "superadmin" || currentUser.role === "admin";
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [selected, setSelected] = useState<{ date: string; run_id: string } | null>(null);
   const [detail, setDetail] = useState<RunDetailResponse | null>(null);
@@ -163,6 +165,34 @@ export function RunsPage({ onOpenReport, onScanStarted }: Props) {
     }
   };
 
+  const handleDeleteRun = async () => {
+    if (!detail) return;
+    if (
+      !window.confirm(
+        `确认永久删除批次 ${detail.date} / ${detail.run_id}？\n该批次的运行记录与项目报告将被清除；若项目最新基线指向该批次，系统会自动回退到上一次有效扫描结果。`
+      )
+    ) {
+      return;
+    }
+    setActionBusy(true);
+    setError(null);
+    try {
+      await api.deleteRun(detail.date, detail.run_id);
+      const res = await api.runs();
+      setRuns(res.runs);
+      if (res.runs.length > 0) {
+        setSelected({ date: res.runs[0].date, run_id: res.runs[0].run_id });
+      } else {
+        setSelected(null);
+        setDetail(null);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除批次失败");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
   const handleViewRejected = async (pid: string, name: string) => {
     if (!detail) return;
     setError(null);
@@ -250,6 +280,7 @@ export function RunsPage({ onOpenReport, onScanStarted }: Props) {
                 </div>
                 <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
                   {r.run_id} · {r.report_mode || "standard"}
+                  {r.triggered_by ? ` · ${r.triggered_by}` : ""}
                 </div>
                 <div className="sub" style={{ fontSize: 12, marginTop: 4 }}>
                   成功 {r.ok_count} / 失败 {r.error_count} / 共 {r.total_projects}
@@ -272,7 +303,7 @@ export function RunsPage({ onOpenReport, onScanStarted }: Props) {
                 批次详情：{detail.date} / {detail.run_id}
               </span>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                {detail.status === "running" && (
+                {isAdmin && detail.status === "running" && (
                   <button
                     className="btn btn-danger"
                     disabled={actionBusy}
@@ -291,7 +322,7 @@ export function RunsPage({ onOpenReport, onScanStarted }: Props) {
                     <RotateCcw size={14} /> 重跑失败项 ({failedProjects.length})
                   </button>
                 )}
-                {okCount > 0 && (
+                {isAdmin && okCount > 0 && (
                   <>
                     <button
                       className="btn"
@@ -315,11 +346,22 @@ export function RunsPage({ onOpenReport, onScanStarted }: Props) {
                     </button>
                   </>
                 )}
+                {detail.can_delete && (
+                  <button
+                    className="btn btn-danger"
+                    disabled={actionBusy}
+                    title="永久删除该冗余/测试批次及其报告"
+                    onClick={() => void handleDeleteRun()}
+                  >
+                    <Trash2 size={14} /> 删除批次
+                  </button>
+                )}
               </div>
             </div>
             <div className="sub" style={{ marginBottom: 12 }}>
-              状态：<b>{detail.status}</b> · 模式：{detail.report_mode || "—"} · 开始：
-              {detail.started_at?.slice(0, 19).replace("T", " ") || "—"}
+              状态：<b>{detail.status}</b> · 模式：{detail.report_mode || "—"}
+              {detail.triggered_by ? ` · 触发人：${detail.triggered_by}` : ""}
+              {" · "}开始：{detail.started_at?.slice(0, 19).replace("T", " ") || "—"}
               {detail.snapshot_at ? ` · 快照：${detail.snapshot_at.slice(0, 19).replace("T", " ")}` : ""}
               {" · "}结束：{detail.finished_at?.slice(0, 19).replace("T", " ") || "—"} · 汇总状态：
               {detail.summary_status || "—"}

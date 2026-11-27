@@ -3,6 +3,7 @@ import { AlertTriangle, ChevronDown, ChevronRight, Download, RefreshCw, RotateCc
 import { api } from "../api";
 import { DraftModal } from "../components/DraftModal";
 import type {
+  AuthUser,
   LiveProgressResponse,
   RunProgressItem,
   RunProgressProjectItem,
@@ -11,6 +12,7 @@ import type {
 import { downloadBlob, sanitizeFilename } from "../utils/markdown";
 
 interface Props {
+  currentUser?: AuthUser | null;
   initialTaskId?: string | null;
   onOpenReport?: (date: string, runId: string, target: string) => void;
   onScanStarted?: (taskId: string) => void;
@@ -132,7 +134,8 @@ function normalizeItems(run: RunProgressItem): RunProgressProjectItem[] {
   return out;
 }
 
-export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Props) {
+export function ProgressPage({ currentUser, initialTaskId, onOpenReport, onScanStarted }: Props) {
+  const isAdmin = !currentUser || currentUser.role === "superadmin" || currentUser.role === "admin";
   const [progress, setProgress] = useState<LiveProgressResponse | null>(null);
   const [progStateFilter, setProgStateFilter] = useState<"" | RunProgressProjectItem["state"]>("");
   const [progReasonFilter, setProgReasonFilter] = useState("");
@@ -449,7 +452,7 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
             )}
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            {run.ok_count > 0 && (
+            {isAdmin && run.ok_count > 0 && (
               <button
                 className="btn"
                 style={{ padding: "4px 10px", fontSize: 12 }}
@@ -460,7 +463,7 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
                 <Download size={13} /> 导出 Word 汇总 (.docx)
               </button>
             )}
-            {maybeStaleOrCli && scanningCount === 0 && (
+            {isAdmin && maybeStaleOrCli && scanningCount === 0 && (
               <button
                 className="btn btn-danger"
                 style={{ padding: "4px 10px", fontSize: 12 }}

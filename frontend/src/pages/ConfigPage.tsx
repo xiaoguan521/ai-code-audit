@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { CalendarClock, Check, Play, RefreshCw, Save, Stethoscope } from "lucide-react";
 import { api } from "../api";
-import type { CatalogProject, DoctorReport, ScheduleResponse } from "../types";
+import type { AuthUser, CatalogProject, DoctorReport, ScheduleResponse } from "../types";
 
 interface Props {
+  currentUser?: AuthUser | null;
   onScanStarted?: (taskId: string) => void;
 }
 
@@ -23,7 +24,8 @@ const WEEKDAY_LABELS: [number, string][] = [
   [7, "周日"],
 ];
 
-export function ConfigPage({ onScanStarted }: Props) {
+export function ConfigPage({ currentUser, onScanStarted }: Props) {
+  const isAdmin = !currentUser || currentUser.role === "superadmin" || currentUser.role === "admin";
   const [projects, setProjects] = useState<CatalogProject[]>([]);
   const [scanStatuses, setScanStatuses] = useState<string[]>(["在研"]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -71,14 +73,17 @@ export function ConfigPage({ onScanStarted }: Props) {
   const loadAll = async () => {
     setError(null);
     try {
-      const [pRes, scRes] = await Promise.all([api.projects(), api.schedule()]);
+      const pRes = await api.projects();
       setProjects(pRes.projects);
       if (pRes.scan_statuses && pRes.scan_statuses.length > 0) {
         setScanStatuses(pRes.scan_statuses);
       }
-      applyScheduleState(scRes);
+      if (isAdmin) {
+        const scRes = await api.schedule();
+        applyScheduleState(scRes);
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "加载项目清单与定时配置失败");
+      setError(err instanceof Error ? err.message : "加载项目清单失败");
     }
   };
 
@@ -206,7 +211,8 @@ export function ConfigPage({ onScanStarted }: Props) {
         </div>
       )}
 
-      {/* 1. 可视化定时扫描配置 */}
+      {/* 1. 可视化定时扫描配置（仅管理员 / 超管可见） */}
+      {isAdmin && (
       <div className="card">
         <div className="card-title">
           <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
@@ -346,15 +352,18 @@ export function ConfigPage({ onScanStarted }: Props) {
           )}
         </div>
       </div>
+      )}
 
       {/* 2. 项目清单与手动触发 + 环境自检 */}
       <div className="card">
         <div className="card-title">
-          <span>项目清单与手动触发扫描（共 {projects.length} 项）</span>
+          <span>{isAdmin ? `项目清单与手动触发扫描（共 ${projects.length} 项）` : `我负责的项目清单（共 ${projects.length} 项）`}</span>
           <div style={{ display: "flex", gap: 8 }}>
-            <button className="btn" onClick={() => void handleDoctor()} disabled={checkingDoctor}>
-              <Stethoscope size={14} /> {checkingDoctor ? "检查中…" : "环境自检"}
-            </button>
+            {isAdmin && (
+              <button className="btn" onClick={() => void handleDoctor()} disabled={checkingDoctor}>
+                <Stethoscope size={14} /> {checkingDoctor ? "检查中…" : "环境自检"}
+              </button>
+            )}
             <button className="btn" onClick={() => void loadAll()}>
               <RefreshCw size={14} /> 刷新
             </button>
@@ -435,21 +444,23 @@ export function ConfigPage({ onScanStarted }: Props) {
             />
             仅演练 (--dry-run)
           </label>
-          <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <input
-              type="checkbox"
-              checked={summaryOnly}
-              onChange={(e) => {
-                setSummaryOnly(e.target.checked);
-                if (e.target.checked) {
-                  setDryRun(false);
-                  setForceFull(false);
-                  setResume(false);
-                }
-              }}
-            />
-            仅生成汇总 (--summary-only)
-          </label>
+          {isAdmin && (
+            <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <input
+                type="checkbox"
+                checked={summaryOnly}
+                onChange={(e) => {
+                  setSummaryOnly(e.target.checked);
+                  if (e.target.checked) {
+                    setDryRun(false);
+                    setForceFull(false);
+                    setResume(false);
+                  }
+                }}
+              />
+              仅生成汇总 (--summary-only)
+            </label>
+          )}
           <input
             placeholder="快照时间 ISO-8601（可选）"
             title="例如 2026-11-24T00:00:00+08:00"
@@ -461,10 +472,15 @@ export function ConfigPage({ onScanStarted }: Props) {
             className="btn btn-primary"
             style={{ marginLeft: "auto" }}
             onClick={() => void handleStart()}
-            disabled={submitting}
+            disabled={submitting || (!isAdmin && selectedIds.length === 0)}
+            title={!isAdmin && selectedIds.length === 0 ? "请先在下方勾选您负责的项目" : undefined}
           >
             <Play size={14} />{" "}
-            {selectedIds.length > 0 ? `扫描已选 (${selectedIds.length})` : "扫描全部在研项目"}
+            {selectedIds.length > 0
+              ? `扫描已选 (${selectedIds.length})`
+              : isAdmin
+              ? "扫描全部在研项目"
+              : "请先勾选项目"}
           </button>
         </div>
 

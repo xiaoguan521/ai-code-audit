@@ -27,6 +27,7 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -45,6 +46,7 @@ sys.path.insert(0, str(RUNNER_DIR))
 
 import doctor  # noqa: E402
 import docx_export  # noqa: E402
+import platform_db  # noqa: E402
 import report_validate  # noqa: E402
 import scoring  # noqa: E402
 from adapters import summary as summary_adapter  # noqa: E402
@@ -449,8 +451,47 @@ def _resolve_workdir(output_dir: Path, settings: dict) -> Path:
     return (output_dir.parent / "work").resolve()
 
 
+def _allowed_pids_for_user(user: dict | None, projects_csv: Path | None) -> set[str] | None:
+    """superadmin/admin 返回 None（不限）；普通用户返回其负责的 project_id 集合。"""
+    if not user or user.get("role") in ("superadmin", "admin"):
+        return None
+    if not projects_csv:
+        return set()
+    return {p["project_id"] for p in _load_projects(projects_csv) if platform_db.user_owns_project(user, p)}
+
+
+def _filter_run_progress(item: dict, allowed_pids: set[str]) -> dict:
+    filtered_items = [x for x in (item.get("items") or []) if x.get("project_id") in allowed_pids]
+    filtered_completed = [x for x in (item.get("completed_projects") or []) if x.get("project_id") in allowed_pids]
+    filtered_pending = [pid for pid in (item.get("pending_projects") or []) if pid in allowed_pids]
+    ok_count = sum(1 for x in filtered_items if x.get("state") == "ok")
+    err_count = sum(1 for x in filtered_items if x.get("state") == "error")
+    scanning_count = sum(1 for x in filtered_items if x.get("state") == "scanning")
+    queued_count = sum(1 for x in filtered_items if x.get("state") == "queued")
+    completed_count = ok_count + err_count
+    total_count = len(filtered_items)
+    percent = round(completed_count * 100 / total_count) if total_count > 0 else 0
+    out = dict(item)
+    out.update({
+        "total_count": total_count,
+        "completed_count": completed_count,
+        "ok_count": ok_count,
+        "error_count": err_count,
+        "scanning_count": scanning_count,
+        "queued_count": queued_count,
+        "pending_count": len(filtered_pending),
+        "percent": percent,
+        "items": filtered_items,
+        "completed_projects": filtered_completed,
+        "pending_projects": filtered_pending,
+    })
+    return out
+
+
 def _build_live_progress(output_dir: Path, projects_csv: Path | None = None,
-                         settings_path: Path | None = None) -> dict:
+                         settings_path: Path | None = None,
+                         user: dict | None = None) -> dict:
+    allowed_pids = _allowed_pids_for_user(user, projects_csv)
     catalog = {p["project_id"]: p for p in _load_projects(projects_csv)} if projects_csv else {}
     settings = (_read_json(settings_path) if settings_path else None) or {}
     if not isinstance(settings, dict):
@@ -495,14 +536,24 @@ def _build_live_progress(output_dir: Path, projects_csv: Path | None = None,
             hist_by_pid=pid_hist, hist_global_avg=hist_avg,
             output_dir=output_dir,
         )
-        if idx == 0:
+        if allowed_pids is not None:
+            item = _filter_run_progress(item, allowed_pids)
+            if item["total_count"] == 0:
+                continue
+        if latest_run is None:
             latest_run = item
         if item["status"] == "running":
             active_runs.append(item)
+    uname = (user or {}).get("username")
+    is_admin = not user or user.get("role") in ("superadmin", "admin")
     with SCAN_LOCK:
-        all_tasks = [_serialize_task(t, include_logs=False) for t in reversed(list(SCAN_TASKS.values()))]
+        visible_tasks = [
+            t for t in reversed(list(SCAN_TASKS.values()))
+            if is_admin or t.get("triggered_by") == uname
+        ]
+        all_tasks = [_serialize_task(t, include_logs=False) for t in visible_tasks]
         running_task = next(
-            (_serialize_task(t, include_logs=True) for t in reversed(list(SCAN_TASKS.values())) if t["status"] == "running"),
+            (_serialize_task(t, include_logs=True) for t in visible_tasks if t["status"] == "running"),
             None,
         )
     return {
@@ -705,12 +756,30 @@ def _parse_markdown_report(md_path: Path, checklist: dict, weights: dict | None 
     return dict(parsed_result)
 
 
-def _discover_runs(output_dir: Path) -> list[dict]:
+def _can_delete_run(user: dict | None, run_data: dict) -> bool:
+    """判断用户是否可删除该批次：运行中批次禁止删除；管理员/超管可删任意非运行批次，普通用户仅可删自己触发的。"""
+    if not user or run_data.get("status") == "running":
+        return False
+    if user.get("role") in ("superadmin", "admin"):
+        return True
+    triggered_by = str(run_data.get("triggered_by") or "").strip().lower()
+    username = str(user.get("username") or "").strip().lower()
+    return bool(triggered_by and username and triggered_by == username)
+
+
+def _discover_runs(output_dir: Path, allowed_pids: set[str] | None = None,
+                   user: dict | None = None) -> list[dict]:
     """扫描 results/<date>/<run_id>/_run.json 与旧格式 results/<date>/_run.json，按时间倒序排列。"""
     results_dir = output_dir / "results"
     runs: list[dict] = []
     if not results_dir.is_dir():
         return runs
+
+    def _add(date_str: str, run_id: str, data: dict) -> None:
+        item = _summarize_run(date_str, run_id, data, output_dir, allowed_pids=allowed_pids, user=user)
+        if allowed_pids is not None and item["total_projects"] == 0 and item["pending_count"] == 0:
+            return
+        runs.append(item)
 
     for date_dir in sorted(results_dir.iterdir(), reverse=True):
         if not date_dir.is_dir() or not _is_safe_segment(date_dir.name):
@@ -722,29 +791,37 @@ def _discover_runs(output_dir: Path) -> list[dict]:
                 run_file = child / "_run.json"
                 data = _read_json(run_file)
                 if isinstance(data, dict):
-                    runs.append(_summarize_run(date_str, child.name, data, output_dir))
+                    _add(date_str, child.name, data)
         # 兼容旧格式: results/<date>/_run.json
         legacy_file = date_dir / "_run.json"
         if legacy_file.is_file():
             data = _read_json(legacy_file)
             if isinstance(data, dict):
-                runs.append(_summarize_run(date_str, "default", data, output_dir))
+                _add(date_str, "default", data)
 
     runs.sort(key=lambda r: (r.get("date", ""), r.get("started_at") or r.get("run_id", "")), reverse=True)
     return runs
 
 
-def _summarize_run(date_str: str, run_id: str, data: dict, output_dir: Path) -> dict:
+def _summarize_run(date_str: str, run_id: str, data: dict, output_dir: Path,
+                   allowed_pids: set[str] | None = None, user: dict | None = None) -> dict:
     projects = data.get("projects") or []
+    pending = data.get("pending_projects") or []
+    if allowed_pids is not None:
+        projects = [p for p in projects if p.get("project_id") in allowed_pids]
+        pending = [pid for pid in pending if pid in allowed_pids]
     ok_count = sum(1 for p in projects if p.get("status") == "ok")
-    err_count = sum(1 for p in projects if p.get("status") == "error")
+    err_count = sum(1 for p in projects if p.get("status") != "ok")
     rep_dir = output_dir / "reports" / date_str if run_id == "default" else output_dir / "reports" / date_str / run_id
-    summary_exists = (rep_dir / "_summary.md").is_file()
+    summary_exists = (rep_dir / "_summary.md").is_file() and allowed_pids is None
     return {
         "date": data.get("date") or date_str,
         "run_id": data.get("run_id") or run_id,
         "status": data.get("status", "unknown"),
         "report_mode": data.get("report_mode", ""),
+        "triggered_by": data.get("triggered_by") or "",
+        "trigger": data.get("trigger") or "",
+        "can_delete": _can_delete_run(user, data),
         "started_at": data.get("started_at"),
         "finished_at": data.get("finished_at"),
         "snapshot_at": data.get("snapshot_at"),
@@ -753,7 +830,7 @@ def _summarize_run(date_str: str, run_id: str, data: dict, output_dir: Path) -> 
         "total_projects": len(projects),
         "ok_count": ok_count,
         "error_count": err_count,
-        "pending_count": len(data.get("pending_projects") or []),
+        "pending_count": len(pending),
     }
 
 
@@ -769,8 +846,10 @@ def _resolve_run_file(output_dir: Path, date_str: str, run_id: str) -> Path:
     return output_dir / "results" / date_str / run_id / "_run.json"
 
 
-def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict) -> dict:
-    runs = _discover_runs(output_dir)
+def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict,
+                    user: dict | None = None) -> dict:
+    allowed_pids = _allowed_pids_for_user(user, projects_csv)
+    runs = _discover_runs(output_dir, allowed_pids=allowed_pids)
     catalog = {p["project_id"]: p for p in _load_projects(projects_csv)}
 
     # 读取所有 state/<pid>.json 作为项目最新基线
@@ -778,6 +857,8 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict) -> di
     states: dict[str, dict] = {}
     if state_dir.is_dir():
         for f in sorted(state_dir.glob("*.json")):
+            if f.stem == "schedule":
+                continue
             data = _read_json(f)
             if isinstance(data, dict):
                 states[f.stem] = data
@@ -791,6 +872,8 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict) -> di
             continue
         totals, secs = [], []
         for p in run_data.get("projects") or []:
+            if allowed_pids is not None and p.get("project_id") not in allowed_pids:
+                continue
             if p.get("status") != "ok":
                 continue
             sc = p.get("report_scores") or {}
@@ -820,6 +903,8 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict) -> di
     latest_projects = {p["project_id"]: p for p in (latest_run_data or {}).get("projects", [])}
 
     all_pids = sorted(set(catalog) | set(states) | set(latest_projects))
+    if allowed_pids is not None:
+        all_pids = [pid for pid in all_pids if pid in allowed_pids]
     rows: list[dict] = []
     dim_buckets: dict[str, list[float]] = {str(d["id"]): [] for d in checklist["dimensions"]}
 
@@ -1026,20 +1111,193 @@ def _mark_run_aborted(output_dir: Path, date_str: str, run_id: str,
     return {"ok": True, "date": date_str, "run_id": run_id, "status": data["status"]}
 
 
+def _rollback_states_for_deleted_run(output_dir: Path, deleted_rep_dir: Path, deleted_pids: set[str]) -> tuple[list[str], list[str]]:
+    """批次删除后，若 state/<pid>.json 的 last_report 指向已被删除的目录，自动回退到最近一次有效历史批次；无历史则移除。"""
+    state_dir = output_dir / "state"
+    if not state_dir.is_dir():
+        return [], []
+    deleted_rep_resolved = deleted_rep_dir.resolve()
+    affected_pids: list[str] = []
+    for sf in sorted(state_dir.glob("*.json")):
+        if sf.stem == "schedule":
+            continue
+        st = _read_json(sf)
+        if not isinstance(st, dict):
+            continue
+        last_rep = str(st.get("last_report") or "").strip()
+        if not last_rep:
+            continue
+        try:
+            rep_p = Path(last_rep).resolve()
+            if rep_p.is_relative_to(deleted_rep_resolved) or (sf.stem in deleted_pids and not rep_p.is_file()):
+                affected_pids.append(sf.stem)
+        except OSError:
+            if sf.stem in deleted_pids:
+                affected_pids.append(sf.stem)
+    if not affected_pids:
+        return [], []
+
+    remaining_runs = _discover_runs(output_dir)
+    rebuilt: list[str] = []
+    cleared: list[str] = []
+    reports_root = (output_dir / "reports").resolve()
+
+    for pid in affected_pids:
+        sf = state_dir / f"{pid}.json"
+        old_st = _read_json(sf) or {}
+        found_state: dict | None = None
+        for r in remaining_runs:
+            rdata = _read_json(_resolve_run_file(output_dir, r["date"], r["run_id"]))
+            if not isinstance(rdata, dict):
+                continue
+            rrep_dir = _resolve_report_dir(output_dir, r["date"], r["run_id"])
+            for rec in rdata.get("projects") or []:
+                if rec.get("project_id") != pid or rec.get("status") != "ok":
+                    continue
+                cand_raw = str(rec.get("report_path") or "").strip()
+                cand = Path(cand_raw) if cand_raw else (rrep_dir / f"{pid}.md")
+                if not cand.is_file():
+                    cand = rrep_dir / f"{pid}.md"
+                try:
+                    cand_res = cand.resolve()
+                except OSError:
+                    continue
+                if not cand_res.is_relative_to(reports_root) or not cand_res.is_file():
+                    continue
+                found_state = dict(old_st) if isinstance(old_st, dict) else {}
+                found_state.update({
+                    "last_commit": rec.get("commit") or found_state.get("last_commit") or "",
+                    "last_report": str(cand_res),
+                    "last_scan_date": r["date"],
+                    "report_mode": rec.get("report_mode") or rdata.get("report_mode") or "standard",
+                    "scores": rec.get("report_scores"),
+                })
+                if "incremental_streak" in rec:
+                    found_state["incremental_streak"] = rec["incremental_streak"]
+                if "last_full_date" in rec:
+                    found_state["last_full_date"] = rec["last_full_date"]
+                break
+            if found_state is not None:
+                break
+
+        if found_state is not None:
+            tmp = sf.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(found_state, ensure_ascii=False, indent=2), encoding="utf-8")
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp, sf)
+            rebuilt.append(pid)
+        else:
+            try:
+                sf.unlink(missing_ok=True)
+                cleared.append(pid)
+            except OSError:
+                pass
+    return rebuilt, cleared
+
+
+def _delete_run(output_dir: Path, date_str: str, run_id: str,
+                settings_path: Path | None, user: dict) -> dict:
+    """删除冗余/测试扫描批次（含权限校验、运行中保护、目录清理与 state 基线回退）。"""
+    run_file = _resolve_run_file(output_dir, date_str, run_id)
+    data = _read_json(run_file)
+    if not isinstance(data, dict):
+        return {"not_found": True, "error": "未找到该批次运行记录"}
+
+    is_admin = user.get("role") in ("superadmin", "admin")
+    triggered_by = str(data.get("triggered_by") or "").strip()
+    if not is_admin:
+        uname = str(user.get("username") or "").strip().lower()
+        if not triggered_by or triggered_by.lower() != uname:
+            return {"forbidden": True, "error": "普通用户仅可删除自己触发的扫描批次"}
+
+    if data.get("status") == "running":
+        return {"conflict": True, "error": "该批次正在运行中，请先中止或标记为已中断后再删除"}
+
+    settings = (_read_json(settings_path) if settings_path else None) or {}
+    workdir = _resolve_workdir(output_dir, settings if isinstance(settings, dict) else {})
+    pending = [str(p) for p in (data.get("pending_projects") or [])]
+    active_pids = [pid for pid in pending if _is_project_actively_scanning(workdir, pid)[0]]
+    if active_pids:
+        return {"conflict": True, "error": f"检测到项目 {', '.join(active_pids[:3])} 仍持有扫描锁，无法删除"}
+
+    deleted_pids = {str(p.get("project_id") or "") for p in (data.get("projects") or []) if p.get("project_id")}
+    results_root = (output_dir / "results").resolve()
+    reports_root = (output_dir / "reports").resolve()
+    res_dir = run_file.parent.resolve()
+    rep_dir = _resolve_report_dir(output_dir, date_str, run_id).resolve()
+
+    if not res_dir.is_relative_to(results_root) or not rep_dir.is_relative_to(reports_root):
+        return {"conflict": True, "error": "批次目录路径越界，已拒绝删除"}
+
+    if run_id == "default":
+        for f in (run_file, res_dir / "summary.events.jsonl"):
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for rf in res_dir.glob("*.rejected.md"):
+            try:
+                rf.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if rep_dir.is_dir():
+            for mf in rep_dir.glob("*.md"):
+                try:
+                    mf.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    else:
+        if res_dir.is_dir() and res_dir != results_root:
+            shutil.rmtree(res_dir, ignore_errors=True)
+        if rep_dir.is_dir() and rep_dir != reports_root:
+            shutil.rmtree(rep_dir, ignore_errors=True)
+
+    # 清理空日期目录
+    for parent in (results_root / date_str, reports_root / date_str):
+        try:
+            if parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+        except OSError:
+            pass
+
+    # 清理内存报告解析缓存
+    rep_prefix = str(rep_dir)
+    with REPORT_CACHE_LOCK:
+        stale_keys = [k for k in REPORT_CACHE if str(k[0]).startswith(rep_prefix)]
+        for k in stale_keys:
+            REPORT_CACHE.pop(k, None)
+
+    rebuilt, cleared = _rollback_states_for_deleted_run(output_dir, rep_dir, deleted_pids)
+    return {
+        "ok": True,
+        "date": date_str,
+        "run_id": run_id,
+        "triggered_by": triggered_by,
+        "rebuilt_states": rebuilt,
+        "cleared_states": cleared,
+    }
+
+
 def _start_scan_task(payload: dict, root: Path, settings_path: Path, projects_csv: Path,
-                     trigger: str = "manual", output_dir: Path | None = None) -> dict:
+                     trigger: str = "manual", output_dir: Path | None = None,
+                     triggered_by: str = "") -> dict:
     task_id = dt.datetime.now().strftime("%H%M%S") + "-" + uuid.uuid4().hex[:8]
     compose_ep = root / "docker" / "compose_entrypoint.py"
     use_compose = bool(os.environ.get("AUDIT_DATA_DIR", "").strip()) and compose_ep.is_file()
+    sub_env = dict(os.environ)
+    sub_env["AUDIT_TRIGGER"] = trigger
+    if triggered_by:
+        sub_env["AUDIT_TRIGGERED_BY"] = triggered_by
     if use_compose:
         cmd = [sys.executable, str(compose_ep)]
-        sub_env = dict(os.environ)
         sub_env["AUDIT_SETTINGS_FILE"] = str(settings_path)
         sub_env["AUDIT_PROJECTS_FILE"] = str(projects_csv)
     else:
         cmd = [sys.executable, str(RUNNER_DIR / "run_daily.py"),
                "--settings", str(settings_path), "--projects", str(projects_csv)]
-        sub_env = None
     only = payload.get("only")
     if isinstance(only, list) and only:
         safe_only = [str(x) for x in only if _is_safe_segment(str(x))]
@@ -1072,6 +1330,7 @@ def _start_scan_task(payload: dict, root: Path, settings_path: Path, projects_cs
     task = {
         "task_id": task_id,
         "trigger": trigger,
+        "triggered_by": triggered_by,
         "command": " ".join(cmd),
         "status": "running",
         "started_at": dt.datetime.now().isoformat(),
@@ -1258,16 +1517,44 @@ class AuditHandler(BaseHTTPRequestHandler):
         morsel = cookie.get(AUTH_COOKIE_NAME)
         return morsel.value if morsel else None
 
-    def _is_authenticated(self) -> bool:
+    def _current_user(self) -> dict | None:
+        db: platform_db.PlatformDB | None = self.cfg.get("db")
+        # 1. Cookie 会话优先（SQLite 持久化）
+        sid = self._session_id_from_cookie()
+        if db is not None and sid:
+            user = db.get_session_user(sid)
+            if user is not None:
+                return user
+        # 2. 兼容脚本/CI 通过 Authorization: Bearer <AUDIT_WEB_TOKEN> 调用
         expected = self.cfg.get("auth_token") or ""
-        if not expected:
-            return True
-        auth_header = (self.headers.get("Authorization") or "").strip()
-        if auth_header.startswith("Bearer "):
-            candidate = auth_header[7:].strip()
-            if candidate and hmac.compare_digest(candidate, expected):
-                return True
-        return _valid_session(self._session_id_from_cookie())
+        if expected:
+            auth_header = (self.headers.get("Authorization") or "").strip()
+            if auth_header.startswith("Bearer "):
+                candidate = auth_header[7:].strip()
+                if candidate and hmac.compare_digest(candidate, expected):
+                    return {
+                        "id": 0,
+                        "username": "api-token",
+                        "display_name": "API 令牌",
+                        "role": "superadmin",
+                        "email": "",
+                        "must_change_password": False,
+                        "email_notify": "off",
+                        "is_active": True,
+                    }
+        return None
+
+    def _is_authenticated(self) -> bool:
+        return self._current_user() is not None
+
+    def _client_ip(self) -> str:
+        return self.client_address[0] if self.client_address else "unknown"
+
+    def _require_role(self, user: dict, roles: tuple[str, ...]) -> bool:
+        if user.get("role") not in roles:
+            self._send_json(403, {"error": "当前账号无权执行此操作"})
+            return False
+        return True
 
     def _cookie_header(self, sid: str, max_age: int) -> tuple[str, str]:
         parts = [f"{AUTH_COOKIE_NAME}={sid}", "Path=/", "HttpOnly", "SameSite=Lax", f"Max-Age={max_age}"]
@@ -1331,31 +1618,66 @@ class AuditHandler(BaseHTTPRequestHandler):
         if path == "/api/health":
             return self._send_json(200, {
                 "ok": True,
-                "auth_required": bool(self.cfg.get("auth_token")),
+                "auth_required": True,
                 "has_frontend": self.cfg["dist_dir"].is_dir(),
             })
 
         if path == "/api/auth/status":
-            auth_required = bool(self.cfg.get("auth_token"))
+            cur_user = self._current_user()
             return self._send_json(200, {
-                "auth_required": auth_required,
-                "authenticated": self._is_authenticated(),
+                "auth_required": True,
+                "authenticated": cur_user is not None,
+                "user": cur_user,
             })
 
-        if path.startswith("/api/") and not self._is_authenticated():
-            return self._send_json(401, {"error": "未登录或会话已过期，请先认证"})
+        cur_user = self._current_user() if path.startswith("/api/") else None
+        if path.startswith("/api/") and cur_user is None:
+            return self._send_json(401, {"error": "未登录或会话已过期，请先登录"})
+
+        db: platform_db.PlatformDB = self.cfg["db"]
+        allowed_pids = _allowed_pids_for_user(cur_user, projects_csv) if cur_user else None
+
+        if path == "/api/me":
+            return self._send_json(200, {"user": cur_user})
+
+        if path == "/api/users":
+            assert cur_user is not None
+            qs = urllib.parse.parse_qs(parsed.query)
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            if qs.get("scope", [""])[0] == "owners":
+                users = [
+                    {"id": u["id"], "username": u["username"], "display_name": u["display_name"],
+                     "role": u["role"], "email": u["email"], "is_active": u["is_active"]}
+                    for u in db.list_users() if u["is_active"]
+                ]
+                return self._send_json(200, {"users": users})
+            return self._send_json(200, {"users": db.list_users()})
+
+        if path == "/api/audit-logs":
+            assert cur_user is not None
+            if not self._require_role(cur_user, ("superadmin",)):
+                return
+            qs = urllib.parse.parse_qs(parsed.query)
+            try:
+                limit = int(qs.get("limit", ["150"])[0])
+            except ValueError:
+                limit = 150
+            return self._send_json(200, {"logs": db.list_audit_logs(limit=limit)})
 
         if path == "/api/overview":
-            return self._send_json(200, _build_overview(output_dir, projects_csv, checklist))
+            return self._send_json(200, _build_overview(output_dir, projects_csv, checklist, user=cur_user))
 
         if path == "/api/runs":
-            return self._send_json(200, {"runs": _discover_runs(output_dir)})
+            return self._send_json(200, {"runs": _discover_runs(output_dir, allowed_pids=allowed_pids, user=cur_user)})
 
         if path.startswith("/api/runs/"):
             segs = [urllib.parse.unquote(s) for s in path[len("/api/runs/"):].split("/") if s]
             # GET /api/runs/<date>/<run_id>/<project_id>/rejected -> 查看被校验拦截的原始草稿
             if len(segs) == 4 and segs[3] == "rejected" and all(_is_safe_segment(s) for s in segs[:3]):
                 date_str, run_id, pid = segs[0], segs[1], segs[2]
+                if allowed_pids is not None and pid not in allowed_pids:
+                    return self._send_json(403, {"error": "无权查看其他负责人的项目草稿"})
                 res_dir = _resolve_run_file(output_dir, date_str, run_id).parent
                 rej_file = (res_dir / f"{pid}.rejected.md").resolve()
                 if not rej_file.is_relative_to(res_dir.resolve()) or not rej_file.is_file():
@@ -1375,10 +1697,16 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return self._send_json(404, {"error": "未找到该批次运行记录"})
             rep_dir = _resolve_report_dir(output_dir, date_str, run_id)
             res_dir = run_file.parent
-            data["has_summary"] = (rep_dir / "_summary.md").is_file()
+            data["has_summary"] = (rep_dir / "_summary.md").is_file() and allowed_pids is None
+            data["can_delete"] = _can_delete_run(cur_user, data)
+            data.setdefault("triggered_by", "")
+            data.setdefault("trigger", "")
             catalog = {p["project_id"]: p for p in _load_projects(projects_csv)}
+            visible_projects = []
             for p in data.get("projects") or []:
                 pid = str(p.get("project_id") or "")
+                if allowed_pids is not None and pid not in allowed_pids:
+                    continue
                 meta = catalog.get(pid, {})
                 if not p.get("department") and meta.get("department"):
                     p["department"] = meta["department"]
@@ -1387,6 +1715,10 @@ class AuditHandler(BaseHTTPRequestHandler):
                 if not p.get("project_name") and meta.get("project_name"):
                     p["project_name"] = meta["project_name"]
                 p["has_rejected_draft"] = bool(_is_safe_segment(pid) and (res_dir / f"{pid}.rejected.md").is_file())
+                visible_projects.append(p)
+            data["projects"] = visible_projects
+            if allowed_pids is not None:
+                data["pending_projects"] = [pid for pid in (data.get("pending_projects") or []) if pid in allowed_pids]
             return self._send_json(200, data)
 
         if path.startswith("/api/reports/"):
@@ -1394,6 +1726,8 @@ class AuditHandler(BaseHTTPRequestHandler):
             # GET /api/reports/<date>/<run_id>/<target>/docx -> 导出 Word (.docx)
             if len(segs) == 4 and segs[3] == "docx" and all(_is_safe_segment(s) for s in segs[:3]):
                 date_str, run_id, target = segs[0], segs[1], segs[2]
+                if allowed_pids is not None and (target == "_summary" or target not in allowed_pids):
+                    return self._send_json(403, {"error": "无权导出该报告"})
                 qs = urllib.parse.parse_qs(parsed.query)
                 force_refresh = qs.get("refresh", ["0"])[0] in ("1", "true", "yes")
                 rep_dir = _resolve_report_dir(output_dir, date_str, run_id)
@@ -1425,6 +1759,8 @@ class AuditHandler(BaseHTTPRequestHandler):
             if len(segs) != 3 or not all(_is_safe_segment(s) for s in segs):
                 return self._send_json(400, {"error": "无效的报告路径"})
             date_str, run_id, target = segs
+            if allowed_pids is not None and (target == "_summary" or target not in allowed_pids):
+                return self._send_json(403, {"error": "无权查看该报告"})
             rep_dir = _resolve_report_dir(output_dir, date_str, run_id)
             if target == "_summary":
                 summary_file = rep_dir / "_summary.md"
@@ -1452,6 +1788,8 @@ class AuditHandler(BaseHTTPRequestHandler):
 
         if path == "/api/projects":
             projects = _load_projects(projects_csv)
+            if allowed_pids is not None:
+                projects = [p for p in projects if p["project_id"] in allowed_pids]
             state_dir = output_dir / "state"
             for p in projects:
                 pid = p["project_id"]
@@ -1465,11 +1803,17 @@ class AuditHandler(BaseHTTPRequestHandler):
             })
 
         if path == "/api/doctor":
+            assert cur_user is not None
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
             return self._send_json(200, doctor.run_checks(
                 ROOT, output_dir=output_dir, projects_csv=projects_csv, settings_path=self.cfg["settings_path"]
             ))
 
         if path == "/api/schedule":
+            assert cur_user is not None
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
             with SCHEDULE_LOCK:
                 sched = _load_schedule(output_dir)
                 now = dt.datetime.now()
@@ -1480,19 +1824,31 @@ class AuditHandler(BaseHTTPRequestHandler):
             })
 
         if path == "/api/scans/progress":
-            return self._send_json(200, _build_live_progress(output_dir, projects_csv, self.cfg["settings_path"]))
+            return self._send_json(200, _build_live_progress(
+                output_dir, projects_csv, self.cfg["settings_path"], user=cur_user
+            ))
 
         if path == "/api/scans":
+            assert cur_user is not None
+            is_admin = cur_user.get("role") in ("superadmin", "admin")
             with SCAN_LOCK:
-                tasks = [_serialize_task(t, include_logs=False) for t in reversed(list(SCAN_TASKS.values()))]
+                tasks = [
+                    _serialize_task(t, include_logs=False)
+                    for t in reversed(list(SCAN_TASKS.values()))
+                    if is_admin or t.get("triggered_by") == cur_user.get("username")
+                ]
             return self._send_json(200, {"tasks": tasks})
 
         if path.startswith("/api/scans/"):
+            assert cur_user is not None
+            is_admin = cur_user.get("role") in ("superadmin", "admin")
             task_id = urllib.parse.unquote(path[len("/api/scans/"):])
             with SCAN_LOCK:
                 t = SCAN_TASKS.get(task_id)
                 if not t:
                     return self._send_json(404, {"error": "未找到任务"})
+                if not is_admin and t.get("triggered_by") != cur_user.get("username"):
+                    return self._send_json(403, {"error": "无权查看其他用户触发的扫描日志"})
                 snap = _serialize_task(t, include_logs=True)
             return self._send_json(200, snap)
 
@@ -1522,50 +1878,244 @@ class AuditHandler(BaseHTTPRequestHandler):
     def _handle_post(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        db: platform_db.PlatformDB = self.cfg["db"]
+        client_ip = self._client_ip()
 
         if path == "/api/auth/login":
-            expected = self.cfg.get("auth_token") or ""
-            if not expected:
-                return self._send_json(200, {"authenticated": True, "auth_required": False})
-            client_ip = (self.client_address[0] if self.client_address else "unknown")
             if _login_rate_limited(client_ip):
                 return self._send_json(429, {"error": "认证失败次数过多，请 5 分钟后再试"})
             payload = self._read_json_body()
             if payload is None:
                 return self._send_json(400, {"error": "无效的 JSON 请求体"})
-            candidate = str(payload.get("token") or "").strip()
-            if not candidate or not hmac.compare_digest(candidate, expected):
+            username = str(payload.get("username") or "").strip()
+            password = str(payload.get("password") or "")
+            user = db.authenticate(username, password)
+            if not user:
                 _record_login_failure(client_ip)
-                return self._send_json(401, {"error": "访问令牌不正确"})
+                return self._send_json(401, {"error": "用户名或密码不正确，或账号已停用"})
             _clear_login_failures(client_ip)
-            sid = _issue_session()
+            sid = db.create_session(user["id"], ttl_sec=SESSION_TTL_SEC)
+            db.record_audit(user, "login", target=user["username"], client_ip=client_ip)
             return self._send_json(
                 200,
-                {"authenticated": True, "auth_required": True},
+                {"authenticated": True, "auth_required": True, "user": user},
                 extra_headers=[self._cookie_header(sid, SESSION_TTL_SEC)],
             )
 
         if path == "/api/auth/logout":
-            _revoke_session(self._session_id_from_cookie())
+            sid = self._session_id_from_cookie()
+            cur_user = self._current_user()
+            db.revoke_session(sid)
+            if cur_user:
+                db.record_audit(cur_user, "logout", target=cur_user["username"], client_ip=client_ip)
             return self._send_json(
                 200,
                 {"authenticated": False},
                 extra_headers=[self._cookie_header("", 0)],
             )
 
-        if path.startswith("/api/") and not self._is_authenticated():
-            return self._send_json(401, {"error": "未登录或会话已过期，请先认证"})
+        cur_user = self._current_user() if path.startswith("/api/") else None
+        if path.startswith("/api/") and cur_user is None:
+            return self._send_json(401, {"error": "未登录或会话已过期，请先登录"})
+        assert cur_user is not None
+
+        # 个人资料与改密（所有已登录真实账号可用）
+        if path == "/api/me/profile":
+            if cur_user["id"] == 0:
+                return self._send_json(400, {"error": "API 令牌不支持修改个人资料"})
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            try:
+                can_edit_name = cur_user.get("role") != "user"
+                updated = db.update_user(
+                    cur_user["id"],
+                    display_name=payload.get("display_name") if (can_edit_name and "display_name" in payload) else None,
+                    email=payload.get("email") if "email" in payload else None,
+                    email_notify=payload.get("email_notify") if "email_notify" in payload else None,
+                )
+            except (ValueError, KeyError) as exc:
+                return self._send_json(400, {"error": str(exc)})
+            db.record_audit(cur_user, "update_profile", target=cur_user["username"],
+                            detail={"email": updated["email"], "email_notify": updated["email_notify"]},
+                            client_ip=client_ip)
+            return self._send_json(200, {"user": updated})
+
+        if path == "/api/me/password":
+            if cur_user["id"] == 0:
+                return self._send_json(400, {"error": "API 令牌不支持修改密码"})
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            try:
+                db.change_password(
+                    cur_user["id"],
+                    str(payload.get("new_password") or ""),
+                    old_password=str(payload.get("old_password") or ""),
+                    must_change_password=False,
+                )
+            except (ValueError, KeyError) as exc:
+                return self._send_json(400, {"error": str(exc)})
+            db.record_audit(cur_user, "change_password", target=cur_user["username"], client_ip=client_ip)
+            return self._send_json(200, {"ok": True, "user": db.get_user(cur_user["id"])})
+
+        # 用户管理（superadmin 管理全部角色；admin 仅可管理普通用户 user，禁止创建/修改/删除管理员或超管）
+        if path == "/api/users":
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            req_role = str(payload.get("role") or "user")
+            if cur_user.get("role") == "admin" and req_role != "user":
+                return self._send_json(403, {"error": "管理员仅可创建普通用户（负责人）账号"})
+            try:
+                created = db.create_user(
+                    username=str(payload.get("username") or ""),
+                    display_name=str(payload.get("display_name") or ""),
+                    role=req_role,
+                    password=str(payload.get("password") or ""),
+                    email=str(payload.get("email") or ""),
+                    must_change_password=bool(payload.get("must_change_password", True)),
+                    email_notify=str(payload.get("email_notify") or "batch"),
+                )
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            db.record_audit(cur_user, "create_user", target=created["username"],
+                            detail={"role": created["role"], "email": created["email"]}, client_ip=client_ip)
+            return self._send_json(201, {"user": created})
+
+        if path == "/api/users/preview-from-projects":
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            payload = self._read_json_body() or {}
+            domain = str(payload.get("email_domain") or "shineyue.com").strip()
+            owners = [p.get("owner", "") for p in _load_projects(self.cfg["projects_csv"])]
+            items = db.preview_users_from_owners(owners, email_domain=domain)
+            return self._send_json(200, {"items": items, "email_domain": domain})
+
+        if path == "/api/users/batch-create":
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            items = payload.get("items") or []
+            default_password = str(payload.get("default_password") or "")
+            if not isinstance(items, list) or not items:
+                return self._send_json(400, {"error": "请至少选择一位要生成的负责人"})
+            if len(default_password) < 6:
+                return self._send_json(400, {"error": "初始密码长度不能少于 6 位"})
+            if cur_user.get("role") == "admin":
+                if any(isinstance(it, dict) and str(it.get("role") or "user") != "user" for it in items):
+                    return self._send_json(403, {"error": "管理员仅可批量创建普通用户（负责人）账号"})
+            created_list, skipped_list = [], []
+            for entry in items:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    u = db.create_user(
+                        username=str(entry.get("username") or ""),
+                        display_name=str(entry.get("display_name") or ""),
+                        role=str(entry.get("role") or "user"),
+                        password=default_password,
+                        email=str(entry.get("email") or ""),
+                        must_change_password=True,
+                    )
+                    created_list.append(u)
+                except ValueError as exc:
+                    skipped_list.append({"username": entry.get("username"), "display_name": entry.get("display_name"), "reason": str(exc)})
+            db.record_audit(cur_user, "batch_create_users", target=f"{len(created_list)} users",
+                            detail={"created": [u["username"] for u in created_list], "skipped": len(skipped_list)},
+                            client_ip=client_ip)
+            return self._send_json(200, {"created": created_list, "skipped": skipped_list})
+
+        if path.startswith("/api/users/"):
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            segs = [urllib.parse.unquote(s) for s in path[len("/api/users/"):].split("/") if s]
+            if len(segs) != 2 or not segs[0].isdigit():
+                return self._send_json(400, {"error": "无效的用户操作路径"})
+            target_uid = int(segs[0])
+            action = segs[1]
+            payload = self._read_json_body() or {}
+            target_u = db.get_user(target_uid)
+            if not target_u:
+                return self._send_json(404, {"error": "用户不存在"})
+            if cur_user.get("role") == "admin":
+                if target_u.get("role") != "user":
+                    return self._send_json(403, {"error": "管理员无权操作超级管理员或其他管理员账号"})
+                if action == "update" and "role" in payload and payload.get("role") != "user":
+                    return self._send_json(403, {"error": "管理员无权将普通用户提权为管理员或超级管理员"})
+            try:
+                if action == "update":
+                    updated = db.update_user(
+                        target_uid,
+                        display_name=payload.get("display_name") if "display_name" in payload else None,
+                        role=payload.get("role") if "role" in payload else None,
+                        email=payload.get("email") if "email" in payload else None,
+                        is_active=payload.get("is_active") if "is_active" in payload else None,
+                        email_notify=payload.get("email_notify") if "email_notify" in payload else None,
+                    )
+                    db.record_audit(cur_user, "update_user", target=updated["username"],
+                                    detail={"role": updated["role"], "is_active": updated["is_active"], "email": updated["email"]},
+                                    client_ip=client_ip)
+                    return self._send_json(200, {"user": updated})
+                if action == "reset-password":
+                    db.change_password(
+                        target_uid,
+                        str(payload.get("new_password") or ""),
+                        must_change_password=bool(payload.get("must_change_password", True)),
+                    )
+                    db.revoke_user_sessions(target_uid)
+                    db.record_audit(cur_user, "reset_password", target=target_u["username"], client_ip=client_ip)
+                    return self._send_json(200, {"ok": True})
+                if action == "delete":
+                    db.delete_user(target_uid, actor_id=cur_user["id"])
+                    db.record_audit(cur_user, "delete_user", target=target_u["username"],
+                                    client_ip=client_ip)
+                    return self._send_json(200, {"ok": True})
+            except KeyError as exc:
+                return self._send_json(404, {"error": str(exc)})
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            return self._send_json(404, {"error": "未知的用户操作"})
 
         if path == "/api/schedule":
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
             payload = self._read_json_body()
             if payload is None:
                 return self._send_json(400, {"error": "无效的 JSON 请求体"})
             res = _update_schedule(self.cfg["output_dir"], payload)
             if res.get("bad_request"):
                 return self._send_json(400, {"error": res["error"]})
+            db.record_audit(cur_user, "update_schedule", target="schedule.json",
+                            detail={"enabled": payload.get("enabled"), "time": payload.get("time")}, client_ip=client_ip)
+            return self._send_json(200, res)
+
+        if path.startswith("/api/runs/") and path.endswith("/delete"):
+            inner = path[len("/api/runs/"):-len("/delete")]
+            segs = [urllib.parse.unquote(s) for s in inner.split("/") if s]
+            if len(segs) != 2 or not all(_is_safe_segment(s) for s in segs):
+                return self._send_json(400, {"error": "无效的批次路径"})
+            res = _delete_run(self.cfg["output_dir"], segs[0], segs[1], self.cfg["settings_path"], cur_user)
+            if res.get("not_found"):
+                return self._send_json(404, {"error": res["error"]})
+            if res.get("forbidden"):
+                return self._send_json(403, {"error": res["error"]})
+            if res.get("conflict"):
+                return self._send_json(409, {"error": res["error"]})
+            db.record_audit(cur_user, "delete_run", target=f"{segs[0]}/{segs[1]}",
+                            detail={"triggered_by": res.get("triggered_by"),
+                                    "rebuilt_states": res.get("rebuilt_states"),
+                                    "cleared_states": res.get("cleared_states")},
+                            client_ip=client_ip)
             return self._send_json(200, res)
 
         if path.startswith("/api/runs/") and path.endswith("/mark-aborted"):
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
             inner = path[len("/api/runs/"):-len("/mark-aborted")]
             segs = [urllib.parse.unquote(s) for s in inner.split("/") if s]
             if len(segs) != 2 or not all(_is_safe_segment(s) for s in segs):
@@ -1575,9 +2125,12 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return self._send_json(404, {"error": res["error"]})
             if res.get("conflict"):
                 return self._send_json(409, {"error": res["error"]})
+            db.record_audit(cur_user, "mark_run_aborted", target=f"{segs[0]}/{segs[1]}", client_ip=client_ip)
             return self._send_json(200, res)
 
         if path.startswith("/api/runs/") and path.endswith("/summary"):
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
             inner = path[len("/api/runs/"):-len("/summary")]
             segs = [urllib.parse.unquote(s) for s in inner.split("/") if s]
             if len(segs) != 2 or not all(_is_safe_segment(s) for s in segs):
@@ -1587,15 +2140,22 @@ class AuditHandler(BaseHTTPRequestHandler):
             )
             if res.get("not_found"):
                 return self._send_json(404, {"error": res["error"]})
+            db.record_audit(cur_user, "generate_summary", target=f"{segs[0]}/{segs[1]}", client_ip=client_ip)
             return self._send_json(200, res)
 
         if path.startswith("/api/scans/") and path.endswith("/cancel"):
             task_id = urllib.parse.unquote(path[len("/api/scans/"):-len("/cancel")])
+            if cur_user.get("role") == "user":
+                with SCAN_LOCK:
+                    t = SCAN_TASKS.get(task_id)
+                    if not t or t.get("triggered_by") != cur_user.get("username"):
+                        return self._send_json(403, {"error": "无权中止其他用户触发的扫描任务"})
             res = _cancel_scan_task(task_id)
             if res.get("not_found"):
                 return self._send_json(404, {"error": res["error"]})
             if res.get("conflict"):
                 return self._send_json(409, {"error": res["error"]})
+            db.record_audit(cur_user, "cancel_scan", target=task_id, client_ip=client_ip)
             return self._send_json(200, res)
 
         if path != "/api/scans":
@@ -1604,14 +2164,30 @@ class AuditHandler(BaseHTTPRequestHandler):
         if payload is None:
             return self._send_json(400, {"error": "无效的 JSON 请求体"})
 
+        # 普通用户仅允许触发自己负责的项目，禁止全量触发与全局汇总
+        if cur_user.get("role") == "user":
+            if payload.get("summary_only"):
+                return self._send_json(403, {"error": "普通用户无权生成全局汇总报告"})
+            only = payload.get("only")
+            if not isinstance(only, list) or not only:
+                return self._send_json(403, {"error": "普通用户必须勾选指定自己负责的项目进行扫描"})
+            allowed = _allowed_pids_for_user(cur_user, self.cfg["projects_csv"]) or set()
+            forbidden = [str(pid) for pid in only if str(pid) not in allowed]
+            if forbidden:
+                return self._send_json(403, {"error": f"无权扫描非本人负责的项目：{', '.join(forbidden[:5])}"})
+
         res = _start_scan_task(
             payload, ROOT, self.cfg["settings_path"], self.cfg["projects_csv"],
             output_dir=self.cfg["output_dir"],
+            triggered_by=cur_user.get("username", ""),
         )
         if res.get("bad_request"):
             return self._send_json(400, {"error": res["error"]})
         if res.get("conflict"):
             return self._send_json(409, {"error": res["error"]})
+        db.record_audit(cur_user, "start_scan", target=res.get("task_id", ""),
+                        detail={"only_count": len(payload.get("only") or []), "fast": payload.get("fast")},
+                        client_ip=client_ip)
         return self._send_json(202, res)
 
 
@@ -1640,6 +2216,22 @@ def main() -> int:
     checklist = scoring.load_checklist()
     dist_dir = (ROOT / "frontend" / "dist").resolve()
     auth_token = (args.token if args.token is not None else os.environ.get("AUDIT_WEB_TOKEN", "")).strip()
+    db = platform_db.PlatformDB(output_dir / "state" / "platform.db")
+    init_admin = db.ensure_initial_superadmin(legacy_token=auth_token)
+    if init_admin:
+        init_user, init_pass = init_admin
+        if auth_token and not os.environ.get("AUDIT_INIT_ADMIN_PASS"):
+            print(
+                f"[web_server] 首次初始化超级管理员：用户名={init_user}，初始密码沿用 AUDIT_WEB_TOKEN（请登录后及时修改密码）",
+                flush=True,
+            )
+        elif os.environ.get("AUDIT_INIT_ADMIN_PASS"):
+            print(f"[web_server] 首次初始化超级管理员：用户名={init_user}（密码来自 AUDIT_INIT_ADMIN_PASS）", flush=True)
+        else:
+            print(
+                f"[web_server] 首次初始化超级管理员：用户名={init_user}，初始密码={init_pass}（请登录后立即修改密码）",
+                flush=True,
+            )
 
     server = ThreadingHTTPServer((args.host, args.port), AuditHandler)
     server.cfg = {  # type: ignore[attr-defined]
@@ -1650,6 +2242,7 @@ def main() -> int:
         "checklist": checklist,
         "dist_dir": dist_dir,
         "auth_token": auth_token,
+        "db": db,
     }
     _hydrate_persisted_tasks(output_dir)
     stop_event = threading.Event()
@@ -1662,7 +2255,7 @@ def main() -> int:
                 print(f"[web_server] scheduler tick error: {exc}", file=sys.stderr, flush=True)
 
     threading.Thread(target=scheduler_worker, daemon=True, name="audit-scheduler").start()
-    auth_mode = "token-enabled" if auth_token else "open (no AUDIT_WEB_TOKEN)"
+    auth_mode = "rbac+api-token" if auth_token else "rbac"
     print(f"[web_server] Listening on http://{args.host}:{args.port} (output_dir={output_dir}, auth={auth_mode})", flush=True)
     try:
         server.serve_forever()

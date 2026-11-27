@@ -1,13 +1,17 @@
 import type {
+  AuditLogEntry,
+  AuthUser,
   CatalogProject,
   DoctorReport,
   LiveProgressResponse,
   OverviewResponse,
+  OwnerPreviewItem,
   ReportResponse,
   RunDetailResponse,
   RunSummary,
   ScanTask,
   ScheduleResponse,
+  UserRole,
 } from "./types";
 
 let unauthorizedHandler: (() => void) | null = null;
@@ -36,14 +40,84 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<{ ok: boolean; auth_required: boolean; has_frontend: boolean }>("/api/health"),
-  authStatus: () => request<{ auth_required: boolean; authenticated: boolean }>("/api/auth/status"),
-  login: (token: string) =>
-    request<{ authenticated: boolean; auth_required: boolean }>("/api/auth/login", {
+  authStatus: () =>
+    request<{ auth_required: boolean; authenticated: boolean; user?: AuthUser | null }>("/api/auth/status"),
+  login: (username: string, password: string) =>
+    request<{ authenticated: boolean; auth_required: boolean; user: AuthUser }>("/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify({ username, password }),
     }),
   logout: () => request<{ authenticated: boolean }>("/api/auth/logout", { method: "POST" }),
+  me: () => request<{ user: AuthUser }>("/api/me"),
+  updateProfile: (payload: { display_name?: string; email?: string; email_notify?: "batch" | "risk_only" | "off" }) =>
+    request<{ user: AuthUser }>("/api/me/profile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  changePassword: (old_password: string, new_password: string) =>
+    request<{ ok: boolean; user: AuthUser }>("/api/me/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ old_password, new_password }),
+    }),
+  users: () => request<{ users: AuthUser[] }>("/api/users"),
+  createUser: (payload: {
+    username: string;
+    display_name: string;
+    role: UserRole;
+    password: string;
+    email: string;
+    must_change_password?: boolean;
+  }) =>
+    request<{ user: AuthUser }>("/api/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  updateUser: (
+    userId: number,
+    payload: {
+      display_name?: string;
+      role?: UserRole;
+      email?: string;
+      is_active?: boolean;
+      email_notify?: "batch" | "risk_only" | "off";
+    }
+  ) =>
+    request<{ user: AuthUser }>(`/api/users/${userId}/update`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  resetUserPassword: (userId: number, new_password: string, must_change_password = true) =>
+    request<{ ok: boolean }>(`/api/users/${userId}/reset-password`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ new_password, must_change_password }),
+    }),
+  deleteUser: (userId: number) =>
+    request<{ ok: boolean }>(`/api/users/${userId}/delete`, { method: "POST" }),
+  previewUsersFromProjects: (email_domain = "shineyue.com") =>
+    request<{ items: OwnerPreviewItem[]; email_domain: string }>("/api/users/preview-from-projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email_domain }),
+    }),
+  batchCreateUsers: (
+    items: Array<{ username: string; display_name: string; email: string; role: UserRole }>,
+    default_password: string
+  ) =>
+    request<{ created: AuthUser[]; skipped: Array<{ username?: string; display_name?: string; reason: string }> }>(
+      "/api/users/batch-create",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items, default_password }),
+      }
+    ),
+  auditLogs: (limit = 150) => request<{ logs: AuditLogEntry[] }>(`/api/audit-logs?limit=${limit}`),
   overview: () => request<OverviewResponse>("/api/overview"),
   runs: () => request<{ runs: RunSummary[] }>("/api/runs"),
   runDetail: (date: string, runId: string) =>
@@ -51,6 +125,11 @@ export const api = {
   markRunAborted: (date: string, runId: string) =>
     request<{ ok: boolean; status: string }>(
       `/api/runs/${encodeURIComponent(date)}/${encodeURIComponent(runId)}/mark-aborted`,
+      { method: "POST" }
+    ),
+  deleteRun: (date: string, runId: string) =>
+    request<{ ok: boolean; date: string; run_id: string; rebuilt_states: string[]; cleared_states: string[] }>(
+      `/api/runs/${encodeURIComponent(date)}/${encodeURIComponent(runId)}/delete`,
       { method: "POST" }
     ),
   generateSummary: (date: string, runId: string) =>
