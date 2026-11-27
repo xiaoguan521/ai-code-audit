@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, ChevronDown, ChevronRight, RefreshCw, RotateCcw, Square } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight, Download, RefreshCw, RotateCcw, Square } from "lucide-react";
 import { api } from "../api";
 import { DraftModal } from "../components/DraftModal";
 import type {
@@ -223,6 +223,18 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
     }
   };
 
+  const handleDownloadSummaryWord = async (date: string, runId: string) => {
+    setActionBusy(true);
+    setError(null);
+    try {
+      await api.downloadReportDocx(date, runId, "_summary", true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "导出 Word 汇总失败");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
   const renderProgressBlock = (run: RunProgressItem, isRunning: boolean) => {
     const allItems = normalizeItems(run);
     const q = progQuery.trim().toLowerCase();
@@ -322,6 +334,17 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
             )}
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            {run.ok_count > 0 && (
+              <button
+                className="btn"
+                style={{ padding: "4px 10px", fontSize: 12 }}
+                disabled={actionBusy}
+                title="即时按当前已完成项目生成并下载 Word 汇总报告（不影响正在运行的扫描）"
+                onClick={() => void handleDownloadSummaryWord(run.date, run.run_id)}
+              >
+                <Download size={13} /> 导出 Word 汇总 (.docx)
+              </button>
+            )}
             {maybeStaleOrCli && scanningCount === 0 && (
               <button
                 className="btn btn-danger"

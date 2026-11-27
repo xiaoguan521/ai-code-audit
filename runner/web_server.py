@@ -44,8 +44,10 @@ RUNNER_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(RUNNER_DIR))
 
 import doctor  # noqa: E402
+import docx_export  # noqa: E402
 import report_validate  # noqa: E402
 import scoring  # noqa: E402
+from adapters import summary as summary_adapter  # noqa: E402
 
 SAFE_SEG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 LEVELS = ("P0", "P1", "P2", "P3")
@@ -1144,6 +1146,66 @@ def _cancel_scan_task(task_id: str) -> dict:
         return {"task_id": task_id, "status": "cancelling"}
 
 
+def _generate_batch_summary_now(output_dir: Path, date_str: str, run_id: str, projects_csv: Path) -> dict:
+    """按最新 Word 汇报模板即时生成/刷新指定批次的 _summary.md（不调用 LLM，秒级完成）。"""
+    run_file = _resolve_run_file(output_dir, date_str, run_id)
+    data = _read_json(run_file)
+    if not isinstance(data, dict):
+        return {"not_found": True, "error": "未找到该批次运行记录"}
+    rep_dir = _resolve_report_dir(output_dir, date_str, run_id)
+    catalog = {p["project_id"]: p for p in _load_projects(projects_csv)}
+    enriched: list[dict] = []
+    ok_count = 0
+    for orig in data.get("projects") or []:
+        rec = dict(orig)
+        pid = str(rec.get("project_id") or "")
+        meta = catalog.get(pid, {})
+        if not rec.get("department") and meta.get("department"):
+            rec["department"] = meta["department"]
+        if not rec.get("owner") and meta.get("owner"):
+            rec["owner"] = meta["owner"]
+        if not rec.get("project_name") and meta.get("project_name"):
+            rec["project_name"] = meta["project_name"]
+        if not rec.get("weights") and meta.get("weights"):
+            rec["weights"] = meta["weights"]
+        if rec.get("status") == "ok":
+            ok_count += 1
+            cand = Path(str(rec.get("report_path") or ""))
+            if not cand.is_file():
+                local_md = rep_dir / f"{pid}.md"
+                if local_md.is_file():
+                    rec["report_path"] = str(local_md)
+        enriched.append(rec)
+
+    res = summary_adapter.generate_batch(enriched, rep_dir, {"summary": {"enabled": False}}, run_id)
+    md_text = str(res.get("text") or "")
+    rep_dir.mkdir(parents=True, exist_ok=True)
+    summary_file = rep_dir / "_summary.md"
+    tmp_md = rep_dir / f"._summary.{uuid.uuid4().hex[:8]}.tmp"
+    tmp_md.write_text(md_text, encoding="utf-8")
+    try:
+        os.chmod(tmp_md, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp_md, summary_file)
+
+    # 若批次未在运行，顺带回写 _run.json 的 summary_status（运行中则避免与 run_daily.py 竞争写 _run.json）
+    if data.get("status") != "running":
+        data["summary_status"] = "generated"
+        data["summary_path"] = str(summary_file)
+        tmp_json = run_file.with_name(f"._run.{uuid.uuid4().hex[:8]}.tmp")
+        tmp_json.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_json, run_file)
+
+    return {
+        "ok": True,
+        "date": date_str,
+        "run_id": run_id,
+        "ok_count": ok_count,
+        "markdown": md_text,
+    }
+
+
 def _serialize_task(task: dict, include_logs: bool) -> dict:
     out = {}
     for k, v in task.items():
@@ -1233,6 +1295,19 @@ class AuditHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_binary(self, data: bytes, content_type: str, download_name: str) -> None:
+        encoded = urllib.parse.quote(download_name)
+        ascii_fallback = re.sub(r"[^A-Za-z0-9._-]+", "_", download_name).strip("_") or "report.docx"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header(
+            "Content-Disposition",
+            f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded}',
+        )
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_OPTIONS(self) -> None:
         self._send_json(204, {})
 
@@ -1316,6 +1391,37 @@ class AuditHandler(BaseHTTPRequestHandler):
 
         if path.startswith("/api/reports/"):
             segs = [urllib.parse.unquote(s) for s in path[len("/api/reports/"):].split("/") if s]
+            # GET /api/reports/<date>/<run_id>/<target>/docx -> 导出 Word (.docx)
+            if len(segs) == 4 and segs[3] == "docx" and all(_is_safe_segment(s) for s in segs[:3]):
+                date_str, run_id, target = segs[0], segs[1], segs[2]
+                qs = urllib.parse.parse_qs(parsed.query)
+                force_refresh = qs.get("refresh", ["0"])[0] in ("1", "true", "yes")
+                rep_dir = _resolve_report_dir(output_dir, date_str, run_id)
+                if target == "_summary":
+                    summary_file = rep_dir / "_summary.md"
+                    if force_refresh or not summary_file.is_file():
+                        gen = _generate_batch_summary_now(output_dir, date_str, run_id, projects_csv)
+                        if gen.get("not_found"):
+                            return self._send_json(404, {"error": gen["error"]})
+                        md_text = gen["markdown"]
+                    else:
+                        md_text = summary_file.read_text(encoding="utf-8", errors="replace")
+                    docx_bytes = docx_export.markdown_to_docx_bytes(md_text, title="代码检查分析报告汇总")
+                    return self._send_binary(
+                        docx_bytes,
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        f"代码检查分析报告汇总_{date_str}_{run_id}.docx",
+                    )
+                md_file = rep_dir / f"{target}.md"
+                if not md_file.is_file():
+                    return self._send_json(404, {"error": f"未找到项目报告 {target}.md"})
+                md_text = md_file.read_text(encoding="utf-8", errors="replace")
+                docx_bytes = docx_export.markdown_to_docx_bytes(md_text, title=target)
+                return self._send_binary(
+                    docx_bytes,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    f"{date_str}_{target}.docx",
+                )
             if len(segs) != 3 or not all(_is_safe_segment(s) for s in segs):
                 return self._send_json(400, {"error": "无效的报告路径"})
             date_str, run_id, target = segs
@@ -1469,6 +1575,18 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return self._send_json(404, {"error": res["error"]})
             if res.get("conflict"):
                 return self._send_json(409, {"error": res["error"]})
+            return self._send_json(200, res)
+
+        if path.startswith("/api/runs/") and path.endswith("/summary"):
+            inner = path[len("/api/runs/"):-len("/summary")]
+            segs = [urllib.parse.unquote(s) for s in inner.split("/") if s]
+            if len(segs) != 2 or not all(_is_safe_segment(s) for s in segs):
+                return self._send_json(400, {"error": "无效的批次路径"})
+            res = _generate_batch_summary_now(
+                self.cfg["output_dir"], segs[0], segs[1], self.cfg["projects_csv"]
+            )
+            if res.get("not_found"):
+                return self._send_json(404, {"error": res["error"]})
             return self._send_json(200, res)
 
         if path.startswith("/api/scans/") and path.endswith("/cancel"):

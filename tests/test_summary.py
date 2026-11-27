@@ -91,6 +91,25 @@ class SummaryTest(unittest.TestCase):
             self.assertIn("#### ├─ 项目：数据应用工具研发项目-张三", text)
             self.assertIn("[indicatordisplay](p1.md)", text)
 
+            # 验证零依赖 Word (.docx) 导出生成合法 OOXML 包且 17 列宽表自动启用横向 A4
+            import io
+            import xml.etree.ElementTree as ET
+            import zipfile
+            import docx_export
+            docx_bytes = docx_export.markdown_to_docx_bytes(text)
+            with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
+                names = set(zf.namelist())
+                self.assertIn("[Content_Types].xml", names)
+                self.assertIn("word/document.xml", names)
+                self.assertIn("word/styles.xml", names)
+                doc_xml = zf.read("word/document.xml")
+                styles_xml = zf.read("word/styles.xml")
+                ET.fromstring(doc_xml)
+                ET.fromstring(styles_xml)
+                self.assertIn(b'orient="landscape"', doc_xml)
+                self.assertIn("代码检查分析报告汇总".encode("utf-8"), doc_xml)
+                self.assertIn("技术研发".encode("utf-8"), doc_xml)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, FileText, RefreshCw, RotateCcw } from "lucide-react";
+import { AlertTriangle, Download, FileText, RefreshCw, RotateCcw } from "lucide-react";
 import { api } from "../api";
 import { DraftModal } from "../components/DraftModal";
 import type { RunDetailResponse, RunSummary } from "../types";
@@ -178,6 +178,37 @@ export function RunsPage({ onOpenReport, onScanStarted }: Props) {
     }
   };
 
+  const handleGenerateSummary = async () => {
+    if (!detail) return;
+    setActionBusy(true);
+    setError(null);
+    try {
+      await api.generateSummary(detail.date, detail.run_id);
+      const updated = await api.runDetail(detail.date, detail.run_id);
+      setDetail(updated);
+      onOpenReport(detail.date, detail.run_id, "_summary");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "生成汇总报告失败");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleDownloadSummaryWord = async () => {
+    if (!detail) return;
+    setActionBusy(true);
+    setError(null);
+    try {
+      await api.downloadReportDocx(detail.date, detail.run_id, "_summary", true);
+      const updated = await api.runDetail(detail.date, detail.run_id).catch(() => null);
+      if (updated) setDetail(updated);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "导出 Word 汇总失败");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
   return (
     <div className="grid-sidebar">
       <div className="card">
@@ -260,13 +291,29 @@ export function RunsPage({ onOpenReport, onScanStarted }: Props) {
                     <RotateCcw size={14} /> 重跑失败项 ({failedProjects.length})
                   </button>
                 )}
-                {detail.has_summary && (
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => onOpenReport(detail.date, detail.run_id, "_summary")}
-                  >
-                    <FileText size={14} /> 查看整体汇总 (_summary.md)
-                  </button>
+                {okCount > 0 && (
+                  <>
+                    <button
+                      className="btn"
+                      disabled={actionBusy}
+                      title="按最新 Word 汇总模板即时生成并导出 .docx 汇总报告"
+                      onClick={() => void handleDownloadSummaryWord()}
+                    >
+                      <Download size={14} /> 导出 Word 汇总 (.docx)
+                    </button>
+                    <button
+                      className="btn btn-primary"
+                      disabled={actionBusy}
+                      onClick={() =>
+                        detail.has_summary
+                          ? onOpenReport(detail.date, detail.run_id, "_summary")
+                          : void handleGenerateSummary()
+                      }
+                    >
+                      <FileText size={14} />{" "}
+                      {detail.has_summary ? "查看整体汇总 (_summary.md)" : "生成汇总报告"}
+                    </button>
+                  </>
                 )}
               </div>
             </div>

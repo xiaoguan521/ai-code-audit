@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Check, ChevronLeft, ChevronRight, Download, Link2, Printer } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, Download, FileText, Link2, Printer, RefreshCw } from "lucide-react";
 import { api } from "../api";
 import type { ReportResponse, RunDetailResponse, RunSummary } from "../types";
 import {
@@ -30,6 +30,7 @@ export function ReportsPage({ initialTarget, onTargetChange }: Props) {
   const [report, setReport] = useState<ReportResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
 
   const [levelFilter, setLevelFilter] = useState("");
   const [issueQuery, setIssueQuery] = useState("");
@@ -123,6 +124,34 @@ export function ReportsPage({ initialTarget, onTargetChange }: Props) {
     downloadMarkdown(`${date}_${target === "_summary" ? "summary" : target}`, report.markdown);
   };
 
+  const handleGenerateSummary = async () => {
+    if (!date || !runId) return;
+    setExportBusy(true);
+    setError(null);
+    try {
+      const res = await api.generateSummary(date, runId);
+      setTarget("_summary");
+      setReport({ type: "summary", date, run_id: runId, markdown: res.markdown });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "生成汇总报告失败");
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
+  const handleDownloadDocx = async (refresh = false) => {
+    if (!date || !runId || !target) return;
+    setExportBusy(true);
+    setError(null);
+    try {
+      await api.downloadReportDocx(date, runId, target, refresh);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "导出 Word 失败");
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
   const handleExportPdf = () => {
     if (!report?.markdown) return;
     const base = `${date}_${target === "_summary" ? "summary" : target}`;
@@ -214,8 +243,27 @@ export function ReportsPage({ initialTarget, onTargetChange }: Props) {
             {copied ? <Check size={14} /> : <Link2 size={14} />} {copied ? "已复制" : "复制链接"}
           </button>
 
+          {target === "_summary" && date && runId && (
+            <button
+              className="btn btn-primary"
+              disabled={exportBusy}
+              title="按 Word 汇总模板即时生成/刷新当前批次汇总报告"
+              onClick={() => void handleGenerateSummary()}
+            >
+              <RefreshCw size={14} /> {exportBusy ? "生成中…" : report ? "刷新汇总" : "生成汇总报告"}
+            </button>
+          )}
+
           {report && (
             <>
+              <button
+                className="btn"
+                disabled={exportBusy}
+                onClick={() => void handleDownloadDocx(false)}
+                title="导出为 Word (.docx) 文档"
+              >
+                <FileText size={14} /> 下载 Word (.docx)
+              </button>
               <button className="btn" onClick={handleDownloadMd}>
                 <Download size={14} /> 下载 Markdown
               </button>

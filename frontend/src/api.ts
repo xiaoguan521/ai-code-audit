@@ -53,6 +53,38 @@ export const api = {
       `/api/runs/${encodeURIComponent(date)}/${encodeURIComponent(runId)}/mark-aborted`,
       { method: "POST" }
     ),
+  generateSummary: (date: string, runId: string) =>
+    request<{ ok: boolean; date: string; run_id: string; ok_count: number; markdown: string }>(
+      `/api/runs/${encodeURIComponent(date)}/${encodeURIComponent(runId)}/summary`,
+      { method: "POST" }
+    ),
+  downloadReportDocx: async (date: string, runId: string, target: string, refresh = false) => {
+    const qs = refresh ? "?refresh=1" : "";
+    const url = `/api/reports/${encodeURIComponent(date)}/${encodeURIComponent(runId)}/${encodeURIComponent(target)}/docx${qs}`;
+    const res = await fetch(url, { credentials: "same-origin" });
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try {
+        const err = await res.json();
+        if (err?.error) msg = err.error;
+      } catch {
+        // ignore
+      }
+      if (res.status === 401 && unauthorizedHandler) unauthorizedHandler();
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const fname =
+      target === "_summary" ? `代码检查分析报告汇总_${date}_${runId}.docx` : `${date}_${target}.docx`;
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objUrl;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
+  },
   rejectedDraft: (date: string, runId: string, projectId: string) =>
     request<{ date: string; run_id: string; project_id: string; markdown: string }>(
       `/api/runs/${encodeURIComponent(date)}/${encodeURIComponent(runId)}/${encodeURIComponent(projectId)}/rejected`
