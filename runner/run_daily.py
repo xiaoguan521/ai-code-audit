@@ -42,6 +42,7 @@ import mailer  # noqa: E402
 import platform_db  # noqa: E402
 import report_validate  # noqa: E402
 import scoring  # noqa: E402
+import vcs  # noqa: E402
 from adapters import harness as harness_adapter  # noqa: E402
 from adapters import summary as summary_adapter  # noqa: E402
 
@@ -214,9 +215,66 @@ def _snapshot_commit(repo: Path, branch: str, ref: str, snapshot_at: dt.datetime
     raise RuntimeError(f"分支 {branch} 在 {snapshot_text(snapshot_at)} 之前没有可用提交")
 
 
+def _project_vcs_and_branch(p: dict) -> tuple[str, str]:
+    vtype = vcs.detect_vcs_type(str(p.get("git_url") or ""), str(p.get("vcs_type") or "") or None)
+    raw_branch = str(p.get("branch") or "").strip()
+    if vtype == "svn":
+        return vtype, raw_branch
+    return vtype, raw_branch or "main"
+
+
+def _sync_svn_repo(p: dict, repo: Path, snapshot_at: dt.datetime | None = None) -> str:
+    """维护只读 SVN 扫描副本，并按批次时间点或 HEAD 固定修订号（返回 r<rev>）。"""
+    target_url = vcs.compose_svn_url(
+        vcs.validate_repo_url(str(p.get("git_url") or ""), "svn"),
+        str(p.get("branch") or ""),
+    )
+    if (repo / ".git").exists():
+        shutil.rmtree(repo)
+    if vcs.is_svn_working_copy(repo):
+        cur_url = (vcs.svn_working_copy_info(repo).get("url") or "").rstrip("/")
+        if cur_url and cur_url != target_url.rstrip("/"):
+            shutil.rmtree(repo)
+
+    cmd_prefix, secret = vcs.svn_base_cmd(target_url)
+    rev_args: list[str] = []
+    if snapshot_at is not None:
+        iso_utc = snapshot_at.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rev_args = ["-r", f"{{{iso_utc}}}"]
+
+    if not vcs.is_svn_working_copy(repo):
+        repo.parent.mkdir(parents=True, exist_ok=True)
+        r = run([*cmd_prefix, "checkout", "--force", *rev_args, target_url, str(repo)], timeout=1800)
+        if r.returncode:
+            raise RuntimeError(f"svn checkout 失败: {vcs.redact_secret(r.stderr.strip()[-500:], secret)}")
+    else:
+        run(["svn", "cleanup"], cwd=repo, timeout=300)
+        r_rev = run(["svn", "revert", "-q", "-R", "."], cwd=repo, timeout=300)
+        if r_rev.returncode:
+            raise RuntimeError(f"svn revert 失败: {vcs.redact_secret(r_rev.stderr.strip()[-500:], secret)}")
+        r_upd = run([*cmd_prefix, "update", "--accept", "theirs-full", *rev_args], cwd=repo, timeout=1800)
+        if r_upd.returncode:
+            raise RuntimeError(f"svn update 失败: {vcs.redact_secret(r_upd.stderr.strip()[-500:], secret)}")
+        run(["svn", "cleanup", "--remove-unversioned", "--remove-ignored"], cwd=repo, timeout=300)
+
+    info = vcs.svn_working_copy_info(repo)
+    rev = info.get("revision") or ""
+    if not rev:
+        r_info = run(["svn", "info", "--show-item", "revision"], cwd=repo)
+        if r_info.returncode == 0 and r_info.stdout.strip().isdigit():
+            rev = f"r{r_info.stdout.strip()}"
+    if not rev:
+        raise RuntimeError("svn info 获取修订号失败")
+    return rev
+
+
 def sync_repo(p: dict, repo: Path, depth: int, snapshot_at: dt.datetime | None = None) -> str:
     """维护扫描副本并固定到统一时间点的分支提交；只拉取，不推送。"""
-    branch = p.get("branch") or "main"
+    vtype, branch = _project_vcs_and_branch(p)
+    if vtype == "svn":
+        return _sync_svn_repo(p, repo, snapshot_at)
+    if vcs.is_svn_working_copy(repo):
+        shutil.rmtree(repo)
     env = git_env()
     created = False
     if not (repo / ".git").exists():
@@ -251,6 +309,36 @@ def sync_repo(p: dict, repo: Path, depth: int, snapshot_at: dt.datetime | None =
 
 
 def changed_files(repo: Path, old: str, new: str) -> list[str] | None:
+    if vcs.is_svn_working_copy(repo):
+        import xml.etree.ElementTree as ET
+        old_rev = vcs.parse_svn_revision(old)
+        new_rev = vcs.parse_svn_revision(new)
+        if old_rev is None or new_rev is None:
+            return None
+        if old_rev == new_rev:
+            return []
+        wc_url = (vcs.svn_working_copy_info(repo).get("url") or "").rstrip("/")
+        if not wc_url:
+            return None
+        cmd_prefix, _ = vcs.svn_base_cmd(wc_url)
+        r = run([*cmd_prefix, "diff", "--summarize", "--xml", "-r", f"{old_rev}:{new_rev}", wc_url], cwd=repo, timeout=300)
+        if r.returncode or not r.stdout.strip():
+            return None
+        try:
+            root_xml = ET.fromstring(r.stdout)
+        except ET.ParseError:
+            return None
+        prefix = wc_url + "/"
+        changed: list[str] = []
+        for el in root_xml.findall(".//path"):
+            if el.attrib.get("kind") == "dir":
+                continue
+            full_u = (el.text or "").strip()
+            if full_u.startswith(prefix):
+                rel = full_u[len(prefix):].lstrip("/")
+                if rel:
+                    changed.append(rel)
+        return sorted(set(changed))
     r = run(["git", "diff", "--name-only", "-z", f"{old}..{new}"], cwd=repo)
     if r.returncode:
         return None  # 浅克隆找不到旧提交 → 退回全量
@@ -532,8 +620,9 @@ def prescan(repo: Path, out: Path, tools: list[str], settings: dict,
         target = out / filename
         entry["scan_scope"] = "changed_files" if scan_files is not None else "repository"
         entry["file_count"] = len(targets) if scan_files is not None else None
+        cloc_vcs_args = ["--vcs=git"] if (repo / ".git").exists() else ["--exclude-dir=.svn,.git"]
         commands = {
-            "cloc": (["cloc", "--json", "--quiet", "--vcs=git", *targets], timeouts["cloc"]),
+            "cloc": (["cloc", "--json", "--quiet", *cloc_vcs_args, *targets], timeouts["cloc"]),
             "gitleaks": (["gitleaks", "detect", "--no-git", "--redact", "--no-banner", "--exit-code", "0",
                           "--report-format", "json", "--report-path", str(target), "--source", "."], timeouts["gitleaks"]),
             "semgrep": (["semgrep", "scan", "--config", rules or "", "--json", "--metrics=off", "--quiet",
@@ -892,7 +981,11 @@ def _try_resume_from_state(p: dict, commit: str, materials_hash: str | None, rep
         return None
     if old_state.get("report_mode", "standard") != report_mode:
         return None
-    if ((old_state.get("branch") or "main") != (p.get("branch") or "main")
+    vtype, cur_branch = _project_vcs_and_branch(p)
+    old_vtype = old_state.get("vcs_type") or vcs.detect_vcs_type(str(old_state.get("git_url") or ""))
+    old_branch = (old_state.get("branch") or "").strip() if old_vtype == "svn" else ((old_state.get("branch") or "main").strip() or "main")
+    if (old_vtype != vtype
+            or old_branch != cur_branch
             or old_state.get("git_url") != p.get("git_url")
             or old_state.get("weights") != (p.get("weights") or "")):
         return None
@@ -962,10 +1055,13 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
                     rec.setdefault("warnings", []).append(warning)
                     log(f"{pid}: 警告：{warning}")
                 else:
-                    result = run(["git", "ls-files", "-z", "--", materials_dir], cwd=repo)
-                    if result.returncode == 0:
+                    try:
+                        mat_files = vcs.list_repo_files(repo, subdir=materials_dir)
+                    except (RuntimeError, OSError, subprocess.TimeoutExpired):
+                        mat_files = None
+                    if mat_files is not None:
                         parts = []
-                        for relative in [x for x in result.stdout.split("\0") if x]:
+                        for relative in mat_files:
                             try:
                                 size = (repo / relative).stat().st_size
                             except OSError:
@@ -1033,11 +1129,15 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
                 if isinstance(old_state, dict):
                     if old_state.get("materials_hash") != materials_hash:
                         materials_changed = True
-                    if ((old_state.get("branch") or "main") != (p.get("branch") or "main")
+                    vtype, cur_branch = _project_vcs_and_branch(p)
+                    old_vtype = old_state.get("vcs_type") or vcs.detect_vcs_type(str(old_state.get("git_url") or ""))
+                    old_branch = (old_state.get("branch") or "").strip() if old_vtype == "svn" else ((old_state.get("branch") or "main").strip() or "main")
+                    if (old_vtype != vtype
+                            or old_branch != cur_branch
                             or old_state.get("git_url") != p.get("git_url")
                             or old_state.get("weights") != (p.get("weights") or "")):
                         config_changed = True
-                        log(f"{pid}: 配置变化（branch/git_url/weights），本次强制全量")
+                        log(f"{pid}: 配置变化（vcs_type/branch/git_url/weights），本次强制全量")
                     if not config_changed:
                         try:
                             old_report = Path(old_state.get("last_report", "")).resolve()
@@ -1217,9 +1317,10 @@ def scan_project(p: dict, settings: dict, run_date: str, args,
                 except (TypeError, ValueError):
                     incremental_streak = 1
                 last_full_date = old_state.get("last_full_date") if isinstance(old_state, dict) else None
+            cur_vtype, cur_branch = _project_vcs_and_branch(p)
             state = {"last_commit": commit, "last_report": str(report_path),
                      "last_scan_date": run_date, "report_mode": report_mode,
-                     "branch": p.get("branch") or "main", "git_url": p.get("git_url"),
+                     "vcs_type": cur_vtype, "branch": cur_branch, "git_url": p.get("git_url"),
                      "weights": p.get("weights") or "", "materials_hash": materials_hash,
                      "model": out.get("agent_model"),
                      "scores": rec.get("report_scores"),

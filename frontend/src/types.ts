@@ -66,9 +66,11 @@ export interface PauseState {
 
 export interface GitProbeResult {
   ok: boolean;
+  vcs_type?: "git" | "svn";
   branches: string[];
   default_branch: string;
   branch_exists: boolean;
+  revision?: string;
   error: string;
 }
 
@@ -230,6 +232,7 @@ export interface CatalogProject {
   project_name: string;
   department: string;
   owner: string;
+  vcs_type?: "git" | "svn";
   git_url: string;
   branch: string;
   status: string;
@@ -420,7 +423,7 @@ export interface OpsRuntimeConfig {
 export interface GitCredentialItem {
   id: number;
   label: string;
-  protocol: "https" | "http";
+  protocol: "https" | "http" | "svn";
   host: string;
   path_prefix: string;
   username: string;

@@ -11,6 +11,11 @@ import re
 import subprocess
 from pathlib import Path, PurePosixPath
 
+try:
+    from . import vcs
+except ImportError:
+    import vcs  # type: ignore[no-redef]
+
 
 MAX_FILE_BYTES = 2 * 1024 * 1024
 TEXT_SUFFIXES = {
@@ -36,13 +41,15 @@ PROMPT_INJECTION_RE = re.compile(
 
 
 def _tracked_files(repo: Path) -> list[str]:
+    if vcs.is_svn_working_copy(repo):
+        return vcs.list_working_copy_files(repo)
     result = subprocess.run(["git", "ls-files", "-z"], cwd=repo, capture_output=True, timeout=120)
     if result.returncode:
         # 单元测试和人工试扫可能给一个未初始化 Git 的临时目录；退化为有界文件清单，
         # 正式扫描仍优先使用 Git 跟踪清单。
         files = []
         for path in repo.rglob("*"):
-            if path.is_file() and ".git" not in path.parts:
+            if path.is_file() and ".git" not in path.parts and ".svn" not in path.parts:
                 files.append(path.relative_to(repo).as_posix())
         return sorted(files)
     return [part.decode("utf-8", "surrogateescape") for part in result.stdout.split(b"\0") if part]

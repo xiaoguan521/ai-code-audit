@@ -51,6 +51,7 @@ import mailer  # noqa: E402
 import platform_db  # noqa: E402
 import report_validate  # noqa: E402
 import scoring  # noqa: E402
+import vcs  # noqa: E402
 from adapters import summary as summary_adapter  # noqa: E402
 
 SAFE_SEG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -712,14 +713,15 @@ def _is_git_or_branch_error(raw: str | None) -> bool:
     if not s:
         return False
     return any(tok in s for tok in (
-        "clone", "branch", "git", "not found", "repository", "remote ref",
+        "clone", "branch", "git", "svn", "subversion", "not found", "repository", "remote ref",
         "authentication", "could not read", "could not resolve", "permission denied",
+        "unable to connect", "e170000", "e170013", "e215004",
         "权限", "分支", "仓库", "无法访问", "连接失败",
     ))
 
 
 def _latest_run_git_errors(output_dir: Path) -> dict[str, str]:
-    """从最近一次扫描批次中提取因 Git 地址/分支/鉴权失败的项目报错映射。"""
+    """从最近一次扫描批次中提取因 Git/SVN 地址/分支/鉴权失败的项目报错映射。"""
     runs = _discover_runs(output_dir)
     if not runs:
         return {}
@@ -737,26 +739,33 @@ def _latest_run_git_errors(output_dir: Path) -> dict[str, str]:
 
 
 def _compute_git_health(proj: dict, st: dict | None, run_git_err: str | None) -> tuple[str, str]:
-    """综合 URL 校验、主动探测结果、最近扫描报错与成功基线判定 Git 地址/分支健康度。"""
+    """综合 URL 校验、主动探测结果、最近扫描报错与成功基线判定 Git/SVN 地址与分支健康度。"""
     url = str(proj.get("git_url") or "").strip()
+    vtype = vcs.detect_vcs_type(url, str(proj.get("vcs_type") or "") or None)
     branch = str(proj.get("branch") or "").strip()
-    if not url or not branch:
-        return "error", "缺少 Git 地址或分支名"
+    if not url:
+        return "error", "缺少仓库地址"
+    if vtype != "svn" and not branch:
+        return "error", "缺少 Git 分支名"
     try:
-        platform_db.validate_git_url(url)
+        platform_db.validate_git_url(url, vcs_type=vtype)
+        if vtype == "svn" and branch:
+            vcs.compose_svn_url(url, branch)
     except ValueError as exc:
         return "error", str(exc)
-    if branch.startswith("-") or any(ch.isspace() for ch in branch) or ".." in branch:
+    if vtype != "svn" and (branch.startswith("-") or any(ch.isspace() for ch in branch) or ".." in branch):
         return "error", f"分支名格式非法：{branch}"
     chk = proj.get("git_check_ok")
     if chk is True:
         return "ok", ""
     if chk is False:
-        return "error", str(proj.get("git_check_error") or "Git 连通或分支校验失败")
+        return "error", str(proj.get("git_check_error") or "仓库连通或分支校验失败")
     if run_git_err:
         return "error", f"最近扫描报错：{run_git_err}"
     if isinstance(st, dict) and st.get("last_commit"):
-        if st.get("git_url") == url and (st.get("branch") or "main") == branch:
+        st_vtype = st.get("vcs_type") or vcs.detect_vcs_type(str(st.get("git_url") or ""))
+        st_branch = (st.get("branch") or "").strip() if st_vtype == "svn" else ((st.get("branch") or "main").strip() or "main")
+        if st_vtype == vtype and st.get("git_url") == url and st_branch == branch:
             return "ok", ""
     return "unknown", ""
 
@@ -764,7 +773,7 @@ def _compute_git_health(proj: dict, st: dict | None, run_git_err: str | None) ->
 def _probe_all_projects_git(output_dir: Path, db: platform_db.PlatformDB,
                             project_ids: list[str] | None = None,
                             only_active: bool = True) -> dict:
-    """并发批量探测项目 Git 地址与分支是否存在，并持久化健康状态。"""
+    """并发批量探测项目 Git/SVN 地址与分支是否存在，并持久化健康状态。"""
     rt_creds = _runtime_git_creds_file(output_dir)
     cred_file = rt_creds if rt_creds.is_file() else _base_git_creds_file()
     projects = db.list_projects()
@@ -779,10 +788,14 @@ def _probe_all_projects_git(output_dir: Path, db: platform_db.PlatformDB,
 
     def _one(p: dict) -> tuple[dict, bool, str]:
         pid = p["project_id"]
-        branch = str(p.get("branch") or "main").strip() or "main"
+        url = str(p.get("git_url") or "")
+        vtype = vcs.detect_vcs_type(url, str(p.get("vcs_type") or "") or None)
+        branch = str(p.get("branch") or "").strip()
+        if vtype != "svn":
+            branch = branch or "main"
         try:
             res = platform_db.probe_git_remote(
-                str(p.get("git_url") or ""), branch=branch, timeout_sec=10, credential_file=cred_file
+                url, branch=branch, timeout_sec=10, credential_file=cred_file, vcs_type=vtype
             )
         except ValueError as exc:
             db.update_project_git_check(pid, ok=False, error=str(exc))
@@ -2583,10 +2596,12 @@ class AuditHandler(BaseHTTPRequestHandler):
             try:
                 rt_creds = _runtime_git_creds_file(self.cfg["output_dir"])
                 branch_str = str(payload.get("branch") or "").strip()
+                vcs_type_str = str(payload.get("vcs_type") or "").strip()
                 res = platform_db.probe_git_remote(
                     str(payload.get("git_url") or ""),
                     branch=branch_str,
                     credential_file=rt_creds if rt_creds.is_file() else _base_git_creds_file(),
+                    vcs_type=vcs_type_str,
                 )
             except ValueError as exc:
                 return self._send_json(400, {"error": str(exc)})

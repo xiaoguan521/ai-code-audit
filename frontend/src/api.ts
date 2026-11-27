@@ -207,11 +207,16 @@ export const api = {
     request<{ ok: boolean; project_id: string }>(`/api/projects/${encodeURIComponent(projectId)}/delete`, {
       method: "POST",
     }),
-  probeGit: (git_url: string, branch = "", project_id = "") =>
+  probeGit: (git_url: string, branch = "", project_id = "", vcs_type = "") =>
     request<GitProbeResult>("/api/projects/probe-git", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ git_url, branch, ...(project_id ? { project_id } : {}) }),
+      body: JSON.stringify({
+        git_url,
+        branch,
+        ...(project_id ? { project_id } : {}),
+        ...(vcs_type ? { vcs_type } : {}),
+      }),
     }),
   probeAllProjectsGit: (only_active = true) =>
     request<{
@@ -306,7 +311,7 @@ export const api = {
     }),
   createGitCredential: (payload: {
     label?: string;
-    protocol: "https" | "http";
+    protocol: "https" | "http" | "svn";
     host: string;
     path_prefix?: string;
     username: string;
@@ -322,7 +327,7 @@ export const api = {
     id: number,
     payload: {
       label?: string;
-      protocol: "https" | "http";
+      protocol: "https" | "http" | "svn";
       host: string;
       path_prefix?: string;
       username: string;

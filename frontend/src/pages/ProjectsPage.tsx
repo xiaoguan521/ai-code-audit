@@ -26,6 +26,7 @@ const EMPTY_FORM: Partial<CatalogProject> = {
   project_name: "",
   department: "",
   owner: "",
+  vcs_type: "git",
   git_url: "",
   branch: "main",
   status: "在研",
@@ -37,6 +38,20 @@ const EMPTY_FORM: Partial<CatalogProject> = {
   weights: "",
   notes: "",
 };
+
+function looksLikeSvnUrl(raw: string): boolean {
+  const url = (raw || "").trim().toLowerCase();
+  if (url.startsWith("svn://") || url.startsWith("svn+ssh://")) return true;
+  if (url.startsWith("http://") || url.startsWith("https://")) {
+    try {
+      const u = new URL(url);
+      if (u.hostname.startsWith("svn.") || u.pathname.includes("/svn/") || u.pathname === "/svn") return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
 
 function formatLoc(n: number | null | undefined): string {
   if (n == null) return "—";
@@ -174,7 +189,7 @@ export function ProjectsPage({ currentUser }: Props) {
 
   const handleProbeGit = async () => {
     if (!form.git_url?.trim()) {
-      setError("请先填写 Git 仓库地址");
+      setError("请先填写仓库地址");
       return;
     }
     setProbing(true);
@@ -183,13 +198,14 @@ export function ProjectsPage({ currentUser }: Props) {
       const res = await api.probeGit(
         form.git_url.trim(),
         (form.branch || "").trim(),
-        modalMode === "edit" ? (form.project_id || "") : ""
+        modalMode === "edit" ? (form.project_id || "") : "",
+        form.vcs_type || "git"
       );
       setProbeRes(res);
       setBranchSearch("");
       if (res.ok && res.branches.length > 0) {
         setBranchDropdownOpen(true);
-        if (!form.branch?.trim() && res.default_branch) {
+        if (!form.branch?.trim() && res.default_branch && res.vcs_type !== "svn") {
           setForm((prev) => ({ ...prev, branch: res.default_branch }));
         }
       }
@@ -197,7 +213,7 @@ export function ProjectsPage({ currentUser }: Props) {
         void loadData();
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Git 探测失败");
+      setError(err instanceof Error ? err.message : "仓库探测失败");
     } finally {
       setProbing(false);
     }
@@ -470,7 +486,7 @@ export function ProjectsPage({ currentUser }: Props) {
               <tr>
                 <th>项目</th>
                 <th>部门 / 负责人</th>
-                <th>Git 地址与分支</th>
+                <th>仓库地址与分支</th>
                 <th>状态</th>
                 <th className="num">代码量 (LOC)</th>
                 <th>最后代码提交 / 活跃度</th>
@@ -506,8 +522,21 @@ export function ProjectsPage({ currentUser }: Props) {
                           gap: 6,
                         }}
                       >
+                        {p.vcs_type === "svn" && (
+                          <span
+                            className="chip"
+                            style={{
+                              borderColor: "var(--accent)",
+                              color: "var(--accent)",
+                              fontSize: 10.5,
+                              padding: "0 5px",
+                            }}
+                          >
+                            SVN
+                          </span>
+                        )}
                         <span className="muted" style={{ display: "inline-flex", alignItems: "center", gap: 3 }}>
-                          <GitBranch size={11} /> {p.branch || "main"}
+                          <GitBranch size={11} /> {p.vcs_type === "svn" ? (p.branch || "直接目录") : (p.branch || "main")}
                         </span>
                         {p.git_health === "error" && (
                           <span
@@ -709,21 +738,65 @@ export function ProjectsPage({ currentUser }: Props) {
               </label>
             </div>
 
-            <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
-              <span className="muted">Git 仓库地址（http/https/ssh/git@）*</span>
+            <div style={{ display: "grid", gap: 4, fontSize: 12 }}>
+              <span className="muted">
+                {form.vcs_type === "svn"
+                  ? "SVN 仓库地址（支持直接填源码目录，如 https://svn.sjgjj.cn/svn/.../4.Src）*"
+                  : "Git / SVN 仓库地址（粘贴 SVN 地址将自动识别为 SVN）*"}
+              </span>
               <div style={{ display: "flex", gap: 8 }}>
+                <select
+                  value={form.vcs_type || "git"}
+                  style={{ width: 92, flexShrink: 0 }}
+                  onChange={(e) => {
+                    const nextVcs = e.target.value as "git" | "svn";
+                    setProbeRes(null);
+                    setBranchDropdownOpen(false);
+                    setForm((prev) => ({
+                      ...prev,
+                      vcs_type: nextVcs,
+                      branch:
+                        nextVcs === "svn"
+                          ? prev.branch === "main"
+                            ? ""
+                            : prev.branch
+                          : prev.branch || "main",
+                    }));
+                  }}
+                >
+                  <option value="git">Git</option>
+                  <option value="svn">SVN</option>
+                </select>
                 <input
                   style={{ flex: 1 }}
                   value={form.git_url || ""}
-                  placeholder="https://git.example.com/group/repo.git"
-                  onChange={(e) => setForm({ ...form, git_url: e.target.value })}
+                  placeholder={
+                    form.vcs_type === "svn"
+                      ? "https://svn.sjgjj.cn/svn/CustomerProject/.../4.Src"
+                      : "https://git.example.com/group/repo.git"
+                  }
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setForm((prev) => {
+                      const autoSvn = looksLikeSvnUrl(val);
+                      if (autoSvn && prev.vcs_type !== "svn") {
+                        return {
+                          ...prev,
+                          git_url: val,
+                          vcs_type: "svn",
+                          branch: prev.branch === "main" ? "" : prev.branch,
+                        };
+                      }
+                      return { ...prev, git_url: val };
+                    });
+                  }}
                   required
                 />
                 <button type="button" className="btn" disabled={probing} onClick={() => void handleProbeGit()}>
-                  <GitBranch size={13} /> {probing ? "探测中…" : "测试连通 & 分支"}
+                  <GitBranch size={13} /> {probing ? "探测中…" : form.vcs_type === "svn" ? "测试连通" : "测试连通 & 分支"}
                 </button>
               </div>
-            </label>
+            </div>
 
             {probeRes && (
               <div
@@ -736,16 +809,28 @@ export function ProjectsPage({ currentUser }: Props) {
                 }}
               >
                 {probeRes.ok ? (
-                  <div>
-                    连通正常！检测到 <b>{probeRes.branches.length}</b> 个远端分支（默认：<code>{probeRes.default_branch || "—"}</code>）
-                    {form.branch && !probeRes.branches.includes(form.branch.trim()) ? (
-                      <span style={{ color: "var(--warning)", marginLeft: 8 }}>
-                        注意：当前所填分支「{form.branch}」不在远端分支列表中，可在下方下拉搜索选择
-                      </span>
-                    ) : form.branch ? (
-                      <span style={{ marginLeft: 8 }}>· 当前分支「{form.branch}」存在 ✓</span>
-                    ) : null}
-                  </div>
+                  probeRes.vcs_type === "svn" ? (
+                    <div>
+                      SVN 连通正常！
+                      {probeRes.revision ? <> 最新修订版 <code>{probeRes.revision}</code></> : null}
+                      {probeRes.branches.length > 0 ? (
+                        <> · 检测到 <b>{probeRes.branches.length}</b> 个标准分支子路径，可在下方下拉选择</>
+                      ) : (
+                        <> · 将直接检出该目录进行扫描</>
+                      )}
+                    </div>
+                  ) : (
+                    <div>
+                      连通正常！检测到 <b>{probeRes.branches.length}</b> 个远端分支（默认：<code>{probeRes.default_branch || "—"}</code>）
+                      {form.branch && !probeRes.branches.includes(form.branch.trim()) ? (
+                        <span style={{ color: "var(--warning)", marginLeft: 8 }}>
+                          注意：当前所填分支「{form.branch}」不在远端分支列表中，可在下方下拉搜索选择
+                        </span>
+                      ) : form.branch ? (
+                        <span style={{ marginLeft: 8 }}>· 当前分支「{form.branch}」存在 ✓</span>
+                      ) : null}
+                    </div>
+                  )
                 ) : (
                   <div>连通失败：{probeRes.error}</div>
                 )}
@@ -761,13 +846,14 @@ export function ProjectsPage({ currentUser }: Props) {
                 }}
               >
                 <span className="muted">
-                  扫描分支 *{probeRes?.ok && probeRes.branches.length > 0 ? `（支持下拉/模糊查，共 ${probeRes.branches.length} 个）` : ""}
+                  {form.vcs_type === "svn" ? "SVN 子路径（可选，留空直接检出上方目录）" : "扫描分支 *"}
+                  {probeRes?.ok && probeRes.branches.length > 0 ? `（支持下拉/模糊查，共 ${probeRes.branches.length} 个）` : ""}
                 </span>
                 <div style={{ display: "flex", position: "relative", alignItems: "center" }}>
                   <input
                     style={{ width: "100%", paddingRight: probeRes?.ok && probeRes.branches.length > 0 ? 30 : 10 }}
                     value={form.branch || ""}
-                    placeholder="输入或选择扫描分支"
+                    placeholder={form.vcs_type === "svn" ? "留空直接检出上方地址，或填 trunk / branches/xxx" : "输入或选择扫描分支"}
                     onFocus={() => {
                       if (probeRes?.ok && probeRes.branches.length > 0) setBranchDropdownOpen(true);
                     }}
@@ -779,7 +865,7 @@ export function ProjectsPage({ currentUser }: Props) {
                         setBranchDropdownOpen(true);
                       }
                     }}
-                    required
+                    required={form.vcs_type !== "svn"}
                   />
                   {probeRes?.ok && probeRes.branches.length > 0 && (
                     <button

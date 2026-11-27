@@ -17,7 +17,7 @@ COPY --from=docker-client /usr/local/bin/docker /usr/local/bin/docker
 ARG TARGETARCH
 
 RUN apk add --no-cache \
-      python3 git openssh-client ca-certificates tzdata \
+      python3 git subversion openssh-client ca-certificates tzdata \
       cloc py3-pip gcompat libstdc++ wget tar gzip \
  && python3 -m pip install --no-cache-dir --disable-pip-version-check \
       --break-system-packages \
@@ -46,7 +46,8 @@ COPY docker/git-credential-readonly.sh docker/git-credential-readonly.sh
 RUN chmod 0555 docker/git-credential-readonly.sh
 
 # Keep the image contract explicit: these commands are consumed by runner/run_daily.py.
-RUN cloc --version \
+RUN svn --version --quiet \
+ && cloc --version \
  && gitleaks version \
  && semgrep --version \
  && lizard --version

@@ -23,6 +23,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+try:
+    from . import vcs
+except ImportError:
+    import vcs  # type: ignore[no-redef]
+
 ROLES = ("superadmin", "admin", "user")
 EMAIL_NOTIFY_MODES = ("batch", "risk_only", "off")
 SESSION_TTL_SEC = 24 * 3600
@@ -42,6 +47,7 @@ PROJECT_CSV_FIELDS = (
     "project_name",
     "department",
     "owner",
+    "vcs_type",
     "git_url",
     "branch",
     "status",
@@ -63,7 +69,7 @@ _EXT_LANG_MAP: dict[str, str] = {
     ".html": "HTML", ".htm": "HTML", ".css": "CSS", ".scss": "SCSS", ".less": "Less",
     ".xml": "XML", ".yml": "YAML", ".yaml": "YAML", ".json": "JSON",
 }
-_SKIP_DIR_PARTS = {"node_modules", "dist", "build", "target", "vendor", ".git", ".idea", ".vscode", "__pycache__", "out"}
+_SKIP_DIR_PARTS = {"node_modules", "dist", "build", "target", "vendor", ".git", ".svn", ".idea", ".vscode", "__pycache__", "out"}
 
 # GB2312 一级汉字（3755 个常用字）按拼音顺序编码的边界码表（GBK 两字节整数 -> 拼音）
 _GB2312_PINYIN_BOUNDARIES: tuple[tuple[int, str], ...] = (
@@ -528,9 +534,10 @@ class PlatformDB:
                 CREATE INDEX IF NOT EXISTS idx_email_logs_created ON email_logs(id DESC);
                 """
             )
-            # 兼容已有数据库：为 projects 表补齐 Git 连通性巡检字段
+            # 兼容已有数据库：为 projects 表补齐 VCS 类型与 Git/SVN 连通性巡检字段
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)").fetchall()}
             for col_name, col_def in (
+                ("vcs_type", "TEXT NOT NULL DEFAULT 'git'"),
                 ("git_check_ok", "INTEGER"),
                 ("git_check_error", "TEXT NOT NULL DEFAULT ''"),
                 ("git_checked_at", "TEXT"),
@@ -893,7 +900,9 @@ class PlatformDB:
                 langs = {}
         except ValueError:
             langs = {}
-        out = {field: (row[field] or "") for field in PROJECT_CSV_FIELDS}
+        keys = set(row.keys())
+        out = {field: (row[field] or "") if field in keys else "" for field in PROJECT_CSV_FIELDS}
+        out["vcs_type"] = vcs.detect_vcs_type(out.get("git_url", ""), out.get("vcs_type") or None)
         out.update({
             "loc_total": row["loc_total"],
             "file_count": row["file_count"],
@@ -915,16 +924,28 @@ class PlatformDB:
         pid = str(data.get("project_id") or "").strip()
         if not PROJECT_ID_RE.match(pid):
             raise ValueError("project_id 仅允许字母/数字开头，包含字母、数字、点、横线或下划线（1-128 位）")
-        git_url = validate_git_url(str(data.get("git_url") or data.get("repo_url") or ""))
-        branch = str(data.get("branch") or "main").strip() or "main"
-        if branch.startswith("-") or any(ch.isspace() for ch in branch) or ".." in branch:
-            raise ValueError(f"分支名格式无效：{branch}")
+        raw_url = str(data.get("git_url") or data.get("repo_url") or "").strip()
+        explicit_vcs = str(data.get("vcs_type") or "").strip().lower()
+        if explicit_vcs and explicit_vcs not in vcs.VALID_VCS_TYPES:
+            raise ValueError("仓库类型仅支持 git 或 svn")
+        vcs_type = vcs.detect_vcs_type(raw_url, explicit_vcs or None)
+        git_url = validate_git_url(raw_url, vcs_type=vcs_type)
+        raw_branch = str(data.get("branch") or "").strip()
+        if vcs_type == "svn":
+            branch = raw_branch
+            if branch:
+                vcs.compose_svn_url(git_url, branch)
+        else:
+            branch = raw_branch or "main"
+            if branch.startswith("-") or any(ch.isspace() for ch in branch) or ".." in branch:
+                raise ValueError(f"分支名格式无效：{branch}")
         status = str(data.get("status") or "在研").strip() or "在研"
         if status not in VALID_PROJECT_STATUSES:
             raise ValueError(f"状态必须是 {' / '.join(VALID_PROJECT_STATUSES)}")
         cleaned = {field: str(data.get(field) or "").strip() for field in PROJECT_CSV_FIELDS}
         cleaned["project_id"] = pid
         cleaned["project_name"] = cleaned["project_name"] or pid
+        cleaned["vcs_type"] = vcs_type
         cleaned["git_url"] = git_url
         cleaned["branch"] = branch
         cleaned["status"] = status
@@ -966,13 +987,17 @@ class PlatformDB:
                     if not pid or pid.startswith("#"):
                         continue
                     git_url = str(row.get("git_url") or row.get("repo_url") or "").strip()
+                    vcs_type = vcs.detect_vcs_type(git_url, str(row.get("vcs_type") or "").strip() or None)
+                    raw_branch = str(row.get("branch") or "").strip()
+                    branch = raw_branch if vcs_type == "svn" else (raw_branch or "main")
                     vals = [
                         pid,
                         str(row.get("project_name") or pid).strip(),
                         str(row.get("department") or "").strip(),
                         str(row.get("owner") or "").strip(),
+                        vcs_type,
                         git_url,
-                        str(row.get("branch") or "main").strip() or "main",
+                        branch,
                         str(row.get("status") or "在研").strip() or "在研",
                         str(row.get("tech_stack") or "").strip(),
                         str(row.get("project_type") or "").strip(),
@@ -987,10 +1012,10 @@ class PlatformDB:
                     conn.execute(
                         """
                         INSERT OR IGNORE INTO projects (
-                            project_id, project_name, department, owner, git_url, branch, status,
+                            project_id, project_name, department, owner, vcs_type, git_url, branch, status,
                             tech_stack, project_type, core_flows, scope_out, materials_dir, weights, notes,
                             created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         vals,
                     )
@@ -1017,16 +1042,20 @@ class PlatformDB:
         now = _now_iso()
         with self._lock, self._connect() as conn:
             exists = conn.execute(
-                "SELECT project_id, git_url, branch FROM projects WHERE project_id = ?", (cleaned["project_id"],)
+                "SELECT project_id, vcs_type, git_url, branch FROM projects WHERE project_id = ?", (cleaned["project_id"],)
             ).fetchone()
             if create_only and exists:
                 raise ValueError(f"项目 ID 已存在：{cleaned['project_id']}")
             if exists:
-                git_changed = (exists["git_url"] != cleaned["git_url"] or exists["branch"] != cleaned["branch"])
+                git_changed = (
+                    (exists["vcs_type"] or "git") != cleaned["vcs_type"]
+                    or exists["git_url"] != cleaned["git_url"]
+                    or exists["branch"] != cleaned["branch"]
+                )
                 conn.execute(
                     """
                     UPDATE projects
-                    SET project_name=?, department=?, owner=?, git_url=?, branch=?, status=?,
+                    SET project_name=?, department=?, owner=?, vcs_type=?, git_url=?, branch=?, status=?,
                         tech_stack=?, project_type=?, core_flows=?, scope_out=?, materials_dir=?,
                         weights=?, notes=?, updated_at=?,
                         git_check_ok=CASE WHEN ? THEN NULL ELSE git_check_ok END,
@@ -1035,7 +1064,7 @@ class PlatformDB:
                     """,
                     (
                         cleaned["project_name"], cleaned["department"], cleaned["owner"],
-                        cleaned["git_url"], cleaned["branch"], cleaned["status"],
+                        cleaned["vcs_type"], cleaned["git_url"], cleaned["branch"], cleaned["status"],
                         cleaned["tech_stack"], cleaned["project_type"], cleaned["core_flows"],
                         cleaned["scope_out"], cleaned["materials_dir"], cleaned["weights"],
                         cleaned["notes"], now,
@@ -1047,14 +1076,14 @@ class PlatformDB:
                 conn.execute(
                     """
                     INSERT INTO projects (
-                        project_id, project_name, department, owner, git_url, branch, status,
+                        project_id, project_name, department, owner, vcs_type, git_url, branch, status,
                         tech_stack, project_type, core_flows, scope_out, materials_dir, weights, notes,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         cleaned["project_id"], cleaned["project_name"], cleaned["department"],
-                        cleaned["owner"], cleaned["git_url"], cleaned["branch"], cleaned["status"],
+                        cleaned["owner"], cleaned["vcs_type"], cleaned["git_url"], cleaned["branch"], cleaned["status"],
                         cleaned["tech_stack"], cleaned["project_type"], cleaned["core_flows"],
                         cleaned["scope_out"], cleaned["materials_dir"], cleaned["weights"],
                         cleaned["notes"], now, now,
@@ -1110,14 +1139,14 @@ class PlatformDB:
                     conn.execute(
                         """
                         UPDATE projects
-                        SET project_name=?, department=?, owner=?, git_url=?, branch=?, status=?,
+                        SET project_name=?, department=?, owner=?, vcs_type=?, git_url=?, branch=?, status=?,
                             tech_stack=?, project_type=?, core_flows=?, scope_out=?, materials_dir=?,
                             weights=?, notes=?, updated_at=?
                         WHERE project_id=?
                         """,
                         (
                             cleaned["project_name"], cleaned["department"], cleaned["owner"],
-                            cleaned["git_url"], cleaned["branch"], cleaned["status"],
+                            cleaned["vcs_type"], cleaned["git_url"], cleaned["branch"], cleaned["status"],
                             cleaned["tech_stack"], cleaned["project_type"], cleaned["core_flows"],
                             cleaned["scope_out"], cleaned["materials_dir"], cleaned["weights"],
                             cleaned["notes"], now, cleaned["project_id"],
@@ -1128,14 +1157,14 @@ class PlatformDB:
                     conn.execute(
                         """
                         INSERT INTO projects (
-                            project_id, project_name, department, owner, git_url, branch, status,
+                            project_id, project_name, department, owner, vcs_type, git_url, branch, status,
                             tech_stack, project_type, core_flows, scope_out, materials_dir, weights, notes,
                             created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             cleaned["project_id"], cleaned["project_name"], cleaned["department"],
-                            cleaned["owner"], cleaned["git_url"], cleaned["branch"], cleaned["status"],
+                            cleaned["owner"], cleaned["vcs_type"], cleaned["git_url"], cleaned["branch"], cleaned["status"],
                             cleaned["tech_stack"], cleaned["project_type"], cleaned["core_flows"],
                             cleaned["scope_out"], cleaned["materials_dir"], cleaned["weights"],
                             cleaned["notes"], now, now,
@@ -1327,9 +1356,13 @@ class PlatformDB:
                               runtime_file: Path | None = None,
                               base_file: Path | None = None) -> dict:
         protocol = str(data.get("protocol") or "https").strip().lower()
-        if protocol not in ("https", "http"):
-            raise ValueError("协议仅支持 https 或 http")
-        host = str(data.get("host") or "").strip().lower().removeprefix("https://").removeprefix("http://").strip("/")
+        if protocol not in ("https", "http", "svn"):
+            raise ValueError("协议仅支持 https、http 或 svn")
+        host = (
+            str(data.get("host") or "").strip().lower()
+            .removeprefix("https://").removeprefix("http://").removeprefix("svn://")
+            .strip("/")
+        )
         if not host or any(ch.isspace() or ch in "@/" for ch in host):
             raise ValueError("Git 域名/地址格式无效，例如 git.shineyue.com 或 10.0.1.10:8080")
         path_prefix = str(data.get("path_prefix") or "").strip()
@@ -1702,23 +1735,21 @@ def test_openai_endpoint(base_url: str, model: str, api_key: str, timeout_sec: i
         }
 
 
-def validate_git_url(raw_url: str) -> str:
-    """校验 Git 仓库地址，防止参数注入与 file:// 本地路径泄露。"""
-    url = (raw_url or "").strip()
-    if not url:
-        raise ValueError("Git 地址不能为空")
-    if url.startswith("-") or any(ch.isspace() for ch in url):
-        raise ValueError(f"Git 地址包含非法字符：{url}")
-    lower = url.lower()
-    if lower.startswith(("http://", "https://", "ssh://")) or url.startswith("git@"):
-        return url
-    raise ValueError("Git 地址仅支持 http://、https://、ssh:// 或 git@ 协议")
+def validate_git_url(raw_url: str, vcs_type: str = "git") -> str:
+    """校验 Git / SVN 仓库地址，防止参数注入与 file:// 本地路径泄露。"""
+    return vcs.validate_repo_url(raw_url, vcs_type=vcs_type)
 
 
 def probe_git_remote(git_url: str, branch: str = "", timeout_sec: int = 15,
-                     credential_file: Path | None = None) -> dict:
-    """执行只读 git ls-remote --heads 校验连通性与分支是否存在。"""
-    url = validate_git_url(git_url)
+                     credential_file: Path | None = None,
+                     vcs_type: str = "") -> dict:
+    """执行只读远端探测：Git 走 git ls-remote，SVN 走 svn info --xml。"""
+    resolved_vcs = vcs.detect_vcs_type(git_url, vcs_type or None)
+    if resolved_vcs == "svn":
+        return vcs.probe_svn_remote(
+            git_url, branch=branch, timeout_sec=timeout_sec, credential_file=credential_file
+        )
+    url = validate_git_url(git_url, vcs_type="git")
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     if credential_file and credential_file.is_file():
@@ -1729,12 +1760,12 @@ def probe_git_remote(git_url: str, branch: str = "", timeout_sec: int = 15,
             capture_output=True, text=True, timeout=timeout_sec, env=env,
         )
     except subprocess.TimeoutExpired:
-        return {"ok": False, "branches": [], "default_branch": "", "branch_exists": False, "error": f"连接 Git 仓库超时（>{timeout_sec}s）"}
+        return {"ok": False, "vcs_type": "git", "branches": [], "default_branch": "", "branch_exists": False, "error": f"连接 Git 仓库超时（>{timeout_sec}s）"}
     except OSError as exc:
-        return {"ok": False, "branches": [], "default_branch": "", "branch_exists": False, "error": f"无法调用 git：{exc}"}
+        return {"ok": False, "vcs_type": "git", "branches": [], "default_branch": "", "branch_exists": False, "error": f"无法调用 git：{exc}"}
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "git ls-remote 失败").strip().splitlines()
-        return {"ok": False, "branches": [], "default_branch": "", "branch_exists": False, "error": " ".join(err[:2])[:300]}
+        return {"ok": False, "vcs_type": "git", "branches": [], "default_branch": "", "branch_exists": False, "error": " ".join(err[:2])[:300]}
 
     branches: list[str] = []
     default_branch = ""
@@ -1749,6 +1780,7 @@ def probe_git_remote(git_url: str, branch: str = "", timeout_sec: int = 15,
     target_branch = (branch or "").strip()
     return {
         "ok": True,
+        "vcs_type": "git",
         "branches": branches,
         "default_branch": default_branch or ("main" if "main" in branches else ("master" if "master" in branches else (branches[0] if branches else ""))),
         "branch_exists": (target_branch in branches) if target_branch else bool(branches),
@@ -1757,7 +1789,7 @@ def probe_git_remote(git_url: str, branch: str = "", timeout_sec: int = 15,
 
 
 def collect_repo_metrics(repo_dir: Path, cloc_json_path: Path | None = None) -> dict:
-    """零依赖快速采集本地 Git 仓库的代码行数、语言分布与最后提交时间。"""
+    """零依赖快速采集本地 Git / SVN 仓库的代码行数、语言分布与最后提交时间。"""
     out: dict = {
         "loc_total": None,
         "file_count": None,
@@ -1769,23 +1801,30 @@ def collect_repo_metrics(repo_dir: Path, cloc_json_path: Path | None = None) -> 
     if not repo_dir.is_dir():
         return out
 
+    is_svn = vcs.is_svn_working_copy(repo_dir)
     # 1. 最后代码提交时间 / 作者 / 主题
-    try:
-        proc = subprocess.run(
-            ["git", "log", "-1", "--format=%cI\x1f%an\x1f%s"],
-            cwd=str(repo_dir), capture_output=True, text=True, timeout=10,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            parts = proc.stdout.strip().split("\x1f", 2)
-            out["last_commit_at"] = parts[0].strip() or None
-            if len(parts) > 1:
-                out["last_commit_author"] = parts[1].strip()[:80]
-            if len(parts) > 2:
-                out["last_commit_subject"] = parts[2].strip()[:140]
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    if is_svn:
+        svn_info = vcs.svn_working_copy_info(repo_dir)
+        out["last_commit_at"] = svn_info.get("last_commit_at")
+        out["last_commit_author"] = svn_info.get("last_commit_author") or ""
+        out["last_commit_subject"] = svn_info.get("last_commit_subject") or ""
+    else:
+        try:
+            proc = subprocess.run(
+                ["git", "log", "-1", "--format=%cI\x1f%an\x1f%s"],
+                cwd=str(repo_dir), capture_output=True, text=True, timeout=10,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                parts = proc.stdout.strip().split("\x1f", 2)
+                out["last_commit_at"] = parts[0].strip() or None
+                if len(parts) > 1:
+                    out["last_commit_author"] = parts[1].strip()[:80]
+                if len(parts) > 2:
+                    out["last_commit_subject"] = parts[2].strip()[:140]
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
-    # 2. 代码行数与语言分布：优先读 cloc.json，否则快速遍历 git ls-files
+    # 2. 代码行数与语言分布：优先读 cloc.json，否则快速遍历受控文件
     if cloc_json_path and cloc_json_path.is_file():
         try:
             cloc_data = json.loads(cloc_json_path.read_text(encoding="utf-8"))
@@ -1810,13 +1849,16 @@ def collect_repo_metrics(repo_dir: Path, cloc_json_path: Path | None = None) -> 
             pass
 
     try:
-        ls = subprocess.run(
-            ["git", "ls-files", "-z"], cwd=str(repo_dir), capture_output=True, timeout=12,
-        )
-        if ls.returncode == 0:
-            rel_paths = [p.decode("utf-8", errors="ignore") for p in ls.stdout.split(b"\x00") if p]
+        if is_svn:
+            rel_paths = vcs.list_working_copy_files(repo_dir)
         else:
-            rel_paths = []
+            ls = subprocess.run(
+                ["git", "ls-files", "-z"], cwd=str(repo_dir), capture_output=True, timeout=12,
+            )
+            if ls.returncode == 0:
+                rel_paths = [p.decode("utf-8", errors="ignore") for p in ls.stdout.split(b"\x00") if p]
+            else:
+                rel_paths = []
     except (OSError, subprocess.TimeoutExpired):
         rel_paths = []
 

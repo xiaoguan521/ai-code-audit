@@ -45,10 +45,10 @@ export function OpsConfigPage() {
   // 运行时环境变量表单
   const [runtime, setRuntime] = useState<OpsRuntimeConfig | null>(null);
 
-  // Git 账号弹窗
+  // Git / SVN 账号弹窗
   const [gitModal, setGitModal] = useState<{ mode: "create" | "edit"; item?: GitCredentialItem } | null>(null);
   const [gitLabel, setGitLabel] = useState("");
-  const [gitProtocol, setGitProtocol] = useState<"https" | "http">("https");
+  const [gitProtocol, setGitProtocol] = useState<"https" | "http" | "svn">("https");
   const [gitHost, setGitHost] = useState("");
   const [gitPathPrefix, setGitPathPrefix] = useState("");
   const [gitUsername, setGitUsername] = useState("");
@@ -337,7 +337,7 @@ export function OpsConfigPage() {
               className={`btn ${tab === "git" ? "btn-primary" : ""}`}
               onClick={() => setTab("git")}
             >
-              <KeyRound size={14} /> Git 仓库账号凭据 ({cfg?.git_credentials.length ?? 0})
+              <KeyRound size={14} /> Git / SVN 仓库凭据 ({cfg?.git_credentials.length ?? 0})
             </button>
             <button
               type="button"
@@ -946,35 +946,36 @@ export function OpsConfigPage() {
             onSubmit={(e) => void handleSaveGit(e)}
           >
             <div className="card-title">
-              <span>{gitModal.mode === "create" ? "新增 Git 仓库账号" : "编辑 Git 仓库账号"}</span>
+              <span>{gitModal.mode === "create" ? "新增 Git / SVN 仓库账号" : "编辑 Git / SVN 仓库账号"}</span>
               <button type="button" className="btn" onClick={() => setGitModal(null)}>
                 关闭
               </button>
             </div>
             <input
-              placeholder="备注名称（例如：公司内网 GitLab 只读账号）"
+              placeholder="备注名称（例如：公司内网 GitLab / SVN 只读账号）"
               value={gitLabel}
               onChange={(e) => setGitLabel(e.target.value)}
             />
             <div style={{ display: "grid", gridTemplateColumns: "110px 1fr", gap: 8 }}>
-              <select value={gitProtocol} onChange={(e) => setGitProtocol(e.target.value as "https" | "http")}>
+              <select value={gitProtocol} onChange={(e) => setGitProtocol(e.target.value as "https" | "http" | "svn")}>
                 <option value="https">https</option>
                 <option value="http">http</option>
+                <option value="svn">svn</option>
               </select>
               <input
-                placeholder="Git 域名或 IP:端口（如 git.shineyue.com）"
+                placeholder="域名或 IP:端口（如 git.sjgjj.cn 或 svn.sjgjj.cn）"
                 value={gitHost}
                 onChange={(e) => setGitHost(e.target.value)}
                 required
               />
             </div>
             <input
-              placeholder="路径前缀（可选，留空匹配该域名下全部仓库；或填 /group/repo.git）"
+              placeholder="路径前缀（可选，留空匹配该域名下全部仓库；或填 /svn/CustomerProject）"
               value={gitPathPrefix}
               onChange={(e) => setGitPathPrefix(e.target.value)}
             />
             <input
-              placeholder="Git 用户名（例如 oauth2 或 readonly-bot）"
+              placeholder="仓库用户名（Git 账号/oauth2 或 SVN 用户名）"
               value={gitUsername}
               onChange={(e) => setGitUsername(e.target.value)}
               required

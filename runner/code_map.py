@@ -7,6 +7,11 @@ import subprocess
 from collections import Counter
 from pathlib import Path, PurePosixPath
 
+try:
+    from . import vcs
+except ImportError:
+    import vcs  # type: ignore[no-redef]
+
 
 LANGUAGES = {".py": "Python", ".java": "Java", ".go": "Go", ".js": "JavaScript",
              ".jsx": "JavaScript", ".ts": "TypeScript", ".tsx": "TypeScript", ".vue": "Vue",
@@ -38,13 +43,18 @@ def excluded(path: str, patterns: list[str]) -> bool:
 
 
 def build(repo: Path, commit: str, scope_out: list[str], limit: int = 120) -> dict:
-    """根据当前 Git index 盘点路径；返回的候选项不是对代码内容的判定。"""
+    """根据当前 Git index 或 SVN 工作副本盘点路径；返回的候选项不是对代码内容的判定。"""
     limit = max(1, min(int(limit), 1000))
-    result = subprocess.run(["git", "ls-files", "-z"], cwd=repo, capture_output=True, timeout=120)
-    if result.returncode:
-        raise RuntimeError("无法读取 Git 跟踪文件清单")
+    if vcs.is_svn_working_copy(repo):
+        raw_paths = vcs.list_working_copy_files(repo)
+        source_desc = "svn working copy；仅盘点受控目录文件，候选路径不代表已检查或测试有效"
+    else:
+        result = subprocess.run(["git", "ls-files", "-z"], cwd=repo, capture_output=True, timeout=120)
+        if result.returncode:
+            raise RuntimeError("无法读取 Git 跟踪文件清单")
+        raw_paths = [os.fsdecode(s) for s in result.stdout.split(b"\0") if s]
+        source_desc = "git ls-files；仅盘点跟踪文件，候选路径不代表已检查或测试有效"
     root = repo.resolve()
-    raw_paths = [os.fsdecode(s) for s in result.stdout.split(b"\0") if s]
     counts: Counter = Counter()
     languages: Counter = Counter()
     top: Counter = Counter()
@@ -111,7 +121,7 @@ def build(repo: Path, commit: str, scope_out: list[str], limit: int = 120) -> di
         add("files", path)
     return {
         "commit": commit,
-        "source": "git ls-files；仅盘点跟踪文件，候选路径不代表已检查或测试有效",
+        "source": source_desc,
         "tracked_files": len(raw_paths),
         "counts": dict(counts),
         "language_file_counts": dict(languages),
