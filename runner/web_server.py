@@ -1439,11 +1439,11 @@ def _summarize_run(date_str: str, run_id: str, data: dict, output_dir: Path,
         pending = [pid for pid in pending if pid in allowed_pids]
     ok_count = sum(1 for p in projects if p.get("status") == "ok")
     err_count = sum(1 for p in projects if p.get("status") != "ok")
-    rep_dir = output_dir / "reports" / date_str if run_id == "default" else output_dir / "reports" / date_str / run_id
+    rep_dir = _resolve_report_dir(output_dir, date_str, run_id)
     summary_exists = (rep_dir / "_summary.md").is_file() and allowed_pids is None
     return {
-        "date": data.get("date") or date_str,
-        "run_id": data.get("run_id") or run_id,
+        "date": date_str,
+        "run_id": run_id,
         "status": data.get("status", "unknown"),
         "report_mode": data.get("report_mode", ""),
         "triggered_by": data.get("triggered_by") or "",
@@ -1462,15 +1462,21 @@ def _summarize_run(date_str: str, run_id: str, data: dict, output_dir: Path,
 
 
 def _resolve_report_dir(output_dir: Path, date_str: str, run_id: str) -> Path:
+    sub = output_dir / "reports" / date_str / run_id
     if run_id == "default":
+        if sub.is_dir() or (output_dir / "results" / date_str / "default" / "_run.json").is_file():
+            return sub
         return output_dir / "reports" / date_str
-    return output_dir / "reports" / date_str / run_id
+    return sub
 
 
 def _resolve_run_file(output_dir: Path, date_str: str, run_id: str) -> Path:
+    sub = output_dir / "results" / date_str / run_id / "_run.json"
+    if sub.is_file():
+        return sub
     if run_id == "default":
         return output_dir / "results" / date_str / "_run.json"
-    return output_dir / "results" / date_str / run_id / "_run.json"
+    return sub
 
 
 def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict,
@@ -1856,7 +1862,8 @@ def _delete_run(output_dir: Path, date_str: str, run_id: str,
         if not triggered_by or triggered_by.lower() != uname:
             return {"forbidden": True, "error": "普通用户仅可删除自己触发的扫描批次"}
 
-    if data.get("status") == "running":
+    is_empty_ghost = (len(data.get("projects") or []) == 0 and len(data.get("pending_projects") or []) == 0)
+    if data.get("status") == "running" and not (is_admin and is_empty_ghost and not _has_running_scan()):
         return {"conflict": True, "error": "该批次正在运行中，请先中止或标记为已中断后再删除"}
 
     settings = (_read_json(settings_path) if settings_path else None) or {}
@@ -1875,7 +1882,8 @@ def _delete_run(output_dir: Path, date_str: str, run_id: str,
     if not res_dir.is_relative_to(results_root) or not rep_dir.is_relative_to(reports_root):
         return {"conflict": True, "error": "批次目录路径越界，已拒绝删除"}
 
-    if run_id == "default":
+    is_legacy_flat = (run_file.resolve() == (results_root / date_str / "_run.json").resolve())
+    if is_legacy_flat:
         for f in (run_file, res_dir / "summary.events.jsonl"):
             try:
                 f.unlink(missing_ok=True)

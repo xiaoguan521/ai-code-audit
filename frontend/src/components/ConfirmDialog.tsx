@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { createPortal } from "react-dom";
 import { AlertTriangle, Info, Trash2, X } from "lucide-react";
 
 export interface ConfirmDialogProps {
@@ -44,7 +45,7 @@ export function ConfirmDialog({
   const shownItems = (previewItems || []).slice(0, 6);
   const moreCount = (previewItems?.length || 0) - shownItems.length;
 
-  return (
+  return createPortal(
     <div
       className="modal-backdrop"
       role="dialog"
@@ -127,6 +128,7 @@ export function ConfirmDialog({
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

@@ -1894,13 +1894,11 @@ tbody tr.clickable:hover {
   transform: translateY(0.5px);
 }
 
-/* 统一弹窗遮罩与入场动效 */
+/* 统一弹窗遮罩与入场动效（避免在带 backdrop-filter 的卡片上二次叠 blur 触发 Chrome 白块残影） */
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.52);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
+  background: rgba(15, 23, 42, 0.56);
   display: grid;
   place-items: center;
   padding: 20px;

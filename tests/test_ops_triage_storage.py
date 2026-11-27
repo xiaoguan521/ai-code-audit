@@ -314,6 +314,34 @@ class OpsTriageStorageTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_delete_empty_running_default_subdir_run(self) -> None:
+        """验证 results/<date>/default/_run.json 子目录型空 running 僵尸批次能被正常读取与删除。"""
+        ghost_dir = self.output_dir / "results" / "2026-11-24" / "default"
+        ghost_dir.mkdir(parents=True, exist_ok=True)
+        (ghost_dir / "_run.json").write_text(
+            json.dumps({
+                "date": "2026-11-24",
+                "run_id": "default",
+                "status": "running",
+                "report_mode": "standard",
+                "projects": [],
+                "pending_projects": [],
+            }),
+            encoding="utf-8",
+        )
+        sa = _Client(self.base_url)
+        self.assertEqual(sa.request("POST", "/api/auth/login", {"username": "admin", "password": "SuperPassword123"})[0], 200)
+
+        code, det = sa.request("GET", "/api/runs/2026-11-24/default")
+        self.assertEqual(code, 200)
+        self.assertEqual(det["run_id"], "default")
+        self.assertEqual(det["status"], "running")
+
+        code, res = sa.request("POST", "/api/runs/2026-11-24/default/delete")
+        self.assertEqual(code, 200)
+        self.assertTrue(res["ok"])
+        self.assertFalse(ghost_dir.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

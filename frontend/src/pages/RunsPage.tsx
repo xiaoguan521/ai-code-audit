@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Download, FileText, GitBranch, Mail, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { AlertTriangle, CheckCircle2, Download, FileText, GitBranch, Mail, RefreshCw, RotateCcw, Trash2, X } from "lucide-react";
 import { api } from "../api";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { DraftModal } from "../components/DraftModal";
@@ -62,13 +63,25 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [selected, setSelected] = useState<{ date: string; run_id: string } | null>(null);
   const [detail, setDetail] = useState<RunDetailResponse | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [draftModal, setDraftModal] = useState<{ title: string; markdown: string; filenameBase: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [confirmKind, setConfirmKind] = useState<"delete_run" | "send_emails" | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{ date: string; run_id: string } | null>(null);
   const [confirmError, setConfirmError] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<Array<{ id: number; tone: "success" | "error"; text: string }>>([]);
+  const toastSeq = useRef(1);
+  const pushToast = useCallback((tone: "success" | "error", text: string) => {
+    const id = toastSeq.current++;
+    setToasts((prev) => [...prev.slice(-2), { id, tone, text }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, tone === "error" ? 7000 : 4500);
+  }, []);
 
   // 清册筛选状态
   const [statusFilter, setStatusFilter] = useState<"" | "ok" | "error">("");
@@ -97,8 +110,31 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
   }, []);
 
   useEffect(() => {
-    if (!selected) return;
-    api.runDetail(selected.date, selected.run_id).then(setDetail).catch(() => setDetail(null));
+    if (!selected) {
+      setDetail(null);
+      setDetailError(null);
+      return;
+    }
+    let cancelled = false;
+    setDetailLoading(true);
+    setDetailError(null);
+    api
+      .runDetail(selected.date, selected.run_id)
+      .then((d) => {
+        if (!cancelled) setDetail(d);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setDetail(null);
+          setDetailError(err instanceof Error ? err.message : "加载该批次详情失败");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setDetailLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [selected]);
 
   const projects = detail?.projects ?? [];
@@ -182,25 +218,39 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
     }
   };
 
-  const handleDeleteRun = () => {
-    if (!detail) return;
+  const handleDeleteRun = (target?: { date: string; run_id: string }) => {
+    const t = target || (activeDate && activeRunId ? { date: activeDate, run_id: activeRunId } : null);
+    if (!t) return;
+    setDeleteTarget(t);
     setConfirmError(null);
     setConfirmKind("delete_run");
   };
 
   const confirmDeleteRun = async () => {
-    if (!detail || !activeDate || !activeRunId) return;
+    const t = deleteTarget || (activeDate && activeRunId ? { date: activeDate, run_id: activeRunId } : null);
+    if (!t) return;
     setActionBusy(true);
     setError(null);
     setConfirmError(null);
     try {
-      await api.deleteRun(activeDate, activeRunId);
+      await api.deleteRun(t.date, t.run_id);
       setConfirmKind(null);
-      setNotice(`已永久删除批次 ${activeDate} / ${activeRunId}`);
+      setDeleteTarget(null);
+      const okMsg = `已永久删除批次 ${t.date} / ${t.run_id}`;
+      setNotice(okMsg);
+      pushToast("success", okMsg);
+      setStatusFilter("");
+      setDeptFilter("");
+      setErrCatFilter("");
+      setQuery("");
       const res = await api.runs();
       setRuns(res.runs);
       if (res.runs.length > 0) {
-        setSelected({ date: res.runs[0].date, run_id: res.runs[0].run_id });
+        const nextSel = { date: res.runs[0].date, run_id: res.runs[0].run_id };
+        setSelected(nextSel);
+        const nextDetail = await api.runDetail(nextSel.date, nextSel.run_id).catch(() => null);
+        setDetail(nextDetail);
+        setDetailError(null);
       } else {
         setSelected(null);
         setDetail(null);
@@ -209,6 +259,7 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
       const msg = err instanceof Error ? err.message : "删除批次失败";
       setConfirmError(msg);
       setError(msg);
+      pushToast("error", msg);
     } finally {
       setActionBusy(false);
     }
@@ -276,11 +327,14 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
     try {
       const res = await api.sendRunEmails(activeDate, activeRunId);
       setConfirmKind(null);
-      setNotice(`邮件投递完成：成功 ${res.sent} 封，失败 ${res.failed} 封，按偏好跳过 ${res.skipped} 人`);
+      const okMsg = `邮件投递完成：成功 ${res.sent} 封，失败 ${res.failed} 封，按偏好跳过 ${res.skipped} 人`;
+      setNotice(okMsg);
+      pushToast("success", okMsg);
     } catch (err) {
       const msg = err instanceof Error ? err.message : "发送批次邮件失败";
       setConfirmError(msg);
       setError(msg);
+      pushToast("error", msg);
     } finally {
       setActionBusy(false);
     }
@@ -332,8 +386,24 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
                   {r.run_id} · {r.report_mode || "standard"}
                   {r.triggered_by ? ` · ${r.triggered_by}` : ""}
                 </div>
-                <div className="sub" style={{ fontSize: 12, marginTop: 4 }}>
-                  成功 {r.ok_count} / 失败 {r.error_count} / 共 {r.total_projects}
+                <div className="sub" style={{ fontSize: 12, marginTop: 4, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+                  <span>
+                    成功 {r.ok_count} / 失败 {r.error_count} / 共 {r.total_projects}
+                  </span>
+                  {r.can_delete && (r.status !== "running" || (r.total_projects === 0 && r.pending_count === 0)) && (
+                    <button
+                      type="button"
+                      className="confirm-close-btn"
+                      title="删除该批次"
+                      aria-label={`删除批次 ${r.date} / ${r.run_id}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteRun({ date: r.date, run_id: r.run_id });
+                      }}
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  )}
                 </div>
               </div>
             );
@@ -341,10 +411,30 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
         )}
       </div>
 
-      <div className="card">
-        {!detail ? (
+      <div className="card" key={selected ? `${selected.date}/${selected.run_id}` : "empty-detail"}>
+        {detailLoading && !detail ? (
           <div className="muted" style={{ padding: 24 }}>
-            请选择左侧的一个运行批次查看详情
+            正在加载批次详情…
+          </div>
+        ) : !detail ? (
+          <div style={{ padding: 24, display: "grid", gap: 10 }}>
+            <div className="muted">
+              {detailError && selected
+                ? `无法读取批次 ${selected.date} / ${selected.run_id} 详情：${detailError}`
+                : "请选择左侧的一个运行批次查看详情"}
+            </div>
+            {detailError && selected && isAdmin && (
+              <div>
+                <button
+                  type="button"
+                  className="btn btn-danger"
+                  disabled={actionBusy}
+                  onClick={() => handleDeleteRun(selected)}
+                >
+                  <Trash2 size={14} /> 删除该异常批次记录
+                </button>
+              </div>
+            )}
           </div>
         ) : (
           <div>
@@ -694,11 +784,11 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
       )}
 
       <ConfirmDialog
-        open={Boolean(confirmKind && detail)}
+        open={Boolean(confirmKind && (confirmKind === "delete_run" ? deleteTarget : detail))}
         tone={confirmKind === "delete_run" ? "danger" : "info"}
         title={
           confirmKind === "delete_run"
-            ? `确认永久删除批次 ${activeDate} / ${activeRunId}？`
+            ? `确认永久删除批次 ${deleteTarget?.date || activeDate} / ${deleteTarget?.run_id || activeRunId}？`
             : `确认发送本批次审查结果邮件？`
         }
         description={
@@ -713,8 +803,38 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
         onCancel={() => {
           setConfirmError(null);
           setConfirmKind(null);
+          setDeleteTarget(null);
         }}
       />
+
+      {toasts.length > 0 &&
+        createPortal(
+          <div className="toast-stack" role="status" aria-live="polite">
+            {toasts.map((t) => (
+              <div key={t.id} className={`toast-item ${t.tone}`}>
+                <span
+                  style={{
+                    color: t.tone === "success" ? "var(--good)" : "var(--critical)",
+                    marginTop: 1,
+                    flexShrink: 0,
+                  }}
+                >
+                  {t.tone === "success" ? <CheckCircle2 size={16} /> : <AlertTriangle size={16} />}
+                </span>
+                <div style={{ flex: 1, minWidth: 0, wordBreak: "break-word" }}>{t.text}</div>
+                <button
+                  type="button"
+                  className="confirm-close-btn"
+                  aria-label="关闭提示"
+                  onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            ))}
+          </div>,
+          document.body
+        )}
     </div>
   );
 }
