@@ -24,6 +24,7 @@ import {
   Sliders,
   Trash2,
   Upload,
+  Users,
   X,
 } from "lucide-react";
 import { api } from "../api";
@@ -32,6 +33,8 @@ import type { AuthUser, CatalogProject, GitProbeResult, StaleThresholds } from "
 
 interface Props {
   currentUser: AuthUser;
+  focusProjectId?: string | null;
+  onFocusConsumed?: () => void;
   onOpenReport?: (date: string, runId: string, target: string) => void;
   onScanStarted?: (taskId: string) => void;
 }
@@ -144,7 +147,7 @@ function topLangs(langs?: Record<string, number>): string {
   return entries.map(([k]) => k).join(" / ");
 }
 
-export function ProjectsPage({ currentUser, onOpenReport, onScanStarted }: Props) {
+export function ProjectsPage({ currentUser, focusProjectId, onFocusConsumed, onOpenReport, onScanStarted }: Props) {
   const isAdmin = currentUser.role === "superadmin" || currentUser.role === "admin";
   const [projects, setProjects] = useState<CatalogProject[]>([]);
   const [thresholds, setThresholds] = useState<StaleThresholds>({ warn_days: 90, critical_days: 180 });
@@ -211,6 +214,14 @@ export function ProjectsPage({ currentUser, onOpenReport, onScanStarted }: Props
   const [showThresholdModal, setShowThresholdModal] = useState(false);
   const [warnDaysInput, setWarnDaysInput] = useState("90");
   const [critDaysInput, setCritDaysInput] = useState("180");
+
+  // 批量修改负责人 / 部门弹窗
+  const [showBatchMeta, setShowBatchMeta] = useState(false);
+  const [batchDeptEnabled, setBatchDeptEnabled] = useState(false);
+  const [batchDeptVal, setBatchDeptVal] = useState("");
+  const [batchOwnerEnabled, setBatchOwnerEnabled] = useState(true);
+  const [batchOwnerMode, setBatchOwnerMode] = useState<"replace" | "append" | "remove">("replace");
+  const [batchOwnerVal, setBatchOwnerVal] = useState("");
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -456,20 +467,36 @@ export function ProjectsPage({ currentUser, onOpenReport, onScanStarted }: Props
     setModalMode("create");
   };
 
-  const openEdit = (p: CatalogProject) => {
-    setForm({ ...p });
-    setEditingHealthHint(p.git_health === "error" ? p.git_health_reason || "地址或分支校验异常" : "");
-    setIdTouched(true);
-    setNameTouched(true);
-    setProbeRes(null);
-    setBranchDropdownOpen(false);
-    setBranchSearch("");
-    setModalMode("edit");
-    // 若该项目当前标记为异常，打开编辑时自动探测一次，免去再点一次按钮
-    if (p.git_health === "error" && p.git_url?.trim()) {
-      void runProbeFor(p.git_url, p.branch || "", p.project_id, p.vcs_type || "git", true);
+  const openEdit = useCallback(
+    (p: CatalogProject, forceProbe = false) => {
+      setForm({ ...p });
+      setEditingHealthHint(p.git_health === "error" ? p.git_health_reason || "地址或分支校验异常" : "");
+      setIdTouched(true);
+      setNameTouched(true);
+      setProbeRes(null);
+      setBranchDropdownOpen(false);
+      setBranchSearch("");
+      setModalMode("edit");
+      // 若该项目当前标记为异常，或从批次页「去修分支」跳转而来，自动探测远端分支
+      if ((forceProbe || p.git_health === "error") && p.git_url?.trim()) {
+        void runProbeFor(p.git_url, p.branch || "", p.project_id, p.vcs_type || "git", true);
+      }
+    },
+    [runProbeFor]
+  );
+
+  // 从「批次记录」点击「去修分支」跳转过来时，自动定位并打开编辑弹窗 + 探测远端分支
+  useEffect(() => {
+    if (!focusProjectId || projects.length === 0) return;
+    const target = projects.find((p) => p.project_id === focusProjectId);
+    if (target) {
+      setQuery(target.project_id);
+      openEdit(target, true);
+    } else {
+      pushToast("error", `未在项目清册中找到 ${focusProjectId}`);
     }
-  };
+    if (onFocusConsumed) onFocusConsumed();
+  }, [focusProjectId, projects, openEdit, onFocusConsumed, pushToast]);
 
   const handleProbeGit = async () => {
     await runProbeFor(
@@ -641,6 +668,32 @@ export function ProjectsPage({ currentUser, onOpenReport, onScanStarted }: Props
       await loadData();
     } catch (err) {
       pushToast("error", err instanceof Error ? err.message : "CSV 导入失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleBatchMetaSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    if (!batchDeptEnabled && !batchOwnerEnabled) {
+      pushToast("error", "请至少勾选一项要修改的字段（部门或负责人）");
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await api.batchUpdateProjectsMeta({
+        project_ids: ids,
+        ...(batchDeptEnabled ? { department: batchDeptVal.trim() } : {}),
+        ...(batchOwnerEnabled ? { owner: batchOwnerVal.trim(), owner_mode: batchOwnerMode } : {}),
+      });
+      setShowBatchMeta(false);
+      setSelectedIds(new Set());
+      pushToast("success", `已批量更新 ${res.updated} 个项目的负责人 / 部门信息`);
+      await loadData();
+    } catch (err) {
+      pushToast("error", err instanceof Error ? err.message : "批量修改失败");
     } finally {
       setBusy(false);
     }
@@ -903,6 +956,22 @@ export function ProjectsPage({ currentUser, onOpenReport, onScanStarted }: Props
                 onClick={() => requestQuickScan(selectedProjects)}
               >
                 <Play size={12} /> 扫描选中
+              </button>
+              <button
+                type="button"
+                className="btn"
+                style={{ padding: "4px 9px", fontSize: 12 }}
+                disabled={busy}
+                onClick={() => {
+                  setBatchDeptEnabled(false);
+                  setBatchDeptVal("");
+                  setBatchOwnerEnabled(true);
+                  setBatchOwnerMode("replace");
+                  setBatchOwnerVal("");
+                  setShowBatchMeta(true);
+                }}
+              >
+                <Users size={12} /> 改负责人/部门
               </button>
               <button
                 type="button"
@@ -1726,6 +1795,108 @@ export function ProjectsPage({ currentUser, onOpenReport, onScanStarted }: Props
               </button>
               <button type="submit" className="btn btn-primary" disabled={busy}>
                 {busy ? "保存中…" : "保存阈值"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* 批量修改负责人 / 部门弹窗 */}
+      {showBatchMeta && (
+        <div className="modal-backdrop" onClick={() => setShowBatchMeta(false)}>
+          <form
+            className="modal-dialog"
+            style={{ width: "min(500px, 95vw)", display: "grid", gap: 12 }}
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => void handleBatchMetaSubmit(e)}
+          >
+            <div className="card-title">
+              <span>批量修改负责人 / 部门（已选 {selectedIds.size} 个项目）</span>
+              <button type="button" className="btn" onClick={() => setShowBatchMeta(false)}>
+                关闭
+              </button>
+            </div>
+
+            <div className="confirm-preview-list">
+              {selectedProjects.slice(0, 6).map((p) => (
+                <span key={p.project_id} className="confirm-preview-chip">
+                  {p.project_name}
+                </span>
+              ))}
+              {selectedProjects.length > 6 && (
+                <span className="confirm-preview-chip muted">等共 {selectedProjects.length} 个项目</span>
+              )}
+            </div>
+
+            <div style={{ display: "grid", gap: 8 }}>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600 }}>
+                <input
+                  type="checkbox"
+                  checked={batchOwnerEnabled}
+                  onChange={(e) => setBatchOwnerEnabled(e.target.checked)}
+                />
+                调整负责人（适合离职交接或新增协作者）
+              </label>
+              {batchOwnerEnabled && (
+                <div style={{ display: "grid", gridTemplateColumns: "130px 1fr", gap: 8 }}>
+                  <select
+                    value={batchOwnerMode}
+                    onChange={(e) => setBatchOwnerMode(e.target.value as "replace" | "append" | "remove")}
+                  >
+                    <option value="replace">替换为新负责人</option>
+                    <option value="append">追加负责人</option>
+                    <option value="remove">移除指定负责人</option>
+                  </select>
+                  <input
+                    list="batch-owner-suggestions"
+                    placeholder="填写姓名（多人用顿号、分隔）"
+                    value={batchOwnerVal}
+                    onChange={(e) => setBatchOwnerVal(e.target.value)}
+                    required={batchOwnerMode !== "replace"}
+                  />
+                  <datalist id="batch-owner-suggestions">
+                    {owners.map((u) => (
+                      <option key={u.username} value={u.display_name}>
+                        {u.username}
+                      </option>
+                    ))}
+                  </datalist>
+                </div>
+              )}
+            </div>
+
+            <div style={{ display: "grid", gap: 8 }}>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600 }}>
+                <input
+                  type="checkbox"
+                  checked={batchDeptEnabled}
+                  onChange={(e) => setBatchDeptEnabled(e.target.checked)}
+                />
+                调整所属部门
+              </label>
+              {batchDeptEnabled && (
+                <>
+                  <input
+                    list="batch-dept-suggestions"
+                    placeholder="填写新部门名称（例如 研发一部）"
+                    value={batchDeptVal}
+                    onChange={(e) => setBatchDeptVal(e.target.value)}
+                  />
+                  <datalist id="batch-dept-suggestions">
+                    {departments.map((d) => (
+                      <option key={d} value={d} />
+                    ))}
+                  </datalist>
+                </>
+              )}
+            </div>
+
+            <div className="confirm-footer">
+              <button type="button" className="btn" disabled={busy} onClick={() => setShowBatchMeta(false)}>
+                取消
+              </button>
+              <button type="submit" className="btn btn-primary" disabled={busy}>
+                {busy ? "更新中…" : `应用到 ${selectedIds.size} 个项目`}
               </button>
             </div>
           </form>

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Download, FileText, Mail, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
+import { AlertTriangle, Download, FileText, GitBranch, Mail, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 import { api } from "../api";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { DraftModal } from "../components/DraftModal";
@@ -9,6 +9,7 @@ interface Props {
   currentUser?: AuthUser | null;
   onOpenReport: (date: string, runId: string, target: string) => void;
   onScanStarted?: (taskId: string) => void;
+  onFixProject?: (projectId: string) => void;
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -32,7 +33,16 @@ function fmtSec(sec: number): string {
 function classifyError(raw: string | undefined): string {
   const s = (raw || "").toLowerCase();
   if (!s) return "其他错误";
-  if (s.includes("clone") || s.includes("branch") || s.includes("git") || s.includes("repository") || s.includes("权限")) {
+  if (
+    s.includes("clone") ||
+    s.includes("branch") ||
+    s.includes("git") ||
+    s.includes("svn") ||
+    s.includes("subversion") ||
+    s.includes("repository") ||
+    s.includes("权限") ||
+    s.includes("分支")
+  ) {
     return "Git 克隆 / 分支";
   }
   if (s.includes("timeout") || s.includes("超时") || s.includes("时限")) {
@@ -47,7 +57,7 @@ function classifyError(raw: string | undefined): string {
   return "其他错误";
 }
 
-export function RunsPage({ currentUser, onOpenReport, onScanStarted }: Props) {
+export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProject }: Props) {
   const isAdmin = !currentUser || currentUser.role === "superadmin" || currentUser.role === "admin";
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [selected, setSelected] = useState<{ date: string; run_id: string } | null>(null);
@@ -621,14 +631,27 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted }: Props) {
                               阅读报告
                             </button>
                           ) : (
-                            <button
-                              className="btn"
-                              style={{ padding: "3px 9px", fontSize: 12 }}
-                              disabled={actionBusy}
-                              onClick={() => void handleRetryProjects([p.project_id])}
-                            >
-                              <RotateCcw size={12} /> 重跑
-                            </button>
+                            <div style={{ display: "flex", gap: 5, flexWrap: "nowrap" }}>
+                              {isAdmin && onFixProject && classifyError(p.error) === "Git 克隆 / 分支" && (
+                                <button
+                                  type="button"
+                                  className="btn"
+                                  style={{ padding: "3px 8px", fontSize: 12, borderColor: "var(--warning)", color: "var(--warning)" }}
+                                  title="跳转到项目管理并自动探测可用分支"
+                                  onClick={() => onFixProject(p.project_id)}
+                                >
+                                  <GitBranch size={12} /> 去修分支
+                                </button>
+                              )}
+                              <button
+                                className="btn"
+                                style={{ padding: "3px 9px", fontSize: 12 }}
+                                disabled={actionBusy}
+                                onClick={() => void handleRetryProjects([p.project_id])}
+                              >
+                                <RotateCcw size={12} /> 重跑
+                              </button>
+                            </div>
                           )}
                         </td>
                       </tr>

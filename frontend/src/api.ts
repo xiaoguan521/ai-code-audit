@@ -22,7 +22,9 @@ import type {
   ScheduleResponse,
   SmtpConfig,
   StaleThresholds,
+  StorageOverview,
   UserRole,
+  IssueTriageStatus,
 } from "./types";
 
 let unauthorizedHandler: (() => void) | null = null;
@@ -238,6 +240,78 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ project_ids, status }),
     }),
+  batchUpdateProjectsMeta: (payload: {
+    project_ids: string[];
+    department?: string;
+    owner?: string;
+    owner_mode?: "replace" | "append" | "remove";
+  }) =>
+    request<{ updated: number; project_ids: string[] }>("/api/projects/batch-update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  triageIssue: (payload: {
+    project_id: string;
+    fingerprint?: string;
+    item_id?: string;
+    level?: string;
+    title?: string;
+    evidence_text?: string;
+    status: IssueTriageStatus;
+    reason?: string;
+  }) =>
+    request<{
+      triage: {
+        project_id: string;
+        fingerprint: string;
+        status: IssueTriageStatus;
+        reason: string;
+        updated_by: string;
+        updated_at: string;
+      };
+    }>("/api/issues/triage", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  opsStorage: () => request<StorageOverview>("/api/ops/storage"),
+  opsStorageCleanup: (payload: {
+    action: "clean_inactive_repos" | "prune_runs" | "save_policy";
+    keep_days?: number;
+    keep_latest?: number;
+  }) =>
+    request<{ result: Record<string, unknown>; storage: StorageOverview }>("/api/ops/storage/cleanup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  downloadDbBackup: async () => {
+    const res = await fetch("/api/ops/db-backup", { credentials: "same-origin" });
+    if (!res.ok) {
+      let msg = `备份下载失败 (HTTP ${res.status})`;
+      try {
+        const err = await res.json();
+        if (err?.error) msg = err.error;
+      } catch {
+        // ignore
+      }
+      if (res.status === 401 && unauthorizedHandler) unauthorizedHandler();
+      throw new Error(msg);
+    }
+    const cd = res.headers.get("Content-Disposition") || "";
+    const match = cd.match(/filename="?([^";]+)"?/i);
+    const fname = match ? match[1] : `platform_backup_${new Date().toISOString().slice(0, 10)}.db`;
+    const blob = await res.blob();
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objUrl;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
+  },
   importProjectsCsv: (csv_text: string, mode: "upsert" | "replace" = "upsert") =>
     request<{ created: number; updated: number; errors: Array<{ line: number; project_id: string; reason: string }> }>(
       "/api/projects/import",

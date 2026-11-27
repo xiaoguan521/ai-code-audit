@@ -98,6 +98,7 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [reportTarget, setReportTarget] = useState<ReportTarget | null>(initial.reportTarget);
   const [focusTaskId, setFocusTaskId] = useState<string | null>(null);
+  const [focusProjectId, setFocusProjectId] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
@@ -208,6 +209,11 @@ export function App() {
   const handleScanStarted = (taskId: string) => {
     setFocusTaskId(taskId);
     navigate("progress");
+  };
+
+  const handleFixProject = (projectId: string) => {
+    setFocusProjectId(projectId);
+    navigate("projects");
   };
 
   if (!authChecked) {
@@ -425,6 +431,7 @@ export function App() {
               currentUser={currentUser}
               onOpenReport={openReport}
               onScanStarted={handleScanStarted}
+              onFixProject={isAdmin ? handleFixProject : undefined}
             />
           )}
           {page === "reports" && (
@@ -437,6 +444,8 @@ export function App() {
           {page === "projects" && (
             <ProjectsPage
               currentUser={currentUser}
+              focusProjectId={focusProjectId}
+              onFocusConsumed={() => setFocusProjectId(null)}
               onOpenReport={openReport}
               onScanStarted={handleScanStarted}
             />

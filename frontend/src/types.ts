@@ -198,6 +198,8 @@ export interface ReportDimension {
   top_risk?: string;
 }
 
+export type IssueTriageStatus = "open" | "planned" | "fixed" | "exempted";
+
 export interface ReportIssue {
   issue_id: string;
   item_id: string;
@@ -207,6 +209,11 @@ export interface ReportIssue {
   impact: string;
   suggestion: string;
   effort: string;
+  fingerprint?: string;
+  triage_status?: IssueTriageStatus;
+  triage_reason?: string;
+  triage_updated_by?: string;
+  triage_updated_at?: string | null;
 }
 
 export interface ReportResponse {
@@ -218,6 +225,13 @@ export interface ReportResponse {
   dimensions?: ReportDimension[];
   issues?: ReportIssue[];
   issue_counts?: Record<string, number>;
+  effective_issue_counts?: Record<string, number>;
+  triage_summary?: {
+    open: number;
+    planned: number;
+    fixed: number;
+    exempted: number;
+  };
   scores?: {
     total?: number | null;
     grade?: string;
@@ -495,6 +509,38 @@ export interface EmailDispatchResult {
   failed: number;
   skipped: number;
   details: EmailLogEntry[];
+}
+
+export interface StorageOverview {
+  disk: {
+    total_bytes: number;
+    used_bytes: number;
+    free_bytes: number;
+    used_percent: number;
+  };
+  directories: {
+    workdir: { path: string; bytes: number };
+    reports: { path: string; bytes: number };
+    results: { path: string; bytes: number };
+    logs: { path: string; bytes: number };
+    state: { path: string; bytes: number };
+    platform_db: { path: string; bytes: number };
+  };
+  reclaimable_repos: {
+    count: number;
+    total_bytes: number;
+    items: Array<{ project_id: string; reason: string; size_bytes: number }>;
+  };
+  runs_summary: {
+    total_runs: number;
+    oldest_date: string | null;
+    newest_date: string | null;
+  };
+  retention_policy: {
+    keep_days: number;
+    keep_latest: number;
+  };
+  scan_running: boolean;
 }
 
 export interface DoctorReport {

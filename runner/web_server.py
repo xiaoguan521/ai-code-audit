@@ -863,6 +863,208 @@ def _refresh_projects_metrics(output_dir: Path, settings_path: Path | None,
     return {"scanned": scanned, "updated": updated, "missing_repo": missing_repo}
 
 
+def _dir_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    total = 0
+    stack = [path]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        else:
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def _has_running_scan() -> bool:
+    with SCAN_LOCK:
+        return any(t.get("status") == "running" for t in SCAN_TASKS.values())
+
+
+def _build_storage_overview(output_dir: Path, settings_path: Path | None, db: platform_db.PlatformDB) -> dict:
+    """统计宿主机磁盘容量、各数据目录体积、可清理残留仓库以及历史批次保留策略。"""
+    settings = (_read_json(settings_path) if settings_path else None) or {}
+    workdir = _resolve_workdir(output_dir, settings if isinstance(settings, dict) else {})
+    reports_dir = output_dir / "reports"
+    results_dir = output_dir / "results"
+    logs_dir = output_dir / "logs"
+    state_dir = output_dir / "state"
+    db_file = db.db_path
+
+    disk_target = output_dir if output_dir.exists() else Path("/")
+    try:
+        du = shutil.disk_usage(disk_target)
+        disk = {
+            "total_bytes": du.total,
+            "used_bytes": du.used,
+            "free_bytes": du.free,
+            "used_percent": round(du.used / du.total * 100, 1) if du.total else 0.0,
+        }
+    except OSError:
+        disk = {"total_bytes": 0, "used_bytes": 0, "free_bytes": 0, "used_percent": 0.0}
+
+    projects = db.list_projects()
+    status_by_pid = {p["project_id"]: p.get("status") or "" for p in projects}
+    active_pids = {pid for pid, st in status_by_pid.items() if st == "在研"}
+
+    reclaimable_repos: list[dict] = []
+    workdir_bytes = 0
+    if workdir.is_dir():
+        try:
+            for entry in sorted(workdir.iterdir(), key=lambda p: p.name):
+                if entry.name.startswith(".") or not entry.is_dir():
+                    continue
+                sz = _dir_size_bytes(entry)
+                workdir_bytes += sz
+                if entry.name not in active_pids:
+                    reason = "已从清册移除" if entry.name not in status_by_pid else f"项目已{status_by_pid[entry.name]}"
+                    reclaimable_repos.append({
+                        "project_id": entry.name,
+                        "reason": reason,
+                        "size_bytes": sz,
+                    })
+        except OSError:
+            pass
+    reclaimable_repos.sort(key=lambda x: x["size_bytes"], reverse=True)
+
+    runs = _discover_runs(output_dir)
+    policy = db.get_retention_policy()
+
+    return {
+        "disk": disk,
+        "directories": {
+            "workdir": {"path": str(workdir), "bytes": workdir_bytes},
+            "reports": {"path": str(reports_dir), "bytes": _dir_size_bytes(reports_dir)},
+            "results": {"path": str(results_dir), "bytes": _dir_size_bytes(results_dir)},
+            "logs": {"path": str(logs_dir), "bytes": _dir_size_bytes(logs_dir)},
+            "state": {"path": str(state_dir), "bytes": _dir_size_bytes(state_dir)},
+            "platform_db": {"path": str(db_file), "bytes": _dir_size_bytes(db_file)},
+        },
+        "reclaimable_repos": {
+            "count": len(reclaimable_repos),
+            "total_bytes": sum(r["size_bytes"] for r in reclaimable_repos),
+            "items": reclaimable_repos[:50],
+        },
+        "runs_summary": {
+            "total_runs": len(runs),
+            "oldest_date": runs[-1]["date"] if runs else None,
+            "newest_date": runs[0]["date"] if runs else None,
+        },
+        "retention_policy": policy,
+        "scan_running": _has_running_scan(),
+    }
+
+
+def _cleanup_inactive_repos(output_dir: Path, settings_path: Path | None, db: platform_db.PlatformDB) -> dict:
+    """清理已停用、已归档或已移除项目残留在 workdir 下的本地仓库克隆目录。"""
+    if _has_running_scan():
+        raise ValueError("当前有正在执行的扫描任务，请待扫描结束或暂停后再清理本地仓库")
+    settings = (_read_json(settings_path) if settings_path else None) or {}
+    workdir = _resolve_workdir(output_dir, settings if isinstance(settings, dict) else {})
+    active_pids = {p["project_id"] for p in db.list_projects() if p.get("status") == "在研"}
+    removed: list[str] = []
+    freed_bytes = 0
+    if workdir.is_dir():
+        root_res = workdir.resolve()
+        for entry in list(workdir.iterdir()):
+            if entry.name.startswith(".") or not entry.is_dir():
+                continue
+            if entry.name in active_pids:
+                continue
+            try:
+                resolved = entry.resolve()
+                if not resolved.is_relative_to(root_res) or resolved == root_res:
+                    continue
+                sz = _dir_size_bytes(resolved)
+                shutil.rmtree(resolved)
+                removed.append(entry.name)
+                freed_bytes += sz
+            except OSError:
+                continue
+    return {"removed_count": len(removed), "freed_bytes": freed_bytes, "removed_projects": removed[:30]}
+
+
+def _prune_old_runs(output_dir: Path, keep_days: int, keep_latest: int) -> dict:
+    """按保留天数与最少保留批次数清理过期历史批次，自动保护最新基线引用的批次。"""
+    if _has_running_scan():
+        raise ValueError("当前有正在执行的扫描任务，请待扫描结束后再清理历史批次")
+    keep_days = max(7, min(3650, int(keep_days)))
+    keep_latest = max(5, min(500, int(keep_latest)))
+    runs = _discover_runs(output_dir)
+    if len(runs) <= keep_latest:
+        return {"removed_count": 0, "freed_bytes": 0, "skipped_protected": 0, "removed_runs": []}
+
+    # 保护任意项目最新 state 引用的批次，防止破坏基线对比
+    protected: set[tuple[str, str]] = set()
+    state_dir = output_dir / "state"
+    reports_root = (output_dir / "reports").resolve()
+    if state_dir.is_dir():
+        for sf in state_dir.glob("*.json"):
+            st = _read_json(sf)
+            if isinstance(st, dict) and st.get("last_report"):
+                try:
+                    rp = Path(str(st["last_report"])).resolve()
+                    if rp.is_relative_to(reports_root):
+                        parts = rp.relative_to(reports_root).parts
+                        if len(parts) >= 3:
+                            protected.add((parts[0], parts[1]))
+                except (OSError, ValueError):
+                    pass
+
+    cutoff_date = (dt.date.today() - dt.timedelta(days=keep_days)).isoformat()
+    removed_runs: list[str] = []
+    skipped_protected = 0
+    freed_bytes = 0
+    for idx, r in enumerate(runs):
+        if idx < keep_latest:
+            continue
+        if r.get("status") == "running":
+            continue
+        rdate, rid = str(r.get("date") or ""), str(r.get("run_id") or "")
+        if not rdate or not rid or rdate >= cutoff_date:
+            continue
+        if (rdate, rid) in protected:
+            skipped_protected += 1
+            continue
+        if not (_is_safe_segment(rdate) and _is_safe_segment(rid)):
+            continue
+        for base_name in ("results", "reports"):
+            target_dir = output_dir / base_name / rdate / rid
+            if target_dir.is_dir():
+                freed_bytes += _dir_size_bytes(target_dir)
+                shutil.rmtree(target_dir, ignore_errors=True)
+            parent_date_dir = output_dir / base_name / rdate
+            try:
+                if parent_date_dir.is_dir() and not any(parent_date_dir.iterdir()):
+                    parent_date_dir.rmdir()
+            except OSError:
+                pass
+        removed_runs.append(f"{rdate}/{rid}")
+
+    return {
+        "removed_count": len(removed_runs),
+        "freed_bytes": freed_bytes,
+        "skipped_protected": skipped_protected,
+        "removed_runs": removed_runs[:30],
+    }
+
+
 def _allowed_pids_for_user(user: dict | None, projects_csv: Path | None,
                            db: platform_db.PlatformDB | None = None) -> set[str] | None:
     """superadmin/admin 返回 None（不限）；普通用户返回其负责的 project_id 集合。"""
@@ -1277,6 +1479,7 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict,
     runs = _discover_runs(output_dir, allowed_pids=allowed_pids)
     catalog = {p["project_id"]: p for p in _load_catalog(projects_csv, db=db)}
     thresholds = db.get_stale_thresholds() if db is not None else {"warn_days": 90, "critical_days": 180}
+    exempted_counts = db.count_exempted_by_project() if db is not None else {}
 
     # 读取所有 state/<pid>.json 作为项目最新基线
     state_dir = output_dir / "state"
@@ -1397,6 +1600,7 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict,
             else None
         )
         code_metrics = _merge_project_code_metrics(meta, st, thresholds)
+        exempted_cnt = exempted_counts.get(pid, 0)
         rows.append({
             "project_id": pid,
             "project_name": meta.get("project_name") or rec.get("project_name") or pid,
@@ -1422,6 +1626,7 @@ def _build_overview(output_dir: Path, projects_csv: Path, checklist: dict,
             "scored_dimensions": scores.get("scored_dimensions"),
             "security_p0": scores.get("security_p0", 0),
             "security_p1": scores.get("security_p1", 0),
+            "exempted_issues": exempted_cnt,
             **issue_counts,
             **code_metrics,
             "dim_scores": dim_scores,
@@ -2214,6 +2419,33 @@ class AuditHandler(BaseHTTPRequestHandler):
             catalog = {p["project_id"]: p for p in _load_catalog(effective_csv, db=db)}
             proj_weights, weights_key = _project_weights(catalog.get(target), checklist)
             parsed_report = _parse_markdown_report(md_file, checklist, proj_weights, weights_key)
+            # 合并项目问题整改与误报豁免状态，生成稳定指纹及排除豁免后的有效问题计数
+            triages = db.list_project_triages(target) if db is not None else {}
+            triage_summary = {"open": 0, "planned": 0, "fixed": 0, "exempted": 0}
+            eff_counts = {lv: 0 for lv in LEVELS}
+            enriched_issues = []
+            for iss in parsed_report.get("issues") or []:
+                item = dict(iss)
+                fp = platform_db.compute_issue_fingerprint(
+                    str(item.get("item_id") or ""),
+                    str(item.get("title") or ""),
+                    str(item.get("evidence_text") or ""),
+                )
+                tr = triages.get(fp)
+                st_val = tr["status"] if tr else "open"
+                item["fingerprint"] = fp
+                item["triage_status"] = st_val
+                item["triage_reason"] = tr["reason"] if tr else ""
+                item["triage_updated_by"] = tr["updated_by"] if tr else ""
+                item["triage_updated_at"] = tr["updated_at"] if tr else None
+                triage_summary[st_val] = triage_summary.get(st_val, 0) + 1
+                lv = str(item.get("level") or "")
+                if st_val != "exempted" and lv in eff_counts:
+                    eff_counts[lv] += 1
+                enriched_issues.append(item)
+            parsed_report["issues"] = enriched_issues
+            parsed_report["triage_summary"] = triage_summary
+            parsed_report["effective_issue_counts"] = eff_counts
             parsed_report.update({
                 "type": "project",
                 "date": date_str,
@@ -2285,6 +2517,32 @@ class AuditHandler(BaseHTTPRequestHandler):
             if not self._require_role(cur_user, ("superadmin",)):
                 return
             return self._send_json(200, _build_ops_config(output_dir, self.cfg["settings_path"], db))
+
+        if path == "/api/ops/storage":
+            assert cur_user is not None
+            if not self._require_role(cur_user, ("superadmin",)):
+                return
+            return self._send_json(200, _build_storage_overview(output_dir, self.cfg["settings_path"], db))
+
+        if path == "/api/ops/db-backup":
+            assert cur_user is not None
+            if not self._require_role(cur_user, ("superadmin",)):
+                return
+            stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            tmp_bak = output_dir / "state" / f".backup_{stamp}_{uuid.uuid4().hex[:8]}.db"
+            try:
+                sz = db.create_hot_backup(tmp_bak)
+                raw_bytes = tmp_bak.read_bytes()
+            except OSError as exc:
+                return self._send_json(500, {"error": f"生成数据库热备份失败：{exc}"})
+            finally:
+                try:
+                    tmp_bak.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            db.record_audit(cur_user, "download_db_backup", target=f"platform_backup_{stamp}.db",
+                            detail={"size_bytes": sz}, client_ip=self._client_ip())
+            return self._send_binary(raw_bytes, "application/x-sqlite3", f"platform_backup_{stamp}.db")
 
         if path == "/api/ops/smtp":
             assert cur_user is not None
@@ -2644,6 +2902,79 @@ class AuditHandler(BaseHTTPRequestHandler):
                             detail={"project_ids": res["project_ids"][:20]}, client_ip=client_ip)
             return self._send_json(200, res)
 
+        if path == "/api/projects/batch-update":
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            raw_ids = payload.get("project_ids")
+            if not isinstance(raw_ids, list) or not raw_ids:
+                return self._send_json(400, {"error": "请至少选择一个项目"})
+            pid_list = [str(x).strip() for x in raw_ids if _is_safe_segment(str(x).strip())]
+            dept = str(payload["department"]) if "department" in payload and payload["department"] is not None else None
+            owner = str(payload["owner"]) if "owner" in payload and payload["owner"] is not None else None
+            owner_mode = str(payload.get("owner_mode") or "replace").strip()
+            managed_csv = _managed_projects_csv(self.cfg["output_dir"])
+            try:
+                res = db.batch_update_projects_meta(
+                    pid_list,
+                    department=dept,
+                    owner=owner,
+                    owner_mode=owner_mode,
+                    managed_csv=managed_csv,
+                )
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            db.record_audit(
+                cur_user,
+                "batch_update_projects_meta",
+                target=f"{res['updated']}个项目",
+                detail={"department": dept, "owner": owner, "owner_mode": owner_mode},
+                client_ip=client_ip,
+            )
+            return self._send_json(200, res)
+
+        if path == "/api/issues/triage":
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            pid = str(payload.get("project_id") or "").strip()
+            if not pid or not _is_safe_segment(pid):
+                return self._send_json(400, {"error": "无效的 project_id"})
+            allowed_pids = _allowed_pids_for_user(cur_user, _effective_projects_csv(self.cfg), db=db)
+            if allowed_pids is not None and pid not in allowed_pids:
+                return self._send_json(403, {"error": "无权操作非本人负责项目的问题状态"})
+            fp = str(payload.get("fingerprint") or "").strip()
+            if not fp:
+                fp = platform_db.compute_issue_fingerprint(
+                    str(payload.get("item_id") or ""),
+                    str(payload.get("title") or ""),
+                    str(payload.get("evidence_text") or ""),
+                )
+            try:
+                saved = db.upsert_issue_triage(
+                    project_id=pid,
+                    fingerprint=fp,
+                    status=str(payload.get("status") or "open"),
+                    reason=str(payload.get("reason") or ""),
+                    item_id=str(payload.get("item_id") or ""),
+                    level=str(payload.get("level") or ""),
+                    title=str(payload.get("title") or ""),
+                    evidence_text=str(payload.get("evidence_text") or ""),
+                    actor=cur_user,
+                )
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            db.record_audit(
+                cur_user,
+                "triage_issue",
+                target=f"{pid}:{saved['item_id'] or fp}",
+                detail={"status": saved["status"], "reason": saved["reason"][:120]},
+                client_ip=client_ip,
+            )
+            return self._send_json(200, {"triage": saved})
+
         if path == "/api/projects/probe-all":
             if not self._require_role(cur_user, ("superadmin", "admin")):
                 return
@@ -2923,6 +3254,41 @@ class AuditHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return self._send_json(400, {"error": str(exc)})
             return self._send_json(404, {"error": "未知的 Git 账号操作"})
+
+        if path == "/api/ops/storage/cleanup":
+            if not self._require_role(cur_user, ("superadmin",)):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            action = str(payload.get("action") or "").strip()
+            try:
+                if action == "clean_inactive_repos":
+                    result = _cleanup_inactive_repos(self.cfg["output_dir"], self.cfg["settings_path"], db)
+                    db.record_audit(cur_user, "cleanup_inactive_repos", target=f"{result['removed_count']}个仓库",
+                                    detail={"freed_bytes": result["freed_bytes"]}, client_ip=client_ip)
+                elif action == "prune_runs":
+                    policy = db.get_retention_policy()
+                    kd = int(payload.get("keep_days", policy["keep_days"]))
+                    kl = int(payload.get("keep_latest", policy["keep_latest"]))
+                    result = _prune_old_runs(self.cfg["output_dir"], kd, kl)
+                    db.record_audit(cur_user, "prune_old_runs", target=f"{result['removed_count']}个批次",
+                                    detail={"keep_days": kd, "keep_latest": kl, "freed_bytes": result["freed_bytes"]},
+                                    client_ip=client_ip)
+                elif action == "save_policy":
+                    saved_policy = db.set_retention_policy(
+                        int(payload.get("keep_days", 90)),
+                        int(payload.get("keep_latest", 30)),
+                    )
+                    result = {"retention_policy": saved_policy}
+                    db.record_audit(cur_user, "update_retention_policy", target="storage_retention_policy",
+                                    detail=saved_policy, client_ip=client_ip)
+                else:
+                    return self._send_json(400, {"error": "未知的存储操作类型"})
+            except (ValueError, TypeError) as exc:
+                return self._send_json(400, {"error": str(exc)})
+            overview_st = _build_storage_overview(self.cfg["output_dir"], self.cfg["settings_path"], db)
+            return self._send_json(200, {"result": result, "storage": overview_st})
 
         # SMTP 邮件投递配置（仅 superadmin）
         if path == "/api/ops/smtp":

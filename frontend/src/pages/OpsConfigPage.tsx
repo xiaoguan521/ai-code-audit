@@ -2,6 +2,9 @@ import { FormEvent, useEffect, useState } from "react";
 import {
   Check,
   Cpu,
+  Database,
+  Download,
+  HardDrive,
   KeyRound,
   Mail,
   Plus,
@@ -21,10 +24,24 @@ import type {
   OpsConfigResponse,
   OpsRuntimeConfig,
   SmtpConfig,
+  StorageOverview,
 } from "../types";
 
+function formatBytes(bytes: number | null | undefined): string {
+  const b = Number(bytes || 0);
+  if (b <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let idx = 0;
+  let val = b;
+  while (val >= 1024 && idx < units.length - 1) {
+    val /= 1024;
+    idx += 1;
+  }
+  return `${val >= 100 ? val.toFixed(0) : val.toFixed(1)} ${units[idx]}`;
+}
+
 export function OpsConfigPage() {
-  const [tab, setTab] = useState<"model" | "runtime" | "git" | "smtp">("model");
+  const [tab, setTab] = useState<"model" | "runtime" | "git" | "smtp" | "storage">("model");
   const [cfg, setCfg] = useState<OpsConfigResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -64,6 +81,13 @@ export function OpsConfigPage() {
   const [testingSmtp, setTestingSmtp] = useState(false);
   const [emailLogs, setEmailLogs] = useState<EmailLogEntry[]>([]);
 
+  // 存储观测、清理与热备份
+  const [storage, setStorage] = useState<StorageOverview | null>(null);
+  const [keepDaysInput, setKeepDaysInput] = useState("90");
+  const [keepLatestInput, setKeepLatestInput] = useState("30");
+  const [storageConfirm, setStorageConfirm] = useState<"clean_inactive_repos" | "prune_runs" | null>(null);
+  const [downloadingBackup, setDownloadingBackup] = useState(false);
+
   const hydrate = (res: OpsConfigResponse) => {
     setCfg(res);
     setBaseUrl(res.model.OPENAI_BASE_URL || "");
@@ -81,15 +105,21 @@ export function OpsConfigPage() {
     setLoading(true);
     setError(null);
     try {
-      const [res, smtpRes, logRes] = await Promise.all([
+      const [res, smtpRes, logRes, storageRes] = await Promise.all([
         api.opsConfig(),
         api.smtpConfig(),
         api.emailLogs(100),
+        api.opsStorage().catch(() => null),
       ]);
       hydrate(res);
       setSmtp(smtpRes.smtp);
       setSmtpPassword("");
       setEmailLogs(logRes.logs);
+      if (storageRes) {
+        setStorage(storageRes);
+        setKeepDaysInput(String(storageRes.retention_policy.keep_days));
+        setKeepLatestInput(String(storageRes.retention_policy.keep_latest));
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载运维配置失败");
     } finally {
@@ -309,6 +339,74 @@ export function OpsConfigPage() {
     }
   };
 
+  const handleSaveRetentionPolicy = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.opsStorageCleanup({
+        action: "save_policy",
+        keep_days: Number(keepDaysInput),
+        keep_latest: Number(keepLatestInput),
+      });
+      setStorage(res.storage);
+      setNotice(
+        `历史保留策略已保存：保留最近 ${res.storage.retention_policy.keep_days} 天且至少保留 ${res.storage.retention_policy.keep_latest} 个批次`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存保留策略失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleConfirmStorageCleanup = async () => {
+    if (!storageConfirm) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.opsStorageCleanup({
+        action: storageConfirm,
+        keep_days: Number(keepDaysInput),
+        keep_latest: Number(keepLatestInput),
+      });
+      setStorage(res.storage);
+      setStorageConfirm(null);
+      const r = res.result as { removed_count?: number; freed_bytes?: number; skipped_protected?: number };
+      if (storageConfirm === "clean_inactive_repos") {
+        setNotice(
+          `残留仓库清理完成：共移除 ${r.removed_count ?? 0} 个目录，释放空间 ${formatBytes(r.freed_bytes)}`
+        );
+      } else {
+        setNotice(
+          `过期批次清理完成：共清理 ${r.removed_count ?? 0} 个批次，释放空间 ${formatBytes(r.freed_bytes)}${
+            r.skipped_protected ? `（自动跳过 ${r.skipped_protected} 个基线引用批次）` : ""
+          }`
+        );
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "存储清理失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDownloadDbBackup = async () => {
+    setDownloadingBackup(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await api.downloadDbBackup();
+      setNotice("已生成并下载 SQLite 一致性在线热备份（platform.db）");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "下载数据库热备份失败");
+    } finally {
+      setDownloadingBackup(false);
+    }
+  };
+
   return (
     <div style={{ display: "grid", gap: 14 }}>
       {error && (
@@ -352,6 +450,13 @@ export function OpsConfigPage() {
               onClick={() => setTab("smtp")}
             >
               <Mail size={14} /> 邮件投递 (SMTP)
+            </button>
+            <button
+              type="button"
+              className={`btn ${tab === "storage" ? "btn-primary" : ""}`}
+              onClick={() => setTab("storage")}
+            >
+              <HardDrive size={14} /> 存储与热备份
             </button>
           </div>
           <button type="button" className="btn" disabled={loading} onClick={() => void loadData()}>
@@ -930,24 +1035,207 @@ export function OpsConfigPage() {
             </div>
           </div>
         )}
+        {/* 5. 存储占用、清理策略与数据库在线热备份 */}
+        {tab === "storage" && (
+          <div style={{ display: "grid", gap: 18 }}>
+            {storage ? (
+              <>
+                <div style={{ display: "grid", gap: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                    <span style={{ fontWeight: 600, fontSize: 13.5 }}>宿主机数据卷磁盘容量</span>
+                    <span className="muted" style={{ fontSize: 12.5 }}>
+                      已用 <b>{formatBytes(storage.disk.used_bytes)}</b> / 总计{" "}
+                      <b>{formatBytes(storage.disk.total_bytes)}</b>（可用 {formatBytes(storage.disk.free_bytes)}，使用率{" "}
+                      <b
+                        style={{
+                          color:
+                            storage.disk.used_percent >= 85
+                              ? "var(--critical)"
+                              : storage.disk.used_percent >= 70
+                                ? "var(--warning)"
+                                : "var(--good)",
+                        }}
+                      >
+                        {storage.disk.used_percent}%
+                      </b>
+                      ）
+                    </span>
+                  </div>
+                  <div className="progress-track" style={{ height: 10 }}>
+                    <div
+                      className={`progress-fill ${
+                        storage.disk.used_percent >= 85 ? "warn" : storage.disk.used_percent < 70 ? "done" : ""
+                      }`}
+                      style={{
+                        width: `${Math.min(100, storage.disk.used_percent)}%`,
+                        background: storage.disk.used_percent >= 85 ? "var(--critical)" : undefined,
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div className="tiles">
+                  <div className="card">
+                    <div className="tile-label">本地代码副本 (workdir)</div>
+                    <div className="tile-value">{formatBytes(storage.directories.workdir.bytes)}</div>
+                    <div className="tile-note">可回收残留 {storage.reclaimable_repos.count} 个（{formatBytes(storage.reclaimable_repos.total_bytes)}）</div>
+                  </div>
+                  <div className="card">
+                    <div className="tile-label">报告与批次产物</div>
+                    <div className="tile-value">
+                      {formatBytes(storage.directories.reports.bytes + storage.directories.results.bytes)}
+                    </div>
+                    <div className="tile-note">
+                      共 {storage.runs_summary.total_runs} 个批次
+                      {storage.runs_summary.oldest_date ? `（最早 ${storage.runs_summary.oldest_date}）` : ""}
+                    </div>
+                  </div>
+                  <div className="card">
+                    <div className="tile-label">运行日志 (logs)</div>
+                    <div className="tile-value">{formatBytes(storage.directories.logs.bytes)}</div>
+                    <div className="tile-note">扫描过程标准输出与诊断日志</div>
+                  </div>
+                  <div className="card">
+                    <div className="tile-label">管理端数据库 (platform.db)</div>
+                    <div className="tile-value">{formatBytes(storage.directories.platform_db.bytes)}</div>
+                    <div className="tile-note">含用户、项目、豁免记录与凭据</div>
+                  </div>
+                </div>
+
+                {/* 数据库在线热备份 */}
+                <div
+                  className="card"
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: 12,
+                  }}
+                >
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: 13.5, display: "inline-flex", alignItems: "center", gap: 6 }}>
+                      <Database size={15} /> 管理端数据库在线热备份
+                    </div>
+                    <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                      基于 SQLite 在线 <code>backup()</code> API 生成一致性快照（WAL 安全、不锁表、不中断扫描），可用于服务器迁移或定期归档。
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    disabled={downloadingBackup}
+                    onClick={() => void handleDownloadDbBackup()}
+                  >
+                    <Download size={14} /> {downloadingBackup ? "正在生成快照…" : "下载 platform.db 热备份"}
+                  </button>
+                </div>
+
+                {/* 可清理残留本地仓库 */}
+                <div className="card" style={{ display: "grid", gap: 10 }}>
+                  <div className="card-title" style={{ marginBottom: 0 }}>
+                    <span>
+                      可清理的残留本地仓库（{storage.reclaimable_repos.count} 个 ·{" "}
+                      {formatBytes(storage.reclaimable_repos.total_bytes)}）
+                    </span>
+                    <button
+                      type="button"
+                      className="btn btn-danger"
+                      disabled={busy || storage.scan_running || storage.reclaimable_repos.count === 0}
+                      title={storage.scan_running ? "扫描进行中暂不可清理" : "清理已停用/已归档/已移除项目的本地代码目录"}
+                      onClick={() => setStorageConfirm("clean_inactive_repos")}
+                    >
+                      <Trash2 size={13} /> 一键清理残留仓库
+                    </button>
+                  </div>
+                  <div className="sub">
+                    仅清理状态为「停用 / 归档」或已从项目清册移除的本地克隆目录，绝不触碰「在研」项目目录及历史报告。
+                  </div>
+                  {storage.reclaimable_repos.items.length > 0 && (
+                    <div className="table-wrap" style={{ maxHeight: 220 }}>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>项目 ID</th>
+                            <th>判定原因</th>
+                            <th className="num">占用空间</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {storage.reclaimable_repos.items.map((it) => (
+                            <tr key={it.project_id}>
+                              <td>
+                                <code>{it.project_id}</code>
+                              </td>
+                              <td>{it.reason}</td>
+                              <td className="num">{formatBytes(it.size_bytes)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+
+                {/* 历史批次保留策略与清理 */}
+                <form className="card" onSubmit={(e) => void handleSaveRetentionPolicy(e)} style={{ display: "grid", gap: 10 }}>
+                  <div className="card-title" style={{ marginBottom: 0 }}>
+                    <span>历史批次保留策略与过期清理</span>
+                    <button
+                      type="button"
+                      className="btn btn-danger"
+                      disabled={busy || storage.scan_running}
+                      onClick={() => setStorageConfirm("prune_runs")}
+                    >
+                      <Trash2 size={13} /> 按策略立即清理过期批次
+                    </button>
+                  </div>
+                  <div className="sub">
+                    同时满足「超过保留天数」且「不在最近 N 个批次内」的历史批次才会被清理，且自动保护各项目最新基线引用的批次。
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 10, maxWidth: 540 }}>
+                    <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+                      <span className="muted">保留天数（7–3650 天）</span>
+                      <input
+                        type="number"
+                        min={7}
+                        max={3650}
+                        value={keepDaysInput}
+                        onChange={(e) => setKeepDaysInput(e.target.value)}
+                      />
+                    </label>
+                    <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+                      <span className="muted">最少保留批次数（5–500）</span>
+                      <input
+                        type="number"
+                        min={5}
+                        max={500}
+                        value={keepLatestInput}
+                        onChange={(e) => setKeepLatestInput(e.target.value)}
+                      />
+                    </label>
+                  </div>
+                  <div>
+                    <button type="submit" className="btn" disabled={busy}>
+                      <Check size={14} /> 保存保留策略
+                    </button>
+                  </div>
+                </form>
+              </>
+            ) : (
+              <div className="muted" style={{ padding: 20, textAlign: "center" }}>
+                正在加载存储统计信息…
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* 新增 / 编辑 Git 凭据弹窗 */}
       {gitModal && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.5)",
-            display: "grid",
-            placeItems: "center",
-            padding: 20,
-            zIndex: 60,
-          }}
-          onClick={() => setGitModal(null)}
-        >
+        <div className="modal-backdrop" onClick={() => setGitModal(null)}>
           <form
-            className="card"
+            className="modal-dialog"
             style={{ width: "min(480px, 95vw)", display: "grid", gap: 10 }}
             onClick={(e) => e.stopPropagation()}
             onSubmit={(e) => void handleSaveGit(e)}
@@ -1004,6 +1292,26 @@ export function OpsConfigPage() {
           </form>
         </div>
       )}
+      <ConfirmDialog
+        open={Boolean(storageConfirm)}
+        tone="danger"
+        title={
+          storageConfirm === "clean_inactive_repos"
+            ? `确认清理 ${storage?.reclaimable_repos.count ?? 0} 个残留本地仓库？`
+            : "确认按保留策略清理过期历史批次？"
+        }
+        description={
+          storageConfirm === "clean_inactive_repos"
+            ? `预计释放磁盘空间 ${formatBytes(storage?.reclaimable_repos.total_bytes)}。如未来重新启用这些项目，下次扫描时会自动重新克隆。`
+            : `将删除超过 ${keepDaysInput} 天且不在最近 ${keepLatestInput} 个批次内的历史结果与报告文件。`
+        }
+        footnote="安全保护：不会删除在研项目仓库，也不会删除任何项目最新基线正在引用的历史批次。"
+        confirmLabel={storageConfirm === "clean_inactive_repos" ? "确认清理仓库" : "确认清理批次"}
+        busy={busy}
+        onConfirm={() => void handleConfirmStorageCleanup()}
+        onCancel={() => setStorageConfirm(null)}
+      />
+
       <ConfirmDialog
         open={Boolean(deleteGitTarget)}
         tone="danger"

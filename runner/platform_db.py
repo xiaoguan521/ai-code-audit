@@ -30,6 +30,7 @@ except ImportError:
 
 ROLES = ("superadmin", "admin", "user")
 EMAIL_NOTIFY_MODES = ("batch", "risk_only", "off")
+ISSUE_TRIAGE_STATUSES = ("open", "planned", "fixed", "exempted")
 SESSION_TTL_SEC = 24 * 3600
 PROMPT_KEYS = ("skill_md", "dispatch_extra", "summary_prompt")
 PROMPT_FILENAMES = {
@@ -532,6 +533,21 @@ class PlatformDB:
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_email_logs_created ON email_logs(id DESC);
+                CREATE TABLE IF NOT EXISTS issue_triages (
+                    project_id TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    item_id TEXT NOT NULL DEFAULT '',
+                    level TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '',
+                    evidence_text TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'open',
+                    reason TEXT NOT NULL DEFAULT '',
+                    updated_by TEXT NOT NULL DEFAULT '',
+                    updated_role TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (project_id, fingerprint)
+                );
+                CREATE INDEX IF NOT EXISTS idx_issue_triages_project ON issue_triages(project_id, status);
                 """
             )
             # 兼容已有数据库：为 projects 表补齐 VCS 类型与 Git/SVN 连通性巡检字段
@@ -1124,6 +1140,205 @@ class PlatformDB:
         if managed_csv is not None and existing:
             self.export_projects_csv(managed_csv)
         return {"updated": len(existing), "status": target_status, "project_ids": existing}
+
+    def batch_update_projects_meta(
+        self,
+        project_ids: list[str],
+        *,
+        department: str | None = None,
+        owner: str | None = None,
+        owner_mode: str = "replace",
+        managed_csv: Path | None = None,
+    ) -> dict:
+        """原子批量调整项目所属部门和/或负责人（支持替换、追加、移除）。"""
+        if owner_mode not in ("replace", "append", "remove"):
+            raise ValueError("owner_mode 必须是 replace、append 或 remove")
+        clean_ids = list(dict.fromkeys(str(x).strip() for x in project_ids if str(x).strip()))
+        if not clean_ids:
+            raise ValueError("请至少选择一个项目")
+        set_dept = department is not None
+        set_owner = owner is not None
+        if not set_dept and not set_owner:
+            raise ValueError("请至少指定要修改的部门或负责人")
+        dept_val = (department or "").strip()[:100]
+        owner_tokens = [s.strip() for s in re.split(r"[、,，/;；]+", (owner or "").strip()) if s.strip()]
+        if set_owner and owner_mode in ("append", "remove") and not owner_tokens:
+            raise ValueError("追加或移除模式必须填写负责人姓名")
+
+        now = _now_iso()
+        placeholders = ",".join("?" for _ in clean_ids)
+        updated_ids: list[str] = []
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT project_id, department, owner FROM projects WHERE project_id IN ({placeholders})",
+                clean_ids,
+            ).fetchall()
+            for r in rows:
+                pid = r["project_id"]
+                new_dept = dept_val if set_dept else (r["department"] or "")
+                new_owner = r["owner"] or ""
+                if set_owner:
+                    if owner_mode == "replace":
+                        new_owner = "、".join(dict.fromkeys(owner_tokens))
+                    else:
+                        cur_list = [s.strip() for s in re.split(r"[、,，/;；]+", new_owner) if s.strip()]
+                        if owner_mode == "append":
+                            merged = list(dict.fromkeys([*cur_list, *owner_tokens]))
+                            new_owner = "、".join(merged)
+                        elif owner_mode == "remove":
+                            rem_set = set(owner_tokens)
+                            new_owner = "、".join([x for x in cur_list if x not in rem_set])
+                conn.execute(
+                    "UPDATE projects SET department = ?, owner = ?, updated_at = ? WHERE project_id = ?",
+                    (new_dept, new_owner, now, pid),
+                )
+                updated_ids.append(pid)
+        if managed_csv is not None and updated_ids:
+            self.export_projects_csv(managed_csv)
+        return {"updated": len(updated_ids), "project_ids": updated_ids}
+
+    def list_project_triages(self, project_id: str) -> dict[str, dict]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM issue_triages WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+            return {
+                r["fingerprint"]: {
+                    "project_id": r["project_id"],
+                    "fingerprint": r["fingerprint"],
+                    "item_id": r["item_id"],
+                    "level": r["level"],
+                    "title": r["title"],
+                    "evidence_text": r["evidence_text"],
+                    "status": r["status"],
+                    "reason": r["reason"],
+                    "updated_by": r["updated_by"],
+                    "updated_role": r["updated_role"],
+                    "updated_at": r["updated_at"],
+                }
+                for r in rows
+            }
+
+    def count_exempted_by_project(self) -> dict[str, int]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT project_id, COUNT(*) AS cnt FROM issue_triages WHERE status = 'exempted' GROUP BY project_id"
+            ).fetchall()
+            return {r["project_id"]: int(r["cnt"]) for r in rows}
+
+    def upsert_issue_triage(
+        self,
+        *,
+        project_id: str,
+        fingerprint: str,
+        status: str,
+        reason: str = "",
+        item_id: str = "",
+        level: str = "",
+        title: str = "",
+        evidence_text: str = "",
+        actor: dict | None = None,
+    ) -> dict:
+        st = (status or "open").strip().lower()
+        if st not in ISSUE_TRIAGE_STATUSES:
+            raise ValueError(f"处置状态仅支持 {' / '.join(ISSUE_TRIAGE_STATUSES)}")
+        fp = (fingerprint or "").strip()
+        if not fp or len(fp) > 64:
+            raise ValueError("无效的问题指纹")
+        rs = (reason or "").strip()[:500]
+        if st == "exempted" and not rs:
+            raise ValueError("标记为「误报 / 风险豁免」时必须填写豁免原因")
+        now = _now_iso()
+        actor_name = (actor or {}).get("display_name") or (actor or {}).get("username") or "system"
+        actor_role = (actor or {}).get("role") or ""
+        with self._lock, self._connect() as conn:
+            if st == "open" and not rs:
+                conn.execute(
+                    "DELETE FROM issue_triages WHERE project_id = ? AND fingerprint = ?",
+                    (project_id, fp),
+                )
+                return {
+                    "project_id": project_id,
+                    "fingerprint": fp,
+                    "item_id": item_id,
+                    "level": level,
+                    "title": title,
+                    "evidence_text": evidence_text,
+                    "status": "open",
+                    "reason": "",
+                    "updated_by": actor_name,
+                    "updated_role": actor_role,
+                    "updated_at": now,
+                }
+            conn.execute(
+                """
+                INSERT INTO issue_triages (
+                    project_id, fingerprint, item_id, level, title, evidence_text,
+                    status, reason, updated_by, updated_role, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, fingerprint) DO UPDATE SET
+                    item_id = excluded.item_id,
+                    level = excluded.level,
+                    title = excluded.title,
+                    evidence_text = excluded.evidence_text,
+                    status = excluded.status,
+                    reason = excluded.reason,
+                    updated_by = excluded.updated_by,
+                    updated_role = excluded.updated_role,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    project_id, fp, item_id[:40], level[:16], title[:240], evidence_text[:300],
+                    st, rs, actor_name[:80], actor_role[:32], now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM issue_triages WHERE project_id = ? AND fingerprint = ?",
+                (project_id, fp),
+            ).fetchone()
+            assert row is not None
+            return dict(row)
+
+    def get_retention_policy(self) -> dict[str, int]:
+        raw = self.get_setting("storage_retention_policy")
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    days = max(7, min(3650, int(data.get("keep_days", 90))))
+                    runs = max(5, min(500, int(data.get("keep_latest", 30))))
+                    return {"keep_days": days, "keep_latest": runs}
+            except (ValueError, TypeError):
+                pass
+        return {"keep_days": 90, "keep_latest": 30}
+
+    def set_retention_policy(self, keep_days: int, keep_latest: int) -> dict[str, int]:
+        days = int(keep_days)
+        runs = int(keep_latest)
+        if days < 7 or days > 3650:
+            raise ValueError("保留天数必须在 7 到 3650 之间")
+        if runs < 5 or runs > 500:
+            raise ValueError("最少保留批次数必须在 5 到 500 之间")
+        policy = {"keep_days": days, "keep_latest": runs}
+        self.set_setting("storage_retention_policy", json.dumps(policy, ensure_ascii=False))
+        return policy
+
+    def create_hot_backup(self, dest_path: Path) -> int:
+        """使用 SQLite 在线 backup API 生成一致性热备份（不阻塞读写，WAL 安全）。"""
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock, self._connect() as src:
+            dst = sqlite3.connect(str(dest_path), timeout=30.0)
+            try:
+                src.backup(dst)
+                dst.commit()
+            finally:
+                dst.close()
+        try:
+            os.chmod(dest_path, 0o600)
+        except OSError:
+            pass
+        return dest_path.stat().st_size
 
     def delete_project(self, project_id: str, *, managed_csv: Path | None = None) -> dict:
         with self._lock, self._connect() as conn:
@@ -1762,6 +1977,18 @@ def test_openai_endpoint(base_url: str, model: str, api_key: str, timeout_sec: i
             "has_thinking": False,
             "error": f"{type(exc).__name__}: {exc}",
         }
+
+
+def compute_issue_fingerprint(item_id: str, title: str, evidence_text: str = "") -> str:
+    """为报告中的风险问题生成跨批次稳定指纹（忽略行号偏移，便于持续匹配豁免与整改状态）。"""
+    norm_item = (item_id or "").strip().lower()
+    norm_title = re.sub(r"\s+", " ", (title or "").strip().lower())
+    # 提取证据中的文件路径部分并去掉 :line-line 行号偏移
+    ev = (evidence_text or "").strip().lower()
+    ev = re.sub(r":\d+(?:-\d+)?", "", ev)
+    ev = re.sub(r"\s+", " ", ev)[:160]
+    raw = f"{norm_item}|{norm_title}|{ev}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def validate_git_url(raw_url: str, vcs_type: str = "git") -> str:

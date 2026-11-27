@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
-import { Check, ChevronLeft, ChevronRight, Download, FileText, Link2, Printer, RefreshCw } from "lucide-react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
+import { Check, ChevronLeft, ChevronRight, Download, FileText, Link2, Printer, RefreshCw, ShieldCheck } from "lucide-react";
 import { api } from "../api";
-import type { AuthUser, ReportResponse, RunDetailResponse, RunSummary } from "../types";
+import type { AuthUser, IssueTriageStatus, ReportIssue, ReportResponse, RunDetailResponse, RunSummary } from "../types";
 import {
   downloadBlob,
   downloadMarkdown,
@@ -10,6 +10,13 @@ import {
   renderMarkdownWithToc,
   type TocItem,
 } from "../utils/markdown";
+
+const TRIAGE_META: Record<IssueTriageStatus, { label: string; color: string }> = {
+  open: { label: "待整改", color: "var(--critical)" },
+  planned: { label: "已排期", color: "var(--accent)" },
+  fixed: { label: "已修复待复核", color: "var(--good)" },
+  exempted: { label: "已豁免 / 误报", color: "var(--text-3)" },
+};
 
 function csvCell(v: string): string {
   const s = String(v ?? "");
@@ -37,9 +44,16 @@ export function ReportsPage({ currentUser, initialTarget, onTargetChange }: Prop
   const [exportBusy, setExportBusy] = useState(false);
 
   const [levelFilter, setLevelFilter] = useState("");
+  const [triageFilter, setTriageFilter] = useState("");
   const [issueQuery, setIssueQuery] = useState("");
   const [projectSearch, setProjectSearch] = useState("");
   const [tab, setTab] = useState<"markdown" | "issues">("markdown");
+
+  // 问题处置 / 误报豁免弹窗
+  const [triageTarget, setTriageTarget] = useState<ReportIssue | null>(null);
+  const [triageStatusInput, setTriageStatusInput] = useState<IssueTriageStatus>("planned");
+  const [triageReasonInput, setTriageReasonInput] = useState("");
+  const [triageBusy, setTriageBusy] = useState(false);
 
   useEffect(() => {
     if (initialTarget) {
@@ -102,12 +116,54 @@ export function ReportsPage({ currentUser, initialTarget, onTargetChange }: Prop
   const filteredIssues = useMemo(() => {
     const list = report?.issues ?? [];
     const q = issueQuery.trim().toLowerCase();
-    return list.filter(
-      (i) =>
-        (!levelFilter || i.level === levelFilter) &&
-        (!q || `${i.issue_id} ${i.item_id} ${i.title} ${i.evidence_text} ${i.suggestion}`.toLowerCase().includes(q))
-    );
-  }, [report?.issues, levelFilter, issueQuery]);
+    return list.filter((i) => {
+      const st = i.triage_status || "open";
+      if (levelFilter && i.level !== levelFilter) return false;
+      if (triageFilter === "active" && st === "exempted") return false;
+      if (triageFilter && triageFilter !== "active" && st !== triageFilter) return false;
+      if (
+        q &&
+        !`${i.issue_id} ${i.item_id} ${i.title} ${i.evidence_text} ${i.suggestion} ${i.triage_reason || ""}`
+          .toLowerCase()
+          .includes(q)
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }, [report?.issues, levelFilter, triageFilter, issueQuery]);
+
+  const openTriageModal = (issue: ReportIssue) => {
+    setTriageTarget(issue);
+    setTriageStatusInput(issue.triage_status || "planned");
+    setTriageReasonInput(issue.triage_reason || "");
+  };
+
+  const handleSaveTriage = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!triageTarget || !report?.project_id) return;
+    setTriageBusy(true);
+    setError(null);
+    try {
+      await api.triageIssue({
+        project_id: report.project_id,
+        fingerprint: triageTarget.fingerprint,
+        item_id: triageTarget.item_id,
+        level: triageTarget.level,
+        title: triageTarget.title,
+        evidence_text: triageTarget.evidence_text,
+        status: triageStatusInput,
+        reason: triageReasonInput.trim(),
+      });
+      setTriageTarget(null);
+      const refreshed = await api.report(date, runId, target);
+      setReport(refreshed);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存问题处置状态失败");
+    } finally {
+      setTriageBusy(false);
+    }
+  };
 
   const okProjects = (runDetail?.projects ?? []).filter((p) => p.status === "ok");
   const visibleProjects = useMemo(() => {
@@ -182,11 +238,22 @@ export function ReportsPage({ currentUser, initialTarget, onTargetChange }: Prop
 
   const handleExportIssuesCsv = () => {
     if (!report?.issues) return;
-    const header = ["ID", "等级", "检查项", "问题标题", "证据", "影响", "修复建议", "工作量"];
+    const header = ["ID", "等级", "检查项", "处置状态", "处置说明", "问题标题", "证据", "影响", "修复建议", "工作量"];
     const lines = [
       header.join(","),
       ...filteredIssues.map((i) =>
-        [i.issue_id, i.level, i.item_id, i.title, i.evidence_text, i.impact, i.suggestion, i.effort]
+        [
+          i.issue_id,
+          i.level,
+          i.item_id,
+          TRIAGE_META[i.triage_status || "open"].label,
+          i.triage_reason || "",
+          i.title,
+          i.evidence_text,
+          i.impact,
+          i.suggestion,
+          i.effort,
+        ]
           .map(csvCell)
           .join(",")
       ),
@@ -323,8 +390,13 @@ export function ReportsPage({ currentUser, initialTarget, onTargetChange }: Prop
               {report.scores?.security_score != null ? report.scores.security_score.toFixed(1) : "—"}
             </span>
             <span className="sub">
-              P0 {report.issue_counts?.P0 ?? 0} / P1 {report.issue_counts?.P1 ?? 0} / P2{" "}
-              {report.issue_counts?.P2 ?? 0} / P3 {report.issue_counts?.P3 ?? 0}
+              有效问题：P0 {report.effective_issue_counts?.P0 ?? report.issue_counts?.P0 ?? 0} / P1{" "}
+              {report.effective_issue_counts?.P1 ?? report.issue_counts?.P1 ?? 0} / P2{" "}
+              {report.effective_issue_counts?.P2 ?? report.issue_counts?.P2 ?? 0} / P3{" "}
+              {report.effective_issue_counts?.P3 ?? report.issue_counts?.P3 ?? 0}
+              {(report.triage_summary?.exempted ?? 0) > 0 && (
+                <> · 已豁免 {report.triage_summary!.exempted} 条</>
+              )}
             </span>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: "4px 20px" }}>
@@ -350,7 +422,7 @@ export function ReportsPage({ currentUser, initialTarget, onTargetChange }: Prop
 
       {report && tab === "issues" && report.type === "project" ? (
         <div className="card">
-          <div className="filters no-print">
+          <div className="filters no-print" style={{ alignItems: "center" }}>
             <select value={levelFilter} onChange={(e) => setLevelFilter(e.target.value)}>
               <option value="">全部等级</option>
               <option value="P0">P0</option>
@@ -358,12 +430,26 @@ export function ReportsPage({ currentUser, initialTarget, onTargetChange }: Prop
               <option value="P2">P2</option>
               <option value="P3">P3</option>
             </select>
+            <select value={triageFilter} onChange={(e) => setTriageFilter(e.target.value)}>
+              <option value="">全部处置状态</option>
+              <option value="active">排除已豁免（仅看有效问题）</option>
+              <option value="open">待整改 ({report.triage_summary?.open ?? 0})</option>
+              <option value="planned">已排期 ({report.triage_summary?.planned ?? 0})</option>
+              <option value="fixed">已修复待复核 ({report.triage_summary?.fixed ?? 0})</option>
+              <option value="exempted">已豁免 / 误报 ({report.triage_summary?.exempted ?? 0})</option>
+            </select>
             <input
-              placeholder="搜索问题标题 / 检查项 / 文件路径 / 建议"
+              placeholder="搜索问题标题 / 检查项 / 文件路径 / 建议 / 豁免说明"
               value={issueQuery}
               onChange={(e) => setIssueQuery(e.target.value)}
-              style={{ minWidth: 280 }}
+              style={{ minWidth: 260, flex: "1 1 240px" }}
             />
+            {report.triage_summary && (
+              <span className="muted" style={{ fontSize: 12, marginLeft: "auto" }}>
+                待整改 <b>{report.triage_summary.open}</b> · 已排期 <b>{report.triage_summary.planned}</b> · 已修复{" "}
+                <b>{report.triage_summary.fixed}</b> · 已豁免 <b>{report.triage_summary.exempted}</b>
+              </span>
+            )}
           </div>
           <div className="table-wrap">
             <table>
@@ -372,31 +458,65 @@ export function ReportsPage({ currentUser, initialTarget, onTargetChange }: Prop
                   <th>ID</th>
                   <th>等级</th>
                   <th>检查项</th>
+                  <th>处置状态</th>
                   <th>问题标题</th>
                   <th>证据</th>
                   <th>修复建议</th>
                   <th>工作量</th>
+                  <th className="no-print">操作</th>
                 </tr>
               </thead>
               <tbody>
-                {filteredIssues.map((i) => (
-                  <tr key={`${i.issue_id}-${i.item_id}`}>
-                    <td>{i.issue_id}</td>
-                    <td>
-                      <span className={`lv-badge lv-${i.level}`}>{i.level}</span>
-                    </td>
-                    <td>{i.item_id}</td>
-                    <td style={{ whiteSpace: "normal", minWidth: 200 }}>{i.title}</td>
-                    <td style={{ whiteSpace: "normal", minWidth: 180 }} className="sub">
-                      {i.evidence_text || "—"}
-                    </td>
-                    <td style={{ whiteSpace: "normal", minWidth: 240 }}>{i.suggestion || "—"}</td>
-                    <td>{i.effort || "—"}</td>
-                  </tr>
-                ))}
+                {filteredIssues.map((i) => {
+                  const st = i.triage_status || "open";
+                  const meta = TRIAGE_META[st];
+                  return (
+                    <tr
+                      key={`${i.issue_id}-${i.item_id}-${i.fingerprint || ""}`}
+                      style={{ opacity: st === "exempted" ? 0.62 : 1 }}
+                    >
+                      <td>{i.issue_id}</td>
+                      <td>
+                        <span className={`lv-badge lv-${i.level}`}>{i.level}</span>
+                      </td>
+                      <td>{i.item_id}</td>
+                      <td style={{ whiteSpace: "normal", minWidth: 118 }}>
+                        <span
+                          className="chip"
+                          style={{ borderColor: meta.color, color: meta.color, fontSize: 11.5 }}
+                          title={i.triage_reason || undefined}
+                        >
+                          {meta.label}
+                        </span>
+                        {i.triage_reason && (
+                          <div className="muted" style={{ fontSize: 11, marginTop: 3, lineHeight: 1.35 }}>
+                            {i.triage_reason.slice(0, 50)}
+                            {i.triage_reason.length > 50 ? "…" : ""}
+                          </div>
+                        )}
+                      </td>
+                      <td style={{ whiteSpace: "normal", minWidth: 200 }}>{i.title}</td>
+                      <td style={{ whiteSpace: "normal", minWidth: 180 }} className="sub">
+                        {i.evidence_text || "—"}
+                      </td>
+                      <td style={{ whiteSpace: "normal", minWidth: 230 }}>{i.suggestion || "—"}</td>
+                      <td>{i.effort || "—"}</td>
+                      <td className="no-print">
+                        <button
+                          type="button"
+                          className="btn"
+                          style={{ padding: "3px 8px", fontSize: 12 }}
+                          onClick={() => openTriageModal(i)}
+                        >
+                          <ShieldCheck size={12} /> 处置
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
                 {filteredIssues.length === 0 && (
                   <tr>
-                    <td colSpan={7} className="muted" style={{ textAlign: "center", padding: 24 }}>
+                    <td colSpan={9} className="muted" style={{ textAlign: "center", padding: 24 }}>
                       没有匹配的风险问题
                     </td>
                   </tr>
@@ -444,6 +564,95 @@ export function ReportsPage({ currentUser, initialTarget, onTargetChange }: Prop
             </div>
           </div>
         )
+      )}
+      {triageTarget && (
+        <div className="modal-backdrop" onClick={() => setTriageTarget(null)}>
+          <form
+            className="modal-dialog"
+            style={{ width: "min(520px, 95vw)", display: "grid", gap: 12 }}
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => void handleSaveTriage(e)}
+          >
+            <div className="card-title">
+              <span>问题整改追踪 / 风险豁免</span>
+              <button type="button" className="btn" onClick={() => setTriageTarget(null)}>
+                关闭
+              </button>
+            </div>
+            <div style={{ fontSize: 12.5, padding: "8px 10px", borderRadius: 8, background: "var(--bg-2)" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                <span className={`lv-badge lv-${triageTarget.level}`}>{triageTarget.level}</span>
+                <b>{triageTarget.item_id}</b>
+                <span>{triageTarget.title}</span>
+              </div>
+              {triageTarget.evidence_text && (
+                <div className="muted" style={{ fontSize: 11.5 }}>
+                  证据：{triageTarget.evidence_text}
+                </div>
+              )}
+            </div>
+
+            <div style={{ display: "grid", gap: 6 }}>
+              <span className="muted" style={{ fontSize: 12 }}>
+                处置状态（系统基于问题指纹跨批次自动记忆，代码行号小幅偏移仍可命中）
+              </span>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {(["open", "planned", "fixed", "exempted"] as IssueTriageStatus[]).map((st) => (
+                  <button
+                    key={st}
+                    type="button"
+                    className={`btn ${triageStatusInput === st ? "btn-primary" : ""}`}
+                    style={{ padding: "5px 10px", fontSize: 12.5 }}
+                    onClick={() => setTriageStatusInput(st)}
+                  >
+                    {TRIAGE_META[st].label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+              <span className="muted">
+                处置说明 / 豁免原因{triageStatusInput === "exempted" ? "（豁免必填）*" : "（可选）"}
+              </span>
+              <textarea
+                rows={3}
+                value={triageReasonInput}
+                onChange={(e) => setTriageReasonInput(e.target.value)}
+                required={triageStatusInput === "exempted"}
+                placeholder={
+                  triageStatusInput === "exempted"
+                    ? "例如：该接口仅内网定时任务调用且由网关统一鉴权，业务评估为可接受风险"
+                    : "例如：已纳入下周迭代修复 / 已在提交 abc123 修复待复核"
+                }
+                style={{
+                  width: "100%",
+                  padding: 8,
+                  borderRadius: 8,
+                  border: "1px solid var(--border)",
+                  background: "var(--bg-2)",
+                  color: "var(--text-1)",
+                  fontSize: 12.5,
+                }}
+              />
+            </label>
+
+            {triageTarget.triage_updated_by && (
+              <div className="muted" style={{ fontSize: 11.5 }}>
+                上次更新：{triageTarget.triage_updated_by} · {(triageTarget.triage_updated_at || "").replace("T", " ").slice(0, 19)}
+              </div>
+            )}
+
+            <div className="confirm-footer">
+              <button type="button" className="btn" disabled={triageBusy} onClick={() => setTriageTarget(null)}>
+                取消
+              </button>
+              <button type="submit" className="btn btn-primary" disabled={triageBusy}>
+                {triageBusy ? "保存中…" : "保存处置状态"}
+              </button>
+            </div>
+          </form>
+        </div>
       )}
     </div>
   );
