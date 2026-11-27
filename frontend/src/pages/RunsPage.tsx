@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Download, FileText, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
+import { AlertTriangle, Download, FileText, Mail, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 import { api } from "../api";
 import { DraftModal } from "../components/DraftModal";
 import type { AuthUser, RunDetailResponse, RunSummary } from "../types";
@@ -55,6 +55,7 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted }: Props) {
   const [actionBusy, setActionBusy] = useState(false);
   const [draftModal, setDraftModal] = useState<{ title: string; markdown: string; filenameBase: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   // 清册筛选状态
   const [statusFilter, setStatusFilter] = useState<"" | "ok" | "error">("");
@@ -228,12 +229,31 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted }: Props) {
     if (!detail) return;
     setActionBusy(true);
     setError(null);
+    setNotice(null);
     try {
       await api.downloadReportDocx(detail.date, detail.run_id, "_summary", true);
       const updated = await api.runDetail(detail.date, detail.run_id).catch(() => null);
       if (updated) setDetail(updated);
     } catch (err) {
       setError(err instanceof Error ? err.message : "导出 Word 汇总失败");
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleSendBatchEmails = async () => {
+    if (!detail) return;
+    if (!window.confirm(`确认向本批次（${detail.date} / ${detail.run_id}）涉及的项目负责人发送含报告附件的结果邮件吗？`)) {
+      return;
+    }
+    setActionBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.sendRunEmails(detail.date, detail.run_id);
+      setNotice(`邮件投递完成：成功 ${res.sent} 封，失败 ${res.failed} 封，按偏好跳过 ${res.skipped} 人`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "发送批次邮件失败");
     } finally {
       setActionBusy(false);
     }
@@ -250,6 +270,9 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted }: Props) {
         </div>
         {error && (
           <div style={{ color: "var(--critical)", fontSize: 12, marginBottom: 8 }}>{error}</div>
+        )}
+        {notice && (
+          <div style={{ color: "var(--good)", fontSize: 12, marginBottom: 8 }}>{notice}</div>
         )}
         {runs.length === 0 ? (
           <div className="muted" style={{ padding: "24px 0" }}>
@@ -324,6 +347,14 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted }: Props) {
                 )}
                 {isAdmin && okCount > 0 && (
                   <>
+                    <button
+                      className="btn"
+                      disabled={actionBusy}
+                      title="按负责人聚合发送本批次结果邮件（含 Word/Markdown 报告附件）"
+                      onClick={() => void handleSendBatchEmails()}
+                    >
+                      <Mail size={14} /> 发送邮件通知
+                    </button>
                     <button
                       className="btn"
                       disabled={actionBusy}

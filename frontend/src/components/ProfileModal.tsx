@@ -151,7 +151,7 @@ export function ProfileModal({ user, forcePasswordChange, onUpdated, onClose }: 
               />
             </label>
             <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
-              <span className="muted">邮件通知偏好（邮件投递启用后生效）</span>
+              <span className="muted">邮件通知偏好（批次完成后按负责人聚合发送，附带报告附件）</span>
               <select
                 value={emailNotify}
                 onChange={(e) => setEmailNotify(e.target.value as AuthUser["email_notify"])}

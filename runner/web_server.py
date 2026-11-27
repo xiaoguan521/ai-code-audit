@@ -46,6 +46,7 @@ sys.path.insert(0, str(RUNNER_DIR))
 
 import doctor  # noqa: E402
 import docx_export  # noqa: E402
+import mailer  # noqa: E402
 import platform_db  # noqa: E402
 import report_validate  # noqa: E402
 import scoring  # noqa: E402
@@ -2147,6 +2148,23 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return
             return self._send_json(200, _build_ops_config(output_dir, self.cfg["settings_path"], db))
 
+        if path == "/api/ops/smtp":
+            assert cur_user is not None
+            if not self._require_role(cur_user, ("superadmin",)):
+                return
+            return self._send_json(200, {"smtp": db.get_smtp_config(include_password=False)})
+
+        if path == "/api/email-logs":
+            assert cur_user is not None
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            qs = urllib.parse.parse_qs(parsed.query)
+            try:
+                limit = int(qs.get("limit", ["100"])[0])
+            except ValueError:
+                limit = 100
+            return self._send_json(200, {"logs": db.list_email_logs(limit=limit)})
+
         if path == "/api/doctor":
             assert cur_user is not None
             if not self._require_role(cur_user, ("superadmin", "admin")):
@@ -2727,6 +2745,68 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return self._send_json(400, {"error": str(exc)})
             return self._send_json(404, {"error": "未知的 Git 账号操作"})
 
+        # SMTP 邮件投递配置（仅 superadmin）
+        if path == "/api/ops/smtp":
+            if not self._require_role(cur_user, ("superadmin",)):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            try:
+                saved = db.save_smtp_config(payload)
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            db.record_audit(cur_user, "update_smtp_config", target=saved.get("host", ""),
+                            detail={"enabled": saved["enabled"], "port": saved["port"],
+                                    "security": saved["security"], "attachment_format": saved["attachment_format"]},
+                            client_ip=client_ip)
+            return self._send_json(200, {"smtp": saved})
+
+        if path == "/api/ops/smtp/test":
+            if not self._require_role(cur_user, ("superadmin",)):
+                return
+            payload = self._read_json_body()
+            if payload is None:
+                return self._send_json(400, {"error": "无效的 JSON 请求体"})
+            to_email = str(payload.get("to_email") or "").strip()
+            override = {k: v for k, v in payload.items() if k != "to_email"}
+            try:
+                res = mailer.send_test_email(db, to_email, override_cfg=override or None)
+            except ValueError as exc:
+                return self._send_json(400, {"error": str(exc)})
+            db.record_audit(cur_user, "test_smtp_email", target=to_email,
+                            detail={"ok": res["ok"], "elapsed_ms": res["elapsed_ms"]}, client_ip=client_ip)
+            return self._send_json(200, res)
+
+        # 邮件失败一键重试（superadmin + admin）
+        if path.startswith("/api/email-logs/") and path.endswith("/retry"):
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            raw_id = path[len("/api/email-logs/"):-len("/retry")].strip("/")
+            if not raw_id.isdigit():
+                return self._send_json(400, {"error": "无效的邮件日志 ID"})
+            log_item = db.get_email_log(int(raw_id))
+            if not log_item:
+                return self._send_json(404, {"error": "未找到该邮件投递记录"})
+            if log_item["recipient_type"] == "test":
+                try:
+                    t_res = mailer.send_test_email(db, log_item["recipient_email"])
+                except ValueError as exc:
+                    return self._send_json(400, {"error": str(exc)})
+                return self._send_json(200, {
+                    "ok": t_res["ok"], "sent": 1 if t_res["ok"] else 0,
+                    "failed": 0 if t_res["ok"] else 1, "skipped": 0, "details": [],
+                    "skipped_reason": t_res.get("error", ""),
+                })
+            res = mailer.dispatch_batch_emails(
+                self.cfg["output_dir"], log_item["run_date"], log_item["run_id"], db,
+                force=True, only_email=log_item["recipient_email"], only_type=log_item["recipient_type"],
+            )
+            db.record_audit(cur_user, "retry_email", target=log_item["recipient_email"],
+                            detail={"run": f"{log_item['run_date']}/{log_item['run_id']}", "sent": res["sent"], "failed": res["failed"]},
+                            client_ip=client_ip)
+            return self._send_json(200, res)
+
         # 扫描暂停 / 恢复（superadmin + admin）
         if path == "/api/scans/pause":
             if not self._require_role(cur_user, ("superadmin", "admin")):
@@ -2789,6 +2869,26 @@ class AuditHandler(BaseHTTPRequestHandler):
             if res.get("conflict"):
                 return self._send_json(409, {"error": res["error"]})
             db.record_audit(cur_user, "mark_run_aborted", target=f"{segs[0]}/{segs[1]}", client_ip=client_ip)
+            return self._send_json(200, res)
+
+        if path.startswith("/api/runs/") and path.endswith("/send-emails"):
+            if not self._require_role(cur_user, ("superadmin", "admin")):
+                return
+            inner = path[len("/api/runs/"):-len("/send-emails")]
+            segs = [urllib.parse.unquote(s) for s in inner.split("/") if s]
+            if len(segs) != 2 or not all(_is_safe_segment(s) for s in segs):
+                return self._send_json(400, {"error": "无效的批次路径"})
+            payload = self._read_json_body() or {}
+            res = mailer.dispatch_batch_emails(
+                self.cfg["output_dir"], segs[0], segs[1], db,
+                force=True,
+                only_email=str(payload.get("recipient_email") or "").strip() or None,
+            )
+            if res.get("skipped_reason") and res["sent"] == 0 and res["failed"] == 0:
+                return self._send_json(400, {"error": res["skipped_reason"]})
+            db.record_audit(cur_user, "send_batch_emails", target=f"{segs[0]}/{segs[1]}",
+                            detail={"sent": res["sent"], "failed": res["failed"], "skipped": res["skipped"]},
+                            client_ip=client_ip)
             return self._send_json(200, res)
 
         if path.startswith("/api/runs/") and path.endswith("/summary"):

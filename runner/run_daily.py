@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import code_map  # noqa: E402
 import facts  # noqa: E402
 import incremental  # noqa: E402
+import mailer  # noqa: E402
 import platform_db  # noqa: E402
 import report_validate  # noqa: E402
 import scoring  # noqa: E402
@@ -1579,6 +1580,17 @@ def main() -> int:
             log(f"整体报告生成失败：{type(exc).__name__}；已完成的项目报告不受影响")
     progress.update(status=run_status(recs), finished_at=now().isoformat())
     write_json_atomic(runlog, progress, mode=0o600)
+    if not args.dry_run:
+        db_file = outdir / "state" / "platform.db"
+        if db_file.is_file():
+            try:
+                pdb = platform_db.PlatformDB(db_file)
+                smtp_cfg = pdb.get_smtp_config(include_password=False)
+                if smtp_cfg.get("enabled") and smtp_cfg.get("auto_send_on_batch", True):
+                    mail_res = mailer.dispatch_batch_emails(outdir, run_date, args.run_id, pdb)
+                    log(f"邮件自动投递完成：成功 {mail_res.get('sent', 0)}，失败 {mail_res.get('failed', 0)}，跳过 {mail_res.get('skipped', 0)}")
+            except Exception as exc:
+                log(f"邮件自动投递异常（不影响扫描结果）：{type(exc).__name__}: {exc}")
     failed = [rec for rec in recs if rec["status"] == "error"]
     log(f"完成：成功 {len(recs) - len(failed)}，失败 {len(failed)}；运行记录 {runlog}")
     if progress.get("summary_path"):

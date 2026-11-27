@@ -3,17 +3,27 @@ import {
   Check,
   Cpu,
   KeyRound,
+  Mail,
   Plus,
   RefreshCw,
+  RotateCcw,
+  Send,
   SlidersHorizontal,
   Trash2,
   Zap,
 } from "lucide-react";
 import { api } from "../api";
-import type { GitCredentialItem, ModelTestResult, OpsConfigResponse, OpsRuntimeConfig } from "../types";
+import type {
+  EmailLogEntry,
+  GitCredentialItem,
+  ModelTestResult,
+  OpsConfigResponse,
+  OpsRuntimeConfig,
+  SmtpConfig,
+} from "../types";
 
 export function OpsConfigPage() {
-  const [tab, setTab] = useState<"model" | "runtime" | "git">("model");
+  const [tab, setTab] = useState<"model" | "runtime" | "git" | "smtp">("model");
   const [cfg, setCfg] = useState<OpsConfigResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -45,6 +55,13 @@ export function OpsConfigPage() {
   const [gitSecret, setGitSecret] = useState("");
   const [gitActive, setGitActive] = useState(true);
 
+  // SMTP 邮件投递配置与日志
+  const [smtp, setSmtp] = useState<SmtpConfig | null>(null);
+  const [smtpPassword, setSmtpPassword] = useState("");
+  const [testToEmail, setTestToEmail] = useState("");
+  const [testingSmtp, setTestingSmtp] = useState(false);
+  const [emailLogs, setEmailLogs] = useState<EmailLogEntry[]>([]);
+
   const hydrate = (res: OpsConfigResponse) => {
     setCfg(res);
     setBaseUrl(res.model.OPENAI_BASE_URL || "");
@@ -62,8 +79,15 @@ export function OpsConfigPage() {
     setLoading(true);
     setError(null);
     try {
-      const res = await api.opsConfig();
+      const [res, smtpRes, logRes] = await Promise.all([
+        api.opsConfig(),
+        api.smtpConfig(),
+        api.emailLogs(100),
+      ]);
       hydrate(res);
+      setSmtp(smtpRes.smtp);
+      setSmtpPassword("");
+      setEmailLogs(logRes.logs);
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载运维配置失败");
     } finally {
@@ -212,6 +236,72 @@ export function OpsConfigPage() {
     }
   };
 
+  const handleSaveSmtp = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!smtp) return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.saveSmtpConfig({ ...smtp, password: smtpPassword.trim() });
+      setSmtp(res.smtp);
+      setSmtpPassword("");
+      setNotice("SMTP 邮件投递配置已保存");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "保存 SMTP 配置失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleTestSmtp = async () => {
+    if (!smtp || !testToEmail.trim()) {
+      setError("请先填写测试收件人邮箱");
+      return;
+    }
+    setTestingSmtp(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.testSmtpEmail({
+        ...smtp,
+        password: smtpPassword.trim(),
+        to_email: testToEmail.trim(),
+      });
+      if (res.ok) {
+        setNotice(`测试邮件（含示例 Word 附件）已发送至 ${testToEmail.trim()}，耗时 ${res.elapsed_ms} ms`);
+      } else {
+        setError(`测试邮件发送失败：${res.error}`);
+      }
+      const logs = await api.emailLogs(100);
+      setEmailLogs(logs.logs);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "测试邮件失败");
+    } finally {
+      setTestingSmtp(false);
+    }
+  };
+
+  const handleRetryEmail = async (logId: number) => {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.retryEmailLog(logId);
+      if (res.ok && res.sent > 0) {
+        setNotice("邮件重发成功");
+      } else {
+        setError(`邮件重发失败：${res.skipped_reason || "请查看最新日志"}`);
+      }
+      const logs = await api.emailLogs(100);
+      setEmailLogs(logs.logs);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重发失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div style={{ display: "grid", gap: 14 }}>
       {error && (
@@ -248,6 +338,13 @@ export function OpsConfigPage() {
               onClick={() => setTab("git")}
             >
               <KeyRound size={14} /> Git 仓库账号凭据 ({cfg?.git_credentials.length ?? 0})
+            </button>
+            <button
+              type="button"
+              className={`btn ${tab === "smtp" ? "btn-primary" : ""}`}
+              onClick={() => setTab("smtp")}
+            >
+              <Mail size={14} /> 邮件投递 (SMTP)
             </button>
           </div>
           <button type="button" className="btn" disabled={loading} onClick={() => void loadData()}>
@@ -600,6 +697,229 @@ export function OpsConfigPage() {
                   )}
                 </tbody>
               </table>
+            </div>
+          </div>
+        )}
+
+        {/* 4. SMTP 邮件投递配置与投递日志 */}
+        {tab === "smtp" && smtp && (
+          <div style={{ display: "grid", gap: 18 }}>
+            <form onSubmit={(e) => void handleSaveSmtp(e)} style={{ display: "grid", gap: 12, maxWidth: 860 }}>
+              <div style={{ display: "flex", gap: 18, flexWrap: "wrap", fontSize: 13 }}>
+                <label style={{ display: "inline-flex", alignItems: "center", gap: 6, fontWeight: 600 }}>
+                  <input
+                    type="checkbox"
+                    checked={smtp.enabled}
+                    onChange={(e) => setSmtp({ ...smtp, enabled: e.target.checked })}
+                  />
+                  启用邮件投递功能
+                </label>
+                <label style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                  <input
+                    type="checkbox"
+                    checked={smtp.auto_send_on_batch}
+                    onChange={(e) => setSmtp({ ...smtp, auto_send_on_batch: e.target.checked })}
+                  />
+                  批次扫描结束后自动按负责人聚合发邮件
+                </label>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "2fr 100px 140px", gap: 10 }}>
+                <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+                  <span className="muted">SMTP 服务器地址</span>
+                  <input
+                    value={smtp.host}
+                    placeholder="例如 smtp.exmail.qq.com 或 smtp.shineyue.com"
+                    onChange={(e) => setSmtp({ ...smtp, host: e.target.value })}
+                  />
+                </label>
+                <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+                  <span className="muted">端口</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={65535}
+                    value={smtp.port}
+                    onChange={(e) => setSmtp({ ...smtp, port: Number(e.target.value) })}
+                  />
+                </label>
+                <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+                  <span className="muted">传输加密</span>
+                  <select
+                    value={smtp.security}
+                    onChange={(e) => setSmtp({ ...smtp, security: e.target.value as SmtpConfig["security"] })}
+                  >
+                    <option value="ssl">SSL/TLS (465)</option>
+                    <option value="starttls">STARTTLS (587)</option>
+                    <option value="none">不加密 (25)</option>
+                  </select>
+                </label>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+                  <span className="muted">SMTP 登录账号</span>
+                  <input
+                    value={smtp.username}
+                    placeholder="例如 code-audit@shineyue.com"
+                    onChange={(e) => setSmtp({ ...smtp, username: e.target.value })}
+                  />
+                </label>
+                <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+                  <span className="muted">
+                    SMTP 密码 / 授权码（{smtp.password_set ? `已配置：${smtp.password_masked}，留空不变` : "未配置"}）
+                  </span>
+                  <input
+                    type="password"
+                    value={smtpPassword}
+                    placeholder="留空保持原密码不变"
+                    onChange={(e) => setSmtpPassword(e.target.value)}
+                  />
+                </label>
+                <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+                  <span className="muted">发件人邮箱（留空同登录账号）</span>
+                  <input
+                    type="email"
+                    value={smtp.from_email}
+                    placeholder="code-audit@shineyue.com"
+                    onChange={(e) => setSmtp({ ...smtp, from_email: e.target.value })}
+                  />
+                </label>
+                <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+                  <span className="muted">发件人显示名</span>
+                  <input
+                    value={smtp.from_name}
+                    onChange={(e) => setSmtp({ ...smtp, from_name: e.target.value })}
+                  />
+                </label>
+                <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+                  <span className="muted">附件格式（超过 6 个自动打包 ZIP）</span>
+                  <select
+                    value={smtp.attachment_format}
+                    onChange={(e) =>
+                      setSmtp({ ...smtp, attachment_format: e.target.value as SmtpConfig["attachment_format"] })
+                    }
+                  >
+                    <option value="docx">Word 文档 (.docx，推荐)</option>
+                    <option value="md">Markdown 原文 (.md)</option>
+                    <option value="both">同时附带 .docx 与 .md</option>
+                  </select>
+                </label>
+                <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+                  <span className="muted">平台外链地址（用于邮件内直达链接）</span>
+                  <input
+                    value={smtp.portal_url}
+                    placeholder="http://10.0.87.179:8787"
+                    onChange={(e) => setSmtp({ ...smtp, portal_url: e.target.value })}
+                  />
+                </label>
+              </div>
+
+              <label style={{ display: "grid", gap: 4, fontSize: 12 }}>
+                <span className="muted">管理层汇总 Word 报告抄送邮箱（可选，多个用逗号分隔，每批次发送整体汇总 .docx）</span>
+                <input
+                  value={smtp.summary_cc_emails}
+                  placeholder="leader1@shineyue.com, qa@shineyue.com"
+                  onChange={(e) => setSmtp({ ...smtp, summary_cc_emails: e.target.value })}
+                />
+              </label>
+
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                <button type="submit" className="btn btn-primary" disabled={busy}>
+                  <Check size={14} /> {busy ? "保存中…" : "保存 SMTP 配置"}
+                </button>
+                <input
+                  type="email"
+                  placeholder="输入测试收件邮箱"
+                  value={testToEmail}
+                  onChange={(e) => setTestToEmail(e.target.value)}
+                  style={{ width: 230 }}
+                />
+                <button type="button" className="btn" disabled={testingSmtp} onClick={() => void handleTestSmtp()}>
+                  <Send size={13} /> {testingSmtp ? "发送中…" : "发送测试邮件（含示例 Word 附件）"}
+                </button>
+              </div>
+            </form>
+
+            <div>
+              <div style={{ fontWeight: 600, fontSize: 13.5, marginBottom: 8 }}>
+                最近邮件投递记录 ({emailLogs.length})
+              </div>
+              <div className="table-wrap" style={{ maxHeight: 380, overflowY: "auto" }}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>批次</th>
+                      <th>类型</th>
+                      <th>收件人</th>
+                      <th>附件</th>
+                      <th>状态</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {emailLogs.map((log) => (
+                      <tr key={log.id}>
+                        <td className="sub">{log.created_at.replace("T", " ")}</td>
+                        <td className="sub">{log.run_date ? `${log.run_date} / ${log.run_id}` : log.run_id}</td>
+                        <td>
+                          <span className="chip">
+                            {log.recipient_type === "owner"
+                              ? "负责人"
+                              : log.recipient_type === "summary"
+                              ? "管理层汇总"
+                              : "测试"}
+                          </span>
+                        </td>
+                        <td>
+                          <div>{log.recipient_name || "—"}</div>
+                          <div className="muted" style={{ fontSize: 11.5 }}>
+                            {log.recipient_email}
+                          </div>
+                        </td>
+                        <td style={{ whiteSpace: "normal", maxWidth: 220 }} className="sub">
+                          {log.attachment_names.length > 0 ? log.attachment_names.join("、") : "—"}
+                        </td>
+                        <td style={{ whiteSpace: "normal", maxWidth: 240 }}>
+                          <span
+                            className="chip"
+                            style={{
+                              borderColor: log.status === "sent" ? "var(--good)" : "var(--critical)",
+                              color: log.status === "sent" ? "var(--good)" : "var(--critical)",
+                            }}
+                          >
+                            {log.status === "sent" ? "已发送" : "失败"}
+                          </span>
+                          {log.error && (
+                            <div style={{ fontSize: 11, color: "var(--critical)", marginTop: 2 }}>{log.error}</div>
+                          )}
+                        </td>
+                        <td>
+                          {log.status !== "sent" && (
+                            <button
+                              type="button"
+                              className="btn"
+                              style={{ padding: "3px 8px", fontSize: 12 }}
+                              disabled={busy}
+                              onClick={() => void handleRetryEmail(log.id)}
+                            >
+                              <RotateCcw size={12} /> 重发
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                    {emailLogs.length === 0 && (
+                      <tr>
+                        <td colSpan={7} className="muted" style={{ textAlign: "center", padding: 20 }}>
+                          暂无邮件投递记录
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         )}

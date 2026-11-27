@@ -446,6 +446,47 @@ export interface ModelTestResult {
   error: string;
 }
 
+export interface SmtpConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+  security: "ssl" | "starttls" | "none";
+  username: string;
+  password_set: boolean;
+  password_masked: string;
+  from_email: string;
+  from_name: string;
+  portal_url: string;
+  attachment_format: "docx" | "md" | "both";
+  max_attach_mb: number;
+  auto_send_on_batch: boolean;
+  summary_cc_emails: string;
+}
+
+export interface EmailLogEntry {
+  id: number;
+  run_date: string;
+  run_id: string;
+  recipient_email: string;
+  recipient_name: string;
+  recipient_type: "owner" | "summary" | "test" | string;
+  project_ids: string[];
+  subject: string;
+  attachment_names: string[];
+  status: "sent" | "failed" | "skipped" | string;
+  error: string;
+  created_at: string;
+}
+
+export interface EmailDispatchResult {
+  ok: boolean;
+  skipped_reason?: string;
+  sent: number;
+  failed: number;
+  skipped: number;
+  details: EmailLogEntry[];
+}
+
 export interface DoctorReport {
   verdict: "ok" | "warn" | "error";
   errors: number;

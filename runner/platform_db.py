@@ -342,14 +342,13 @@ def split_owners(raw: str | None) -> list[str]:
     return [t.strip() for t in tokens if t.strip()]
 
 
-def user_owns_project(user: dict | None, project: dict) -> bool:
-    """判断用户是否有权访问该项目（superadmin/admin 全部可见；普通用户按负责人匹配）。"""
+def owner_matches_user(user: dict | None, owner_raw: str | None) -> bool:
+    """严格判断某项目的 owner 字段是否显式指向该用户（用于邮件投递，不因 admin 角色匹配全量项目）。"""
     if not user:
         return False
-    role = user.get("role")
-    if role in ("superadmin", "admin"):
-        return True
-    owners = split_owners(project.get("owner"))
+    owners = split_owners(owner_raw)
+    if not owners:
+        return False
     display = str(user.get("display_name") or "").strip()
     username = str(user.get("username") or "").strip().lower()
     for owner in owners:
@@ -360,6 +359,16 @@ def user_owns_project(user: dict | None, project: dict) -> bool:
         if username and name_to_pinyin(owner) == username:
             return True
     return False
+
+
+def user_owns_project(user: dict | None, project: dict) -> bool:
+    """判断用户是否有权访问该项目（superadmin/admin 全部可见；普通用户按负责人匹配）。"""
+    if not user:
+        return False
+    role = user.get("role")
+    if role in ("superadmin", "admin"):
+        return True
+    return owner_matches_user(user, project.get("owner"))
 
 
 def hash_password(password: str, salt: str | None = None) -> str:
@@ -502,6 +511,21 @@ class PlatformDB:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS email_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_date TEXT NOT NULL DEFAULT '',
+                    run_id TEXT NOT NULL DEFAULT '',
+                    recipient_email TEXT NOT NULL,
+                    recipient_name TEXT NOT NULL DEFAULT '',
+                    recipient_type TEXT NOT NULL DEFAULT 'owner',
+                    project_ids_json TEXT NOT NULL DEFAULT '[]',
+                    subject TEXT NOT NULL DEFAULT '',
+                    attachment_names_json TEXT NOT NULL DEFAULT '[]',
+                    status TEXT NOT NULL DEFAULT 'sent',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_email_logs_created ON email_logs(id DESC);
                 """
             )
 
@@ -1386,6 +1410,155 @@ class PlatformDB:
             pass
         os.replace(tmp, runtime_file)
         return len(lines)
+
+    # ---------- SMTP 配置与邮件投递日志 ----------
+
+    def get_smtp_config(self, include_password: bool = False) -> dict:
+        defaults = {
+            "enabled": False,
+            "host": "",
+            "port": 465,
+            "security": "ssl",
+            "username": "",
+            "password": "",
+            "from_email": "",
+            "from_name": "八性代码质量审查平台",
+            "portal_url": "",
+            "attachment_format": "docx",
+            "max_attach_mb": 15,
+            "auto_send_on_batch": True,
+            "summary_cc_emails": "",
+        }
+        stored = self.get_setting("smtp_config")
+        if isinstance(stored, dict):
+            defaults.update({k: v for k, v in stored.items() if k in defaults})
+        out = dict(defaults)
+        pwd = str(out.get("password") or "")
+        out["password_set"] = bool(pwd)
+        out["password_masked"] = mask_secret(pwd)
+        if not include_password:
+            out.pop("password", None)
+        return out
+
+    def save_smtp_config(self, payload: dict) -> dict:
+        cur = self.get_smtp_config(include_password=True)
+        enabled = bool(payload.get("enabled", cur["enabled"]))
+        host = str(payload.get("host", cur["host"]) or "").strip()
+        try:
+            port = int(payload.get("port", cur["port"]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("SMTP 端口必须为整数") from exc
+        if port < 1 or port > 65535:
+            raise ValueError("SMTP 端口需在 1–65535 之间")
+        security = str(payload.get("security", cur["security"]) or "ssl").strip().lower()
+        if security not in ("ssl", "starttls", "none"):
+            raise ValueError("加密方式仅支持 ssl / starttls / none")
+        username = str(payload.get("username", cur["username"]) or "").strip()
+        raw_pwd = str(payload.get("password") or "")
+        if payload.get("clear_password"):
+            password = ""
+        elif raw_pwd:
+            password = raw_pwd
+        else:
+            password = str(cur.get("password") or "")
+        from_email = str(payload.get("from_email", cur["from_email"]) or "").strip() or (username if EMAIL_RE.match(username) else "")
+        if from_email and not EMAIL_RE.match(from_email):
+            raise ValueError(f"发件人邮箱格式无效：{from_email}")
+        from_name = str(payload.get("from_name", cur["from_name"]) or "八性代码质量审查平台").strip()[:80]
+        portal_url = str(payload.get("portal_url", cur["portal_url"]) or "").strip().rstrip("/")
+        if portal_url and not portal_url.lower().startswith(("http://", "https://")):
+            raise ValueError("平台访问地址需以 http:// 或 https:// 开头")
+        att_fmt = str(payload.get("attachment_format", cur["attachment_format"]) or "docx").strip().lower()
+        if att_fmt not in ("docx", "md", "both"):
+            raise ValueError("附件格式仅支持 docx / md / both")
+        try:
+            max_mb = int(payload.get("max_attach_mb", cur["max_attach_mb"]))
+        except (TypeError, ValueError):
+            max_mb = 15
+        max_mb = max(1, min(50, max_mb))
+        auto_send = bool(payload.get("auto_send_on_batch", cur["auto_send_on_batch"]))
+        raw_cc = str(payload.get("summary_cc_emails", cur["summary_cc_emails"]) or "").strip()
+        cc_list = [e.strip() for e in re.split(r"[;,，、\s]+", raw_cc) if e.strip()]
+        for cc in cc_list:
+            if not EMAIL_RE.match(cc):
+                raise ValueError(f"管理层汇总抄送邮箱格式无效：{cc}")
+        if enabled and not host:
+            raise ValueError("启用邮件投递时必须填写 SMTP 服务器地址")
+        saved = {
+            "enabled": enabled,
+            "host": host,
+            "port": port,
+            "security": security,
+            "username": username,
+            "password": password,
+            "from_email": from_email,
+            "from_name": from_name,
+            "portal_url": portal_url,
+            "attachment_format": att_fmt,
+            "max_attach_mb": max_mb,
+            "auto_send_on_batch": auto_send,
+            "summary_cc_emails": ", ".join(cc_list),
+        }
+        self.set_setting("smtp_config", saved)
+        return self.get_smtp_config(include_password=False)
+
+    def record_email_log(self, *, run_date: str, run_id: str, recipient_email: str,
+                         recipient_name: str, recipient_type: str, project_ids: list[str],
+                         subject: str, attachment_names: list[str], status: str, error: str = "") -> dict:
+        now = _now_iso()
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO email_logs (
+                    run_date, run_id, recipient_email, recipient_name, recipient_type,
+                    project_ids_json, subject, attachment_names_json, status, error, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_date, run_id, recipient_email, recipient_name[:80], recipient_type,
+                    json.dumps(project_ids, ensure_ascii=False), subject[:300],
+                    json.dumps(attachment_names, ensure_ascii=False), status, (error or "")[:500], now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM email_logs WHERE id = ?", (cur.lastrowid,)).fetchone()
+            assert row is not None
+            return self._row_to_email_log(row)
+
+    @staticmethod
+    def _row_to_email_log(row: sqlite3.Row) -> dict:
+        try:
+            pids = json.loads(row["project_ids_json"] or "[]")
+        except ValueError:
+            pids = []
+        try:
+            atts = json.loads(row["attachment_names_json"] or "[]")
+        except ValueError:
+            atts = []
+        return {
+            "id": int(row["id"]),
+            "run_date": row["run_date"],
+            "run_id": row["run_id"],
+            "recipient_email": row["recipient_email"],
+            "recipient_name": row["recipient_name"],
+            "recipient_type": row["recipient_type"],
+            "project_ids": pids if isinstance(pids, list) else [],
+            "subject": row["subject"],
+            "attachment_names": atts if isinstance(atts, list) else [],
+            "status": row["status"],
+            "error": row["error"],
+            "created_at": row["created_at"],
+        }
+
+    def list_email_logs(self, limit: int = 150) -> list[dict]:
+        lim = max(1, min(500, int(limit or 150)))
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT * FROM email_logs ORDER BY id DESC LIMIT ?", (lim,)).fetchall()
+            return [self._row_to_email_log(r) for r in rows]
+
+    def get_email_log(self, log_id: int) -> dict | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM email_logs WHERE id = ?", (log_id,)).fetchone()
+            return self._row_to_email_log(row) if row else None
 
 
 def mask_secret(value: str) -> str:

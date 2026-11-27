@@ -3,6 +3,8 @@ import type {
   AuthUser,
   CatalogProject,
   DoctorReport,
+  EmailDispatchResult,
+  EmailLogEntry,
   GitCredentialItem,
   GitProbeResult,
   LiveProgressResponse,
@@ -18,6 +20,7 @@ import type {
   RunSummary,
   ScanTask,
   ScheduleResponse,
+  SmtpConfig,
   StaleThresholds,
   UserRole,
 } from "./types";
@@ -328,6 +331,31 @@ export const api = {
     request<{ ok: boolean; git_credentials: GitCredentialItem[] }>(`/api/ops/git-credentials/${id}/delete`, {
       method: "POST",
     }),
+  smtpConfig: () => request<{ smtp: SmtpConfig }>("/api/ops/smtp"),
+  saveSmtpConfig: (payload: Partial<SmtpConfig> & { password?: string; clear_password?: boolean }) =>
+    request<{ smtp: SmtpConfig }>("/api/ops/smtp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  testSmtpEmail: (payload: { to_email: string } & Partial<SmtpConfig> & { password?: string }) =>
+    request<{ ok: boolean; elapsed_ms: number; error: string }>("/api/ops/smtp/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  emailLogs: (limit = 100) => request<{ logs: EmailLogEntry[] }>(`/api/email-logs?limit=${limit}`),
+  retryEmailLog: (logId: number) =>
+    request<EmailDispatchResult>(`/api/email-logs/${logId}/retry`, { method: "POST" }),
+  sendRunEmails: (date: string, runId: string, recipient_email?: string) =>
+    request<EmailDispatchResult>(
+      `/api/runs/${encodeURIComponent(date)}/${encodeURIComponent(runId)}/send-emails`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(recipient_email ? { recipient_email } : {}),
+      }
+    ),
   doctor: () => request<DoctorReport>("/api/doctor"),
   schedule: () => request<ScheduleResponse>("/api/schedule"),
   saveSchedule: (payload: {
