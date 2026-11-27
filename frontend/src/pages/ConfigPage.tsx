@@ -502,8 +502,7 @@ export function ConfigPage({ onScanStarted }: Props) {
             <thead>
               <tr>
                 <th style={{ width: 36 }}>选</th>
-                <th>项目 ID</th>
-                <th>项目名称</th>
+                <th>项目名称 / ID</th>
                 <th>部门 / 负责人</th>
                 <th>分支</th>
                 <th>技术栈</th>
@@ -529,15 +528,19 @@ export function ConfigPage({ onScanStarted }: Props) {
                         onChange={() => scannable && toggleId(p.project_id)}
                       />
                     </td>
-                    <td>
-                      <code>{p.project_id}</code>
+                    <td style={{ whiteSpace: "normal", minWidth: 220, maxWidth: 340 }}>
+                      <div style={{ fontWeight: 600 }}>{p.project_name}</div>
+                      <div className="muted" style={{ fontSize: 11, wordBreak: "break-all" }}>
+                        <code>{p.project_id}</code>
+                      </div>
                     </td>
-                    <td>{p.project_name}</td>
-                    <td>
+                    <td style={{ whiteSpace: "normal", minWidth: 120 }}>
                       {p.department || "—"} / {p.owner || "—"}
                     </td>
-                    <td>{p.branch || "main"}</td>
-                    <td style={{ whiteSpace: "normal", maxWidth: 240 }}>{p.tech_stack || "—"}</td>
+                    <td style={{ whiteSpace: "normal", maxWidth: 160, wordBreak: "break-all" }}>
+                      {p.branch || "main"}
+                    </td>
+                    <td style={{ whiteSpace: "normal", maxWidth: 220 }}>{p.tech_stack || "—"}</td>
                     <td>
                       <span className="chip">{p.status}</span>
                     </td>
@@ -551,7 +554,7 @@ export function ConfigPage({ onScanStarted }: Props) {
               })}
               {filteredProjects.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="muted" style={{ textAlign: "center", padding: 24 }}>
+                  <td colSpan={7} className="muted" style={{ textAlign: "center", padding: 24 }}>
                     没有符合筛选条件的项目
                   </td>
                 </tr>

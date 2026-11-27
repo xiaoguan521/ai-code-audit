@@ -5,7 +5,7 @@
   "max_parallel": 2,
   "max_model_concurrency": 2,
   "model_queue_timeout_sec": 1800,
-  "batch_timeout_sec": 43200,
+  "batch_timeout_sec": 129600,
   "prescan_timeouts": {},
   "per_project_timeout_sec": 3600,
   "adaptive_timeout": true,

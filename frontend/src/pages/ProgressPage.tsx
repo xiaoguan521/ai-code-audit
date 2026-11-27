@@ -8,6 +8,7 @@ import type {
   RunProgressProjectItem,
   ScanTask,
 } from "../types";
+import { downloadBlob, sanitizeFilename } from "../utils/markdown";
 
 interface Props {
   initialTaskId?: string | null;
@@ -53,6 +54,46 @@ function formatDateTime(iso: string | null | undefined): string {
   return iso.slice(0, 19).replace("T", " ");
 }
 
+function classifyReason(it: RunProgressProjectItem): string {
+  if (it.state !== "error") return STATE_LABEL[it.state];
+  const raw = it.error || "";
+  const s = raw.toLowerCase();
+  if (raw.includes("批次总时限到") || raw.includes("批次已超时")) return "批次总时限到";
+  if (
+    s.includes("clone") ||
+    s.includes("branch") ||
+    s.includes("git") ||
+    s.includes("repository") ||
+    s.includes("not found") ||
+    raw.includes("权限")
+  ) {
+    return "Git 克隆 / 分支";
+  }
+  if (raw.includes("脱敏") || raw.includes("密钥") || (it.secret_patterns?.length ?? 0) > 0) {
+    return "报告脱敏拦截";
+  }
+  if (raw.includes("校验") || raw.includes("拦截")) return "报告校验拦截";
+  if (s.includes("timeout") || raw.includes("超时") || raw.includes("超过")) return "单项目执行超时";
+  if (
+    s.includes("api") ||
+    s.includes("model") ||
+    s.includes("http") ||
+    s.includes("connection") ||
+    s.includes("429") ||
+    s.includes("502") ||
+    s.includes("503") ||
+    s.includes("harness")
+  ) {
+    return "模型 / Harness 错误";
+  }
+  return "其他失败";
+}
+
+function csvCell(v: string | number | null | undefined): string {
+  const s = String(v ?? "");
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
 function normalizeItems(run: RunProgressItem): RunProgressProjectItem[] {
   if (run.items && run.items.length > 0) return run.items;
   const out: RunProgressProjectItem[] = [];
@@ -94,6 +135,8 @@ function normalizeItems(run: RunProgressItem): RunProgressProjectItem[] {
 export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Props) {
   const [progress, setProgress] = useState<LiveProgressResponse | null>(null);
   const [progStateFilter, setProgStateFilter] = useState<"" | RunProgressProjectItem["state"]>("");
+  const [progReasonFilter, setProgReasonFilter] = useState("");
+  const [exportScope, setExportScope] = useState("filtered");
   const [progQuery, setProgQuery] = useState("");
   const [collapsedDepts, setCollapsedDepts] = useState<Record<string, boolean>>({});
   const [expandAllOverride, setExpandAllOverride] = useState<boolean | null>(null);
@@ -237,12 +280,84 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
 
   const renderProgressBlock = (run: RunProgressItem, isRunning: boolean) => {
     const allItems = normalizeItems(run);
+    const errorItems = allItems.filter((it) => it.state === "error");
+    const reasonCountsMap = new Map<string, number>();
+    for (const it of errorItems) {
+      const cat = classifyReason(it);
+      reasonCountsMap.set(cat, (reasonCountsMap.get(cat) || 0) + 1);
+    }
+    const reasonClusters = [...reasonCountsMap.entries()].sort((a, b) => b[1] - a[1]);
+
     const q = progQuery.trim().toLowerCase();
     const filtered = allItems.filter(
       (it) =>
         (!progStateFilter || it.state === progStateFilter) &&
-        (!q || `${it.department} ${it.project_name} ${it.project_id} ${it.owner}`.toLowerCase().includes(q))
+        (!progReasonFilter || (it.state === "error" && classifyReason(it) === progReasonFilter)) &&
+        (!q ||
+          `${it.department} ${it.project_name} ${it.project_id} ${it.owner} ${it.error || ""}`
+            .toLowerCase()
+            .includes(q))
     );
+
+    const handleExportAppsCsv = (scopeKey: string) => {
+      let targetItems: RunProgressProjectItem[] = [];
+      let label = "全部";
+      if (scopeKey === "filtered") {
+        targetItems = filtered;
+        label = progReasonFilter || (progStateFilter ? STATE_LABEL[progStateFilter] : "当前筛选");
+      } else if (scopeKey === "all") {
+        targetItems = allItems;
+        label = "全部应用";
+      } else if (scopeKey === "all_error") {
+        targetItems = errorItems;
+        label = "全部失败";
+      } else if (scopeKey === "state:ok") {
+        targetItems = allItems.filter((x) => x.state === "ok");
+        label = "已完成";
+      } else if (scopeKey === "state:queued") {
+        targetItems = allItems.filter((x) => x.state === "queued");
+        label = "排队中";
+      } else if (scopeKey === "state:scanning") {
+        targetItems = allItems.filter((x) => x.state === "scanning");
+        label = "正在扫描";
+      } else if (scopeKey.startsWith("reason:")) {
+        const reasonName = scopeKey.slice("reason:".length);
+        targetItems = errorItems.filter((x) => classifyReason(x) === reasonName);
+        label = reasonName;
+      }
+      const sortedExport = [...targetItems].sort((a, b) => {
+        const c1 = (a.department || "未分组").localeCompare(b.department || "未分组", "zh-CN");
+        if (c1 !== 0) return c1;
+        const c2 = classifyReason(a).localeCompare(classifyReason(b), "zh-CN");
+        if (c2 !== 0) return c2;
+        return a.project_name.localeCompare(b.project_name, "zh-CN");
+      });
+      const header = ["部门", "项目名称", "项目ID", "负责人", "状态", "原因分类", "总评分", "耗时", "详细说明"];
+      const lines = [
+        header.map(csvCell).join(","),
+        ...sortedExport.map((it) => {
+          const detailParts: string[] = [];
+          if (it.error) detailParts.push(it.error);
+          if (it.secret_patterns?.length) detailParts.push(`密钥模式: ${it.secret_patterns.join("; ")}`);
+          if (it.validation_problems?.length) detailParts.push(`校验提示: ${it.validation_problems.join("; ")}`);
+          return [
+            it.department || "未分组",
+            it.project_name,
+            it.project_id,
+            it.owner || "",
+            STATE_LABEL[it.state],
+            classifyReason(it),
+            it.total != null ? it.total.toFixed(1) : "",
+            it.duration_seconds != null ? formatDuration(it.duration_seconds) : "",
+            detailParts.join(" | "),
+          ]
+            .map(csvCell)
+            .join(",");
+        }),
+      ];
+      const fname = `${sanitizeFilename(`${run.date}_${run.run_id}_${label}_${sortedExport.length}项`)}.csv`;
+      downloadBlob(fname, "\ufeff" + lines.join("\n"), "text/csv;charset=utf-8");
+    };
 
     const deptMap = new Map<string, RunProgressProjectItem[]>();
     for (const it of filtered) {
@@ -286,7 +401,7 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
       if (expandAllOverride !== null) return expandAllOverride;
       const key = `${run.run_id}:${dept}`;
       if (key in collapsedDepts) return !collapsedDepts[key];
-      if (progQuery.trim() || progStateFilter) return true;
+      if (progQuery.trim() || progStateFilter || progReasonFilter) return true;
       return scanning > 0 || groups.length <= 4;
     };
 
@@ -421,49 +536,159 @@ export function ProgressPage({ initialTaskId, onOpenReport, onScanStarted }: Pro
           <div className={fillClass} style={{ width: `${run.percent}%` }} />
         </div>
 
+        {reasonClusters.length > 0 && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              flexWrap: "wrap",
+              gap: 6,
+              marginBottom: 10,
+              padding: "8px 10px",
+              borderRadius: 8,
+              background: "var(--bg-1)",
+              border: "1px solid var(--border)",
+              fontSize: 12,
+            }}
+          >
+            <span style={{ fontWeight: 600, color: "var(--critical)" }}>按失败原因筛选 / 导出：</span>
+            {reasonClusters.map(([cat, cnt]) => (
+              <button
+                key={cat}
+                type="button"
+                className={`weekday-btn ${progReasonFilter === cat ? "active" : ""}`}
+                onClick={() => {
+                  const next = progReasonFilter === cat ? "" : cat;
+                  setProgReasonFilter(next);
+                  if (next) {
+                    setProgStateFilter("error");
+                    setExportScope(`reason:${next}`);
+                  } else {
+                    setExportScope("filtered");
+                  }
+                }}
+              >
+                {cat} ({cnt})
+              </button>
+            ))}
+            {progReasonFilter && (
+              <>
+                <button
+                  type="button"
+                  className="weekday-btn"
+                  onClick={() => {
+                    setProgReasonFilter("");
+                    setProgStateFilter("");
+                    setExportScope("filtered");
+                  }}
+                >
+                  清除原因筛选
+                </button>
+                {!isRunning && filtered.length > 0 && (
+                  <button
+                    type="button"
+                    className="btn"
+                    style={{ padding: "3px 9px", fontSize: 12 }}
+                    disabled={actionBusy}
+                    onClick={() =>
+                      void handleRetryFailed(
+                        filtered.map((x) => x.project_id),
+                        run.report_mode
+                      )
+                    }
+                  >
+                    <RotateCcw size={12} /> 重跑该类失败 ({filtered.length})
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
         <div className="filters" style={{ marginBottom: 10 }}>
           <button
             type="button"
-            className={`weekday-btn ${progStateFilter === "" ? "active" : ""}`}
-            onClick={() => setProgStateFilter("")}
+            className={`weekday-btn ${progStateFilter === "" && !progReasonFilter ? "active" : ""}`}
+            onClick={() => {
+              setProgStateFilter("");
+              setProgReasonFilter("");
+            }}
           >
             全部 ({allItems.length})
           </button>
           <button
             type="button"
             className={`weekday-btn ${progStateFilter === "scanning" ? "active" : ""}`}
-            onClick={() => setProgStateFilter("scanning")}
+            onClick={() => {
+              setProgStateFilter("scanning");
+              setProgReasonFilter("");
+            }}
           >
             正在扫描 ({scanningCount})
           </button>
           <button
             type="button"
             className={`weekday-btn ${progStateFilter === "ok" ? "active" : ""}`}
-            onClick={() => setProgStateFilter("ok")}
+            onClick={() => {
+              setProgStateFilter("ok");
+              setProgReasonFilter("");
+            }}
           >
             已完成 ({run.ok_count})
           </button>
           <button
             type="button"
-            className={`weekday-btn ${progStateFilter === "error" ? "active" : ""}`}
-            onClick={() => setProgStateFilter("error")}
+            className={`weekday-btn ${progStateFilter === "error" && !progReasonFilter ? "active" : ""}`}
+            onClick={() => {
+              setProgStateFilter("error");
+              setProgReasonFilter("");
+            }}
           >
             失败 ({run.error_count})
           </button>
           <button
             type="button"
             className={`weekday-btn ${progStateFilter === "queued" ? "active" : ""}`}
-            onClick={() => setProgStateFilter("queued")}
+            onClick={() => {
+              setProgStateFilter("queued");
+              setProgReasonFilter("");
+            }}
           >
             排队中 ({queuedCount})
           </button>
           <input
-            placeholder="筛选部门 / 项目名 / 负责人 / ID"
+            placeholder="筛选部门 / 项目名 / 负责人 / 原因"
             value={progQuery}
             onChange={(e) => setProgQuery(e.target.value)}
-            style={{ minWidth: 210 }}
+            style={{ minWidth: 200 }}
           />
-          <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+          <div style={{ marginLeft: "auto", display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+            <select
+              value={exportScope}
+              onChange={(e) => setExportScope(e.target.value)}
+              style={{ padding: "4px 8px", fontSize: 12 }}
+              title="选择要导出的应用范围或失败原因"
+            >
+              <option value="filtered">导出当前筛选 ({filtered.length})</option>
+              {reasonClusters.map(([cat, cnt]) => (
+                <option key={cat} value={`reason:${cat}`}>
+                  按原因：{cat} ({cnt})
+                </option>
+              ))}
+              {errorItems.length > 0 && <option value="all_error">全部失败 ({errorItems.length})</option>}
+              {run.ok_count > 0 && <option value="state:ok">全部已完成 ({run.ok_count})</option>}
+              {queuedCount > 0 && <option value="state:queued">全部排队中 ({queuedCount})</option>}
+              {scanningCount > 0 && <option value="state:scanning">正在扫描 ({scanningCount})</option>}
+              <option value="all">全部应用 ({allItems.length})</option>
+            </select>
+            <button
+              type="button"
+              className="btn"
+              style={{ padding: "4px 9px", fontSize: 12 }}
+              onClick={() => handleExportAppsCsv(exportScope)}
+            >
+              <Download size={13} /> 导出应用 CSV
+            </button>
             <button
               type="button"
               className="btn"

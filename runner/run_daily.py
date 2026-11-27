@@ -1307,7 +1307,7 @@ def main() -> int:
     except (TypeError, ValueError):
         log("拒绝启动：max_parallel 和 max_model_concurrency 必须为正整数")
         return 2
-    batch_timeout = settings.get("batch_timeout_sec", 21600)
+    batch_timeout = settings.get("batch_timeout_sec", 129600)
     if isinstance(batch_timeout, bool) or not isinstance(batch_timeout, (int, float)) or batch_timeout <= 0:
         log("拒绝启动：batch_timeout_sec 必须为正数")
         return 2
