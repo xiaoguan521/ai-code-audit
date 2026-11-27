@@ -342,6 +342,39 @@ class OpsTriageStorageTests(unittest.TestCase):
         self.assertTrue(res["ok"])
         self.assertFalse(ghost_dir.exists())
 
+        # 同时验证重命名目录（如 2026-11-24.interrupted/_run.json，内部 date 仍是 2026-11-24）
+        # 的 can_delete、详情、标记中断与删除均按真实目录名工作
+        renamed_dir = self.output_dir / "results" / "2026-11-24.interrupted"
+        renamed_dir.mkdir(parents=True, exist_ok=True)
+        (renamed_dir / "_run.json").write_text(
+            json.dumps({
+                "date": "2026-11-24",
+                "status": "running",
+                "report_mode": "standard",
+                "projects": [],
+                "pending_projects": [],
+            }),
+            encoding="utf-8",
+        )
+        code, runs_res = sa.request("GET", "/api/runs")
+        self.assertEqual(code, 200)
+        hit = next(r for r in runs_res["runs"] if r["date"] == "2026-11-24.interrupted")
+        self.assertTrue(hit["can_delete"])
+
+        code, det2 = sa.request("GET", "/api/runs/2026-11-24.interrupted/default")
+        self.assertEqual(code, 200)
+        self.assertEqual(det2["date"], "2026-11-24.interrupted")
+        self.assertEqual(det2["run_id"], "default")
+        self.assertTrue(det2["can_delete"])
+
+        code, ab = sa.request("POST", "/api/runs/2026-11-24.interrupted/default/mark-aborted")
+        self.assertEqual(code, 200)
+        self.assertIn(ab["status"], ("failed", "partial_failed", "aborted"))
+
+        code, del2 = sa.request("POST", "/api/runs/2026-11-24.interrupted/default/delete")
+        self.assertEqual(code, 200)
+        self.assertFalse(renamed_dir.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

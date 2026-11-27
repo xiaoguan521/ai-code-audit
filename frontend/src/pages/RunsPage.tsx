@@ -199,8 +199,8 @@ export function RunsPage({ currentUser, onOpenReport, onScanStarted, onFixProjec
     }
   };
 
-  const activeDate = detail?.date || selected?.date || "";
-  const activeRunId = detail?.run_id || selected?.run_id || "";
+  const activeDate = selected?.date || detail?.date || "";
+  const activeRunId = selected?.run_id || detail?.run_id || "";
 
   const handleMarkAborted = async () => {
     if (!detail || !activeDate || !activeRunId) return;

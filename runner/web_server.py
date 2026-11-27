@@ -1384,10 +1384,17 @@ def _parse_markdown_report(md_path: Path, checklist: dict, weights: dict | None 
 
 
 def _can_delete_run(user: dict | None, run_data: dict) -> bool:
-    """判断用户是否可删除该批次：运行中批次禁止删除；管理员/超管可删任意非运行批次，普通用户仅可删自己触发的。"""
-    if not user or run_data.get("status") == "running":
+    """判断用户是否可删除该批次：运行中批次仅允许管理员清理 0 项目空僵尸记录；非运行批次管理员可删任意、普通用户仅可删自己触发的。"""
+    if not user:
         return False
-    if user.get("role") in ("superadmin", "admin"):
+    is_admin = user.get("role") in ("superadmin", "admin")
+    if run_data.get("status") == "running":
+        is_empty_ghost = (
+            len(run_data.get("projects") or []) == 0
+            and len(run_data.get("pending_projects") or []) == 0
+        )
+        return bool(is_admin and is_empty_ghost and not _has_running_scan())
+    if is_admin:
         return True
     triggered_by = str(run_data.get("triggered_by") or "").strip().lower()
     username = str(user.get("username") or "").strip().lower()
@@ -2353,8 +2360,10 @@ class AuditHandler(BaseHTTPRequestHandler):
                 return self._send_json(404, {"error": "未找到该批次运行记录"})
             rep_dir = _resolve_report_dir(output_dir, date_str, run_id)
             res_dir = run_file.parent
-            data["date"] = data.get("date") or date_str
-            data["run_id"] = data.get("run_id") or run_id
+            # 始终以实际目录路径段作为 date / run_id，避免重命名目录（如 2026-11-24.interrupted）
+            # 内旧 JSON 的 date 与真实目录不一致导致标记中断/删除接口 404。
+            data["date"] = date_str
+            data["run_id"] = run_id
             data["has_summary"] = (rep_dir / "_summary.md").is_file() and allowed_pids is None
             data["can_delete"] = _can_delete_run(cur_user, data)
             data.setdefault("triggered_by", "")
